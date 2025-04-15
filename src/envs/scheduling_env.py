@@ -4,13 +4,75 @@ from collections import deque
 import sys
 from sklearn.preprocessing import MinMaxScaler
 import csv
-
+from numba import jit, njit
 
 from gym.envs.registration import EnvSpec
 from gym import spaces
-from numba import jit
-from map_visualizer import visualize_map
+from src.utils.map_visualizer import visualize_map
 # import cupy as cp
+
+# numbaで高速化するための関数
+@njit
+def time_transition_njit(on_premise_window_status, on_premise_window_job_id,
+                        cloud_window_status, cloud_window_job_id,
+                        slide_on_premise, slide_cloud):
+    if slide_on_premise:
+        # オンプレミスのスライドウィンドウをシフト（手動実装）
+        for i in range(on_premise_window_status.shape[0]):
+            for j in range(on_premise_window_status.shape[1]-1):
+                on_premise_window_status[i, j] = on_premise_window_status[i, j+1]
+                on_premise_window_job_id[i, j] = on_premise_window_job_id[i, j+1]
+            # 最後の列をクリア
+            on_premise_window_status[i, -1] = 0
+            on_premise_window_job_id[i, -1] = -1
+
+    if slide_cloud:
+        # クラウドのスライドウィンドウをシフト（手動実装）
+        for i in range(cloud_window_status.shape[0]):
+            for j in range(cloud_window_status.shape[1]-1):
+                cloud_window_status[i, j] = cloud_window_status[i, j+1]
+                cloud_window_job_id[i, j] = cloud_window_job_id[i, j+1]
+            # 最後の列をクリア
+            cloud_window_status[i, -1] = 0
+            cloud_window_job_id[i, -1] = -1
+        
+    return on_premise_window_status, on_premise_window_job_id, cloud_window_status, cloud_window_job_id
+
+@njit
+def do_schedule_njit(on_premise_window_status, on_premise_window_job_id, 
+                    cloud_window_status, cloud_window_job_id,
+                    job_width, job_height, job_id, when_submitted, use_cloud, 
+                    position, current_time):
+    # 位置情報を解析して注意深く処理
+    if len(position) == 2:
+        # 従来の連続した割り当て
+        i, a = position
+        if not use_cloud:  # オンプレミスに割り当てる場合
+            on_premise_window_status[i:i + job_height, a:a + job_width] = 1
+            on_premise_window_job_id[i:i + job_height, a:a + job_width] = job_id
+        else:  # クラウドに割り当てる場合
+            cloud_window_status[i:i + job_height, a:a + job_width] = 1
+            cloud_window_job_id[i:i + job_height, a:a + job_width] = job_id
+    else:
+        # 分散した割り当て（node_allocationがリストの場合）
+        i, a, node_allocation = position
+        if not use_cloud:
+            for col_offset in range(len(node_allocation)):
+                col = a + col_offset
+                for node_idx in range(len(node_allocation[col_offset])):
+                    node = node_allocation[col_offset][node_idx]
+                    on_premise_window_status[node, col] = 1
+                    on_premise_window_job_id[node, col] = job_id
+        else:
+            for col_offset in range(len(node_allocation)):
+                col = a + col_offset
+                for node_idx in range(len(node_allocation[col_offset])):
+                    node = node_allocation[col_offset][node_idx]
+                    cloud_window_status[node, col] = 1
+                    cloud_window_job_id[node, col] = job_id
+        
+    return current_time - when_submitted
+
 
 
 # 学習環境
@@ -35,7 +97,7 @@ class SchedulingEnv(gym.core.Env):
         self.cloud_window_user_history = np.zeros((6,1)) # クラウドのスライドウィンドウの履歴
         self.n_cloud_node = n_cloud_node  # クラウド計算資源のノード数
         self.n_job_queue_obs = n_job_queue_obs  # ジョブキューの観測部分の長さ
-        self.n_job_queue_bck = n_job_queue_bck  # ジョブ���ューのバックログ部分の長さ
+        self.n_job_queue_bck = n_job_queue_bck  # ジョブキューのバックログ部分の長さ
         self.rear_job_queue = 0  # ジョブキューの末尾 (== 0: ジョブキューが空)
         self.weight_wt = weight_wt  # 報酬における待ち時間の重み
         self.weight_cost = weight_cost  # 報酬におけるコストの重み
@@ -354,19 +416,17 @@ class SchedulingEnv(gym.core.Env):
         self.time += 1
         self.update_window_history()
 
-        if slide_on_premise:
-            # オンプレミスのスライドウィンドウをシフト
-            self.on_premise_window['status'] = np.roll(self.on_premise_window['status'], -1, axis=1)
-            self.on_premise_window['job_id'] = np.roll(self.on_premise_window['job_id'], -1, axis=1)
-            self.on_premise_window['status'][:, -1] = 0
-            self.on_premise_window['job_id'][:, -1] = -1
-
-        if slide_cloud:
-            # クラウドのスライドウィンドウをシフト
-            self.cloud_window['status'] = np.roll(self.cloud_window['status'], -1, axis=1)
-            self.cloud_window['job_id'] = np.roll(self.cloud_window['job_id'], -1, axis=1)
-            self.cloud_window['status'][:, -1] = 0
-            self.cloud_window['job_id'][:, -1] = -1
+        # 構造化配列からndarrayを取得
+        on_premise_status = self.on_premise_window['status']
+        on_premise_job_id = self.on_premise_window['job_id']
+        cloud_status = self.cloud_window['status']
+        cloud_job_id = self.cloud_window['job_id']
+    
+        # Numbaで高速化された関数を呼び出し
+        on_premise_status, on_premise_job_id, cloud_status, cloud_job_id = time_transition_njit(
+            on_premise_status, on_premise_job_id, cloud_status, cloud_job_id,
+            slide_on_premise, slide_cloud
+        )
 
         # 新しいジョブをジョブキューに追加
         self.append_new_job2job_queue()
