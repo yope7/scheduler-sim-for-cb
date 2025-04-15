@@ -10,7 +10,7 @@ param_agent:
   weight_wt: 0.3 # 報酬における待ち時間の重み
   weight_cost: 0.7 # 報酬におけるコストの重み
 param_simulation:
-  nb_steps: 20000000000 # ステップ数
+  nb_steps: 1 # ステップ数
   nb_episodes: 500 # エピソード数
   nb_max_episode_steps: -1 # 1エピソードあたりの最大ステップ数(-1:最大ステップ無し)
   multi_algorithm: true # true: multi algorithm(先にジョブを決める) false: single algorithm(後でジョブを決める)

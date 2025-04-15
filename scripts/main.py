@@ -1,54 +1,21 @@
-# Example of using PCN with this environment
-import mo_gymnasium as mo_gym
 import numpy as np
-# from mo_gymnasium.utils import MORecordEpisodeStatistics
-import json
-from PCNagent2 import PCN
-import gym
-from gym import spaces
-import numpy as np
-np.set_printoptions(linewidth=np.inf)   
-# from pyinstrument import Profiler
-import wandb
-
-import torch
-
-# print(torch.cuda.is_available())
-# train_loader = torch.utils.data.DataLoader(
-#     dataset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True
-# )
-
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-from gymnasium.envs.registration import EnvSpec
-from multiEnv2 import SchedulingEnv
-# from randomEnv import SimpleEnv
-from src.utils.job_gen.job_generator import JobGenerator
 import yaml
-import sys  # sysモジュールをインポート
-from archive.All2 import SchedulingVisualizer
+import sys
 import argparse
-from typing import Optional
 import itertools
-import os
-from datetime import datetime
-from morl_baselines.common.pareto import get_non_dominated_inds
-from DQNAgent import DQNAgent
 import matplotlib.pyplot as plt
+from morl_baselines.common.pareto import get_non_dominated_inds
+from src.agents.pcn_agent import PCN  
+from src.envs.scheduling_env import SchedulingEnv
+from src.utils.job_gen.job_generator import JobGenerator
+from src.utils.map_visualizer import visualize_map
+from src.agents.dqn_agent import DQNAgent
+from numba import jit
+from src.agents.all_agent import ExhaustiveSearchAgent
+np.set_printoptions(linewidth=np.inf) 
 
-
-# with open('config.yml', 'r') as yml:
-#     config = yaml.safe_load(yml)
-
-# 環境のパラメータをUUU
-
-
-
-
-with open('config.yml', 'r') as yml:
+with open('config/config.yml', 'r') as yml:
     config = yaml.safe_load(yml)
-
 # 環境のパラメータをUUU
 max_step = np.inf
 n_window = config['param_env']['n_window']
@@ -58,29 +25,14 @@ n_job_queue_obs = config['param_env']['n_job_queue_obs']
 n_job_queue_bck = config['param_env']['n_job_queue_bck']
 penalty_not_allocate = config['param_env']['penalty_not_allocate']  # 割り当てない(一時キューに格納する)という行動を選択した際のペナルティー
 penalty_invalid_action = config['param_env']['penalty_invalid_action']  # actionが無効だった場合のペナルティー
-
-
-# 基本パラメータによって決まるパラメータ
-# モデルの入力層のノード数(observationの要素数)
-# n_observation = n_on_premise_node*n_window + n_cloud_node*n_window + 4*(n_job_queue_obs)+1
-# n_observation = 
-# print("n_observation", n_observation)
-# モデルの出力層のノード数(actionの要素数)
 n_action = 2
-
-
-# ジョブと学習環境の設定
-
-# 報酬の各目的関数の重みを設定
 weight_wt = config['param_agent']['weight_wt']
 weight_cost = config['param_agent']['weight_cost']
-
 nb_steps = config['param_simulation']['nb_steps']
 nb_episodes = config['param_simulation']['nb_episodes']
 nb_max_episode_steps = config['param_simulation']['nb_max_episode_steps'] # 1エピソードあたりの最大ステップ数(-1:最大ステップ無し)
 if nb_max_episode_steps == -1:
     nb_max_episode_steps = np.inf
-
 multi_algorithm = config['param_simulation']['multi_algorithm'] # 0:single algorithm(後でジョブを決める) 1:multi algorithm
 
 # デバッグフラグ
@@ -193,24 +145,6 @@ def set_and_train(nb_steps, lams, loops, how_many_episodes,ob_number,nb_jobs):
         # 表示
         plt.show()
 
-    # 関数の実行
-    # visualize_map(mapmap)
-    # print("type(e_returns): ",type(e_returns))
-
-    
-    # #e_returnsをファイルに保存
-    # with open("e_returns.json", "w") as f:
-    #     # e_returns はndarray
-
-    #         # NumPy配列をリストに変換
-    #     def convert(o): 
-    #         if isinstance(o, np.ndarray):
-    #             return o.tolist()
-    #         raise TypeError(f"Type {type(o)} not serializable")
-
-    #     json.dump(mapmap, f, ensure_ascii=False, indent=4, default=convert)
-
-
     return 0
 
     # print("values: ",values)
@@ -237,12 +171,8 @@ def parse_args():
                       choices=['single', 'pareto','pcn','all'], 
                       help='実行モード（single: 単一重み, pareto: パレートフロント探索, pcn: PCN, all: 全探索）')
     # 既存の引数
-    parser.add_argument('--nb_steps', type=int, default=100)
     parser.add_argument('--how_many_episodes', type=int, default=1000)
     parser.add_argument('--nb_jobs', type=int, default=11)
-    parser.add_argument('--lams', type=float, nargs='+', default=[0.2])
-    parser.add_argument('--loops', type=int, default=1)
-    parser.add_argument('--ob_number', type=int, default=1)
     return parser.parse_args()
 
 def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
@@ -344,11 +274,8 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
     on_premise_map, cloud_map = env.get_windows()
     print(env.calc_objective_values())
 
-    # print("on_premise_map: ",on_premise_map)
-    # print("--------------------------------")
-    # print("cloud_map: ",cloud_map)
-
     return agent.get_mapmap()
+
 
 def run_exhaustive_mode(nb_jobs: int):
     """全探索モードの実行"""
@@ -360,74 +287,21 @@ def run_exhaustive_mode(nb_jobs: int):
 
     jobs_set = job_generator.generate_jobs_set()
 
-    # 各ジョブに対するアクション（0 または 1）の全組み合わせを生成
-    all_action_sets = list(itertools.product([0, 1], repeat=nb_jobs))
-    print(f"Total action sets: {len(all_action_sets)}")
-
-    results = []
-    scheduling_details = []
-    epi_summary = []
-    reward_summary = []
+    # 環境の初期化
+    env = SchedulingEnv(
+        max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
+        weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
+        next_init_windows, flag=1
+    )
     
-    # 各組み合わせごとにエピソードをシミュレーション
-    for i, action_set in enumerate(all_action_sets):
-        print(f"Processing action set {i+1}/{len(all_action_sets)}: {action_set}")
-        
-        # 環境の初期化
-        env = SchedulingEnv(
-            max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
-            weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
-            next_init_windows, flag=1
-        )
-        
-        # 環境のリセット
-        obs = env.reset()
-        done = False
-        total_reward = [0,0]
-        step = 0
-        wt_sum = 0
-        scheduled = False
-
-        
-        # エピソードの実行
-        while not done:
-            action = action_set[step]
-            obs, reward, scheduled, wt_step, done = env.step(action)
-            if scheduled:
-                step += 1
-            if done:
-                env.finalize_window_history()
-            # print("reward: ",reward)
-            total_reward[0] += reward[0]
-            total_reward[1] += reward[1]
-            wt_sum += wt_step
-        # 結果の収集
-        waiting_time, cost = env.get_episode_metrics()
-        on_premise_map, cloud_map = env.get_windows()
-        epi_summary.append([wt_sum, cost])
-        reward_summary.append([total_reward[0], total_reward[1]])
-        value_cost, value_wt = env.calc_objective_values()
-        results.append([value_cost, value_wt])
-
-
-
-    # non_dominated_inds = get_non_dominated_inds(np.array(reward_summary))
-    # pareto_front = np.array(reward_summary)[non_dominated_inds]
-
-    non_dominated_inds = get_non_dominated_inds(np.array(results))
-    pareto_front = np.array(results)[non_dominated_inds]
-   
-    # print("reward_summary: ",reward_summary)
-    # print("pareto_front: ",pareto_front)
-    print("results: ",results)
-    print("pareto_front: ",pareto_front)
-
-
-    # # 結果の保存
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # filename = f"exhaustive_search_results_{nb_jobs}jobs_{timestamp}.json"
-
-    return results
+    # エージェントの初期化と実行
+    agent = ExhaustiveSearchAgent()
+    search_results = agent.run_exhaustive_search(env, nb_jobs)
+    
+    print("results: ", search_results['results'])
+    print("pareto_front: ", search_results['pareto_front'])
+    
+    return search_results['results']
 
 def run_pareto_search(nb_steps: int, how_many_episodes: int, nb_jobs: int, weight_steps: int = 10):
     pareto_points = []
@@ -494,25 +368,6 @@ def run_pareto_search(nb_steps: int, how_many_episodes: int, nb_jobs: int, weigh
     return pareto_points
 
 if __name__ == "__main__":
-    # 出力ディレクトリの作成
-    os.makedirs("exploration_results", exist_ok=True)
-    
-    # 設定ファイルの読み込みと基本パラメータの設定
-    with open('config.yml', 'r') as yml:
-        config = yaml.safe_load(yml)
-
-    # 環境パラメータの設定
-    max_step = np.inf
-    n_window = config['param_env']['n_window']
-    n_on_premise_node = config['param_env']['n_on_premise_node']
-    n_cloud_node = config['param_env']['n_cloud_node']
-    n_job_queue_obs = config['param_env']['n_job_queue_obs']
-    n_job_queue_bck = config['param_env']['n_job_queue_bck']
-    penalty_not_allocate = config['param_env']['penalty_not_allocate']
-    penalty_invalid_action = config['param_env']['penalty_invalid_action']
-    weight_wt = config['param_agent']['weight_wt']
-    weight_cost = config['param_agent']['weight_cost']
-    nb_steps = config['param_simulation']['nb_steps']
 
     # コマンドライン引数の解析
     args = parse_args()
@@ -521,13 +376,13 @@ if __name__ == "__main__":
         # 強化学習モードのパラメータ設定と実行
         loops = 0
         lams = [0.2] * loops
-        how_many_episodes = 1000000
+        how_many_episodes = 10000
         ob_number = 1
         nb_jobs = 11
         mapmap = run_PCN_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
         print("PCN強化学習による実行が完了しました")
 
-    if args.mode == 'rl':
+    if args.mode == 'single':
         loops = 0
         lams = [0.2] * loops
         how_many_episodes = 50000
@@ -537,11 +392,13 @@ if __name__ == "__main__":
         print("単目的強化学習による実行が完了しました")
 
     elif args.mode == 'pareto':     
+
+        how_many_episodes = 10000
         pareto_points = run_pareto_search(
-            nb_steps=args.nb_steps,
-            how_many_episodes=args.how_many_episodes,
+            nb_steps,
+            how_many_episodes,
             nb_jobs=args.nb_jobs,
-            weight_steps=10  # 重みの分割数
+            weight_steps=1  # 重みの分割数
         )
         print("\nPareto Front Points:")
         for wt, cost in pareto_points:

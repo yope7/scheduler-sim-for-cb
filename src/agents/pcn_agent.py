@@ -12,7 +12,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-wandb.init(project="temp")
+# wandb.init(project="temp")
 
 np.random.seed(42)
 
