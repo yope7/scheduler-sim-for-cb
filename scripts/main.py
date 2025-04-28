@@ -571,7 +571,7 @@ def save_pareto_solutions_to_json(self, mode_name: str = "default"):
     
     return filename
 
-def run_nsga2_mode(nb_jobs: int, pop_size: int = 50, num_generations: int = 100):
+def run_nsga2_mode(nb_jobs: int, pop_size: int = 100, num_generations: int = 100):
     """NSGA-IIモードの実行"""
     # 環境パラメータの設定
     next_init_windows = None
@@ -595,7 +595,8 @@ def run_nsga2_mode(nb_jobs: int, pop_size: int = 50, num_generations: int = 100)
         mutation_prob=0.3
     )
     
-    result = agent.run(env, nb_jobs)
+    # n_jobsパラメータを追加（使用するCPUコア数、-1は全コア使用）
+    result = agent.run(env, nb_jobs, n_jobs=-1)
     
     # パレートフロントの可視化（独自のグラフ）
     visualize_nsga2_results(result)

@@ -5,6 +5,8 @@ from typing import List, Dict, Tuple, Optional
 import os
 import datetime
 from morl_baselines.common.pareto import get_non_dominated_inds
+import multiprocessing as mp
+from joblib import Parallel, delayed
 
 class Individual:
     """NSGA-IIで扱う個体クラス"""
@@ -70,40 +72,75 @@ class NSGA2Agent:
             chromosome = [random.randint(0, 1) for _ in range(nb_jobs)]
             self.population.append(Individual(chromosome))
             
-    def evaluate_population(self, env):
-        """Evaluate the population"""
-        for individual in self.population:
-            if hasattr(individual, 'objectives') and all(obj != 0 for obj in individual.objectives):
-                # If already evaluated with non-zero objectives, skip
-                continue
+    def evaluate_population_parallel(self, env, n_jobs=-1):
+        """個体評価を並列化して実行"""
+        # 未評価の個体のみを対象にする
+        individuals_to_evaluate = [
+            ind for ind in self.population 
+            if not hasattr(ind, 'objectives') or any(obj == 0 for obj in ind.objectives)
+        ]
+        
+        if not individuals_to_evaluate:
+            return
+        
+        # 利用可能なCPUコア数を取得
+        if n_jobs == -1:
+            n_jobs = mp.cpu_count()
+        
+        # 環境をシリアライズ可能な形で準備
+        # 注: 環境によってはこの方法が使えない場合がある
+        env_params = {
+            'max_step': env.max_step,
+            'n_window': env.n_window,
+            'n_on_premise_node': env.n_on_premise_node,
+            'n_cloud_node': env.n_cloud_node,
+            'n_job_queue_obs': env.n_job_queue_obs,
+            'n_job_queue_bck': env.n_job_queue_bck,
+            'weight_wt': env.weight_wt,
+            'weight_cost': env.weight_cost,
+            'penalty_not_allocate': env.penalty_not_allocate,
+            'penalty_invalid_action': env.penalty_invalid_action,
+            'jobs_set': env.jobs_set,
+            'flag': 0
+        }
+        
+        # 1個体の評価を行う関数
+        def evaluate_individual(chromosome):
+            # 環境のコピーを作成
+            env_copy = type(env)(**env_params)
             
-            # Reset environment
-            obs = env.reset()
+            obs = env_copy.reset()
             done = False
             step = 0
             total_reward = [0, 0]
-            scheduled = False
             
-            # Run episode
             while not done:
-                if step < len(individual.chromosome):
-                    action = individual.chromosome[step]
+                if step < len(chromosome):
+                    action = chromosome[step]
                 else:
-                    # Use random action if not enough actions
-                    action = random.randint(0, 1)
+                    action = 0
                     
-                obs, reward, scheduled, wt_step, done = env.step(action)
+                obs, reward, scheduled, wt_step, done = env_copy.step(action)
                 if scheduled:
                     step += 1
                 if done:
-                    env.finalize_window_history()
+                    env_copy.finalize_window_history()
                 total_reward[0] += reward[0]
                 total_reward[1] += reward[1]
                 
-            # Set objective values
-            cost, makespan = env.calc_objective_values()
-            individual.objectives = [cost, makespan]
-            
+            cost, makespan = env_copy.calc_objective_values()
+            return [cost, makespan]
+        
+        # 並列評価の実行
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(evaluate_individual)(ind.chromosome) 
+            for ind in individuals_to_evaluate
+        )
+        
+        # 結果を各個体に設定
+        for ind, result in zip(individuals_to_evaluate, results):
+            ind.objectives = result
+    
     def non_dominated_sort(self):
         """非支配ソーティング"""
         # 各個体の支配関係と支配されている個体数をカウント
@@ -417,13 +454,13 @@ class NSGA2Agent:
             'chromosomes': chromosomes
         }
         
-    def run(self, env, nb_jobs: int, verbose: bool = True):
-        """NSGA-IIによる最適化を実行"""
+    def run(self, env, nb_jobs: int, verbose: bool = True, n_jobs=-1):
+        """NSGA-IIによる最適化を実行（並列処理対応）"""
         # 初期集団の生成
         self.initialize_population(nb_jobs)
         
-        # 初期集団の評価
-        self.evaluate_population(env)
+        # 初期集団の評価（並列）
+        self.evaluate_population_parallel(env, n_jobs)
         
         # 非支配ソートと混雑度計算
         self.non_dominated_sort()
@@ -440,10 +477,10 @@ class NSGA2Agent:
             # 子孫集団の生成
             self.create_offspring()
             
-            # 子孫集団の評価（環境を複製して評価）
+            # 子孫集団の評価（並列）
             offspring_copy = self.offspring.copy()
             self.population = offspring_copy
-            self.evaluate_population(env)
+            self.evaluate_population_parallel(env, n_jobs)
             evaluated_offspring = self.population.copy()
             
             # 親と子の集団を結合
