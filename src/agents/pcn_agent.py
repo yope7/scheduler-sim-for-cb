@@ -24,6 +24,7 @@ from morl_baselines.common.evaluation import log_all_multi_policy_metrics
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.pareto import get_non_dominated_inds
 from morl_baselines.common.performance_indicators import hypervolume
+from src.utils.map_visualizer import visualize_map
 
 
 def crowding_distance(points):
@@ -216,6 +217,11 @@ class PCN(MOAgent, MOPolicy):
             experiment_name += " continuous action" if self.continuous_action else ""
             self.setup_wandb(project_name, experiment_name, wandb_entity)
 
+        # 評価結果を蓄積するための変数を追加
+        self.evaluation_history = []
+        self.evaluation_timestamps = []
+        self.global_steps_at_evaluation = []
+
     def get_config(self) -> dict:
         """Get configuration of PCN model."""
         return {
@@ -343,6 +349,7 @@ class PCN(MOAgent, MOPolicy):
         # random objective
         r_i = self.np_random.integers(0, len(desired_return))
         desired_return[r_i] += self.np_random.uniform(high=s[r_i])
+        # 改善の余地あり
         desired_return = np.float32(desired_return)
         return desired_return, desired_horizon
 
@@ -481,8 +488,8 @@ class PCN(MOAgent, MOPolicy):
 
         return best_transitions, [wt_sum, mkspan, cost]
 
-    def evaluate(self, env, max_return, n=50):
-        """Evaluate policy in the given environment."""
+    def evaluate(self, env, max_return, n=10, save_history=True):
+        """評価結果を履歴に保存し、優れた解を経験再生バッファに追加するよう拡張したevaluate"""
         n = min(n, len(self.experience_replay))
         episodes = self._nlargest(n)
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
@@ -490,34 +497,57 @@ class PCN(MOAgent, MOPolicy):
         horizons = np.float32(horizons)
         e_returns = []
         e_values = []
+        all_transitions = []  # 全てのtransitionsを保存するリスト
+        
         for i in range(n):
-            # _run_episodeの返り値から遷移リストだけを抽出
-            transitions, _,_, _ , map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
+            transitions, _, _, _, map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
             # compute return
             for j in reversed(range(len(transitions) - 1)):
                 transitions[j].reward += self.gamma * transitions[j + 1].reward
             e_returns.append(transitions[0].reward)
             e_values.append(value)
+            all_transitions.append(transitions)  # transitionsを保存
+        
         distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
 
-        non_dominated_inds = get_non_dominated_inds(np.array(e_returns))
-        pareto_front = np.array(e_returns)[non_dominated_inds]
-        non_dominated_inds_values2 = get_non_dominated_inds(np.array(e_values))
-        pareto_front_values = np.array(e_values)[non_dominated_inds_values2]
-
-        print("pareto_front: ",pareto_front)
-        print("pareto_front_values: ",pareto_front_values)
-        # print("pareto_front", pareto_front)
-
-        if self.log:
-            wandb.log({
-                "pareto_front": wandb.Table(
-                    data=pareto_front, 
-                    columns=["Objective1", "Objective2"]
-                )
-            })
+        # 非支配解を抽出
+        non_dominated_inds_reward = get_non_dominated_inds(np.array(e_returns))
+        non_dominated_inds_values = get_non_dominated_inds(np.array(e_values))
+        pareto_front_reward = np.array(e_returns)[non_dominated_inds_reward]
+        pareto_front_values = np.array(e_values)[non_dominated_inds_values]
         
-        return e_returns, np.array(returns), distances,map_fin
+        # ======= 非支配解を経験再生バッファに追加（安全に行う） =======
+        if len(non_dominated_inds_reward) > 0:
+            # 元のexperience_replayのサイズを保存
+            original_size = len(self.experience_replay)
+            max_size = original_size
+            
+            for i in non_dominated_inds_reward:
+                # 単純に追加するだけにして、heapqの比較問題を回避
+                if len(self.experience_replay) < max_size:
+                    # ヒープに追加する際は、優先度は解の品質に基づいて設定
+                    # ここでは、報酬の合計値を使用（より大きい方が優先）
+                    priority = float(np.sum(e_returns[i]))
+                    heapq.heappush(self.experience_replay, (priority, self.global_step, all_transitions[i]))
+            
+            # 必要に応じてヒープを再構築
+            if len(self.experience_replay) > max_size:
+                # 最も優先度の低い要素を削除してサイズを調整
+                self.experience_replay = heapq.nlargest(max_size, self.experience_replay)
+                heapq.heapify(self.experience_replay)
+        
+        # 履歴に保存
+        if save_history:
+            self.evaluation_history.append({
+                'all_returns': np.array(e_returns),
+                'pareto_front_reward': pareto_front_reward,
+                'pareto_front_values': pareto_front_values,
+                'values': e_values
+            })
+            self.evaluation_timestamps.append("1")
+            self.global_steps_at_evaluation.append(self.global_step)
+        
+        return e_returns, np.array(returns), distances, map_fin
 
     def plot_rewards(self, rewards):
         waiting_times, cloud_costs = zip(*rewards)
@@ -530,10 +560,32 @@ class PCN(MOAgent, MOPolicy):
         plt.show()
 
     def save(self, filename: str = "PCN_model", savedir: str = "weights"):
-        """Save PCN."""
+        """保存時に一意のファイル名を生成して新規ファイルを作成"""
         if not os.path.isdir(savedir):
             os.makedirs(savedir)
-        th.save(self.model, f"{savedir}/{filename}.pt")
+        
+        # 一意のIDを生成（タイムスタンプとランダム数字の組み合わせ）
+        import datetime
+        import random
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
+        
+        # 一意のファイル名を作成
+        unique_filename = f"{filename}_{unique_id}.pt"
+        
+        # モデルを保存
+        model_path = f"{savedir}/{unique_filename}"
+        th.save(self.model, model_path)
+        
+        # 最新モデルとしてもコピーして保存（最新版へのアクセスを簡単にするため）
+        latest_path = f"{savedir}/{filename}_latest.pt"
+        import shutil
+        shutil.copy2(model_path, latest_path)
+        
+        # print(f"モデルを保存しました: {model_path}")
+        # print(f"最新モデルとしても保存: {latest_path}")
+        
+        return model_path  # 保存したパスを返す（必要に応じて使用可能）
 
     def load(self, filename: str = "PCN_model", savedir: str = "weights"):
         """Load PCN."""
@@ -717,11 +769,18 @@ class PCN(MOAgent, MOPolicy):
             )
 
             if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
-                self.save()
+                
                 n_checkpoints += 1
+                # print("self.global_step", self.global_step)
+
+                self.evaluate(eval_env, max_return, n=num_points_pf)
                 # e_returns, _, _ = self.evaluate(eval_env, max_return, n=num_points_pf)
                 # self.e_returns.append(e_returns)
+        self.save()
         self.e_returns, _, _, self.mapmap = self.evaluate(eval_env, max_return, n=num_points_pf)
+        
+        # 訓練終了時にパレート解集合を保存
+        self.save_pareto_solutions_to_txt(mode_name=f"training_complete")
         
     
     def get_e_returns(self):
@@ -732,3 +791,170 @@ class PCN(MOAgent, MOPolicy):
     
     def get_mapmap(self):
         return self.mapmap
+
+    def visualize_evaluation_history(self, save_dir="evaluation_history"):
+        """評価履歴を可視化し、一意のIDを持つファイルとして保存"""
+        if not self.evaluation_history:
+            print("評価履歴がありません")
+            return
+        
+        # ディレクトリ作成
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 一意のIDを生成（現在時刻のタイムスタンプとランダム値を組み合わせる）
+        import datetime
+        import random
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
+        
+        # 全データから適切な表示範囲を計算
+        all_x_values = []
+        all_y_values = []
+        for history in self.evaluation_history:
+            all_returns = history['values']
+            all_x_values.extend([ret[0] for ret in all_returns])
+            all_y_values.extend([ret[1] for ret in all_returns])
+        
+        # 表示範囲の計算（少しマージンを追加）
+        x_min, x_max = min(all_x_values), max(all_x_values)
+        y_min, y_max = min(all_y_values), max(all_y_values)
+        x_margin = (x_max - x_min) * 0.1
+        y_margin = (y_max - y_min) * 0.1
+        x_range = [x_min - x_margin, x_max + x_margin]
+        y_range = [y_min - y_margin, y_max + y_margin]
+        
+        # パレートフロントの進化を可視化
+        plt.figure(figsize=(15, 10))
+        
+        # 各評価時点のパレートフロントをプロット
+        colors = plt.cm.viridis(np.linspace(0, 1, len(self.evaluation_history)))
+        
+        for i, (history, step) in enumerate(zip(self.evaluation_history, self.global_steps_at_evaluation)):
+            pareto_front_reward = history['pareto_front_reward']
+            pareto_front_values = history['pareto_front_values']
+            plt.scatter(
+                [ret[0] for ret in pareto_front_values], 
+                [ret[1] for ret in pareto_front_values],
+                color=colors[i], 
+                label=f"Step {step}",
+                alpha=0.7
+            )
+        
+        plt.title("パレートフロントの進化")
+        plt.xlabel("時間報酬")
+        plt.ylabel("コスト")
+        plt.xlim(x_range)
+        plt.ylim(y_range)
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.grid(True)
+        plt.tight_layout()
+        
+        # 一意のIDを含むファイル名で保存
+        pareto_png_filename = f"{save_dir}/pareto_evolution_{unique_id}.png"
+        plt.savefig(pareto_png_filename)
+        plt.close()
+        
+
+        
+        # アニメーション作成
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        def update(frame):
+            ax.clear()
+            history = self.evaluation_history[frame]
+            pareto_front_reward = history['pareto_front_reward']
+            pareto_front_values = history['pareto_front_values']
+            all_returns = history['values']
+            
+            ax.scatter([ret[0] for ret in all_returns], [ret[1] for ret in all_returns], alpha=0.3, color='blue')
+            ax.scatter([ret[0] for ret in pareto_front_values], [ret[1] for ret in pareto_front_values], color='red', s=80)
+            
+            ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}でのパレートフロント")
+            ax.set_xlabel("時間報酬")
+            ax.set_ylabel("コスト")
+            ax.set_xlim(x_range)
+            ax.set_ylim(y_range)
+            ax.grid(True)
+        
+        ani = FuncAnimation(fig, update, frames=len(self.evaluation_history), repeat=True)
+        
+        # 一意のIDを含むファイル名でGIFを保存
+        pareto_gif_filename = f"{save_dir}/pareto_animation_{unique_id}.gif"
+        ani.save(pareto_gif_filename, writer='pillow', fps=2)
+        plt.close()
+        
+        print(f"評価履歴の可視化を保存しました:")
+        print(f" - パレートフロント画像: {pareto_png_filename}")
+        print(f" - アニメーションGIF: {pareto_gif_filename}")
+
+    def save_pareto_solutions_to_txt(self, mode_name="default"):
+        """パレートフロントの解をテキストファイルに保存"""
+        if not self.evaluation_history:
+            print("評価履歴がありません。ファイルは作成されませんでした。")
+            return
+        
+        # 保存ディレクトリの作成
+        save_dir = "pareto_solutions"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 一意のファイル名を作成
+        import datetime
+        import random
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
+        
+        # 最新の評価結果を取得
+        latest_eval = self.evaluation_history[-1]
+        
+        # 結果をテキストファイルに書き込む
+        filename = f"{save_dir}/pareto_solutions_{mode_name}_{unique_id}.txt"
+        try:
+            with open(filename, 'w') as f:
+                # ヘッダー情報
+                f.write(f"# パレートフロント解 - {mode_name}\n")
+                f.write(f"# 日時: {timestamp}\n")
+                f.write(f"# ステップ数: {self.global_step}\n")
+                f.write("\n")
+                
+                # パレートフロントデータ
+                f.write("## パレートフロント\n")
+                if 'pareto_front_values' in latest_eval:
+                    pareto_front_values = latest_eval['pareto_front_values']
+                    for i, solution in enumerate(pareto_front_values):
+                        f.write(f"解 {i+1}: {solution}\n")
+                f.write("\n")
+                
+                # 実際の評価値
+                f.write("## 実際の評価値 (コスト, 実行時間)\n")
+                if 'values' in latest_eval:
+                    values = latest_eval['values']
+                    for i, val in enumerate(values):
+                        f.write(f"値 {i+1}: {val}\n")
+                f.write("\n")
+                
+                # 全解のデータ
+                f.write("## 全ての報酬\n")
+                if 'all_returns' in latest_eval:
+                    all_returns = latest_eval['all_returns']
+                    for i, ret in enumerate(all_returns):
+                        f.write(f"解 {i+1}: {ret}\n")
+                
+                # マップ情報はテキストでは表現しにくいので省略
+                f.write("\n## マップデータは別途画像として保存されます\n")
+            
+            # マップデータの視覚化を別途保存
+            try:
+                if 'maps' in latest_eval:
+                    final_maps = latest_eval['maps']
+                    map_image_path = f"{save_dir}/final_schedule_{mode_name}_{unique_id}.png"
+                    visualize_map(final_maps[0], final_maps[1], [], map_image_path)
+                    f.write(f"マップ画像: {map_image_path}\n")
+                    print(f"スケジュールマップを保存しました: {map_image_path}")
+            except Exception as map_err:
+                print(f"マップ画像の保存中にエラーが発生しました: {map_err}")
+            
+            print(f"パレートフロントデータをテキストファイルに保存しました: {filename}")
+            return filename
+        except Exception as e:
+            print(f"ファイルの保存中にエラーが発生しました: {e}")
+            return None

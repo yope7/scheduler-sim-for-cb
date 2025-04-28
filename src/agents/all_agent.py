@@ -1,6 +1,6 @@
 import numpy as np
 import itertools
-from morl_baselines.common.pareto import get_non_dominated_inds
+from morl_baselines.common.pareto import get_non_dominated_inds_minimize
 from numba import jit
 class ExhaustiveSearchAgent:
     def __init__(self):
@@ -49,13 +49,13 @@ class ExhaustiveSearchAgent:
             # 結果の収集
             waiting_time, cost = env.get_episode_metrics()
             on_premise_map, cloud_map = env.get_windows()
-            epi_summary.append([wt_sum, cost])
+            epi_summary.append([waiting_time, cost])
             reward_summary.append([total_reward[0], total_reward[1]])
             value_cost, value_wt = env.calc_objective_values()
             results.append([value_cost, value_wt])
 
         # パレートフロントの計算
-        non_dominated_inds = get_non_dominated_inds(np.array(results))
+        non_dominated_inds = get_non_dominated_inds_minimize(np.array(results))
         pareto_front = np.array(results)[non_dominated_inds]
         
         return {
