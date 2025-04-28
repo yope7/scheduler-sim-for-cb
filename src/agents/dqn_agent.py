@@ -4,6 +4,9 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 import random
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from morl_baselines.common.pareto import get_non_dominated_inds
 
 class DQNNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -34,8 +37,8 @@ class DQNAgent:
         batch_size=64,
         hidden_dim=256,
         target_update=10,
-        weight_wt=0.7,    # 待ち時間の重み
-        weight_cost=0.3   # コストの重み
+        weight_cost=0.0,
+        weight_id=None  # 重みのID（可視化用）
     ):
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
@@ -58,12 +61,27 @@ class DQNAgent:
         self.batch_size = batch_size
         self.target_update = target_update
         self.steps = 0
-        self.weight_wt = weight_wt
+        self.weight_wt = 1-weight_cost
         self.weight_cost = weight_cost
+        self.weight_id = weight_id if weight_id is not None else f"wt{self.weight_wt:.2f}_cost{self.weight_cost:.2f}"
 
         # 報酬の管理
         self.total_wt_reward = 0
         self.total_cost_reward = 0
+        
+        # 学習履歴の記録用（新規追加）
+        self.training_history = {
+            'episodes': [],     # エピソード番号
+            'wt_values': [],    # 待ち時間の値
+            'cost_values': [],  # コストの値
+            'wt_rewards': [],   # 待ち時間の報酬
+            'cost_rewards': [], # コストの報酬
+            'losses': []        # 損失値
+        }
+        
+        # 評価用の最良値を初期化
+        self.best_wt = float('inf')
+        self.best_cost = float('inf')
 
     def select_action(self, state):
         if random.random() < self.epsilon:
@@ -119,13 +137,34 @@ class DQNAgent:
         self.steps += 1
         return loss.item()
 
-    def train(self, num_episodes, early_stop_threshold=0.01, patience=50, min_episodes=100):
+    def train(self, num_episodes, early_stop_threshold=0.01, patience=50, min_episodes=100, 
+              record_interval=10):
+        """
+        DQNエージェントの学習
+        
+        Args:
+            num_episodes: 学習エピソード数
+            early_stop_threshold: 早期終了の閾値
+            patience: 早期終了の我慢回数
+            min_episodes: 最小エピソード数
+            record_interval: 履歴を記録する間隔（エピソード数）
+        """
         losses = []
         best_loss = float('inf')
         patience_counter = 0
         avg_loss = float('inf')
         min_loss_improvement = 0.001  # 最小改善閾値
         window_size = 10  # 移動平均のウィンドウサイズ
+        
+        # 学習履歴の記録をリセット
+        self.training_history = {
+            'episodes': [],
+            'wt_values': [],
+            'cost_values': [],
+            'wt_rewards': [],
+            'cost_rewards': [],
+            'losses': []
+        }
         
         for episode in range(num_episodes):
             state = self.env.reset()
@@ -151,6 +190,13 @@ class DQNAgent:
                 self.total_wt_reward += reward[0]
                 self.total_cost_reward += reward[1]
                 episode_steps += 1
+                
+            self.env.finalize_window_history()
+            value_cost, value_wt = self.env.calc_objective_values()
+            
+            # 最良値の更新
+            self.best_wt = min(self.best_wt, value_wt)
+            self.best_cost = min(self.best_cost, value_cost)
 
             if episode_losses:
                 avg_loss = sum(episode_losses) / len(episode_losses)
@@ -173,13 +219,27 @@ class DQNAgent:
                             if patience_counter >= patience:
                                 print(f"\nEarly stopping at episode {episode}")
                                 print(f"Loss improvement below threshold: {improvement:.6f}")
+                                
+                                # 履歴を記録
+                                if episode % record_interval == 0 or episode == num_episodes - 1:
+                                    self._record_history(episode, value_wt, value_cost, 
+                                                        self.total_wt_reward, self.total_cost_reward, 
+                                                        avg_loss if episode_losses else None)
                                 break
+
+            # 学習経過の記録（一定間隔）
+            if episode % record_interval == 0 or episode == num_episodes - 1:
+                self._record_history(episode, value_wt, value_cost, 
+                                    self.total_wt_reward, self.total_cost_reward, 
+                                    avg_loss if episode_losses else None)
 
             if episode % 10 == 0:
                 print(f"\nEpisode {episode}")
                 print(f"Total Reward: {total_reward:.2f}")
                 print(f"Waiting Time Reward: {self.total_wt_reward:.2f}")
                 print(f"Cost Reward: {self.total_cost_reward:.2f}")
+                print(f"Cost: {value_cost:.2f}")
+                print(f"Waiting Time: {value_wt:.2f}")
                 if episode_losses:
                     print(f"Average Loss: {avg_loss:.4f}")
                 print(f"Epsilon: {self.epsilon:.3f}")
@@ -188,5 +248,118 @@ class DQNAgent:
 
         return losses
     
+    def _record_history(self, episode, wt, cost, wt_reward, cost_reward, loss):
+        """学習経過を記録"""
+        self.training_history['episodes'].append(episode)
+        self.training_history['wt_values'].append(wt)
+        self.training_history['cost_values'].append(cost)
+        self.training_history['wt_rewards'].append(wt_reward)
+        self.training_history['cost_rewards'].append(cost_reward)
+        if loss is not None:
+            self.training_history['losses'].append(loss)
+    
     def get_rewards(self):
         return self.total_wt_reward, self.total_cost_reward
+    
+    def get_training_history(self):
+        """学習履歴を取得"""
+        return self.training_history
+    
+    def get_best_values(self):
+        """最良の待ち時間とコストを取得"""
+        return self.best_wt, self.best_cost
+    
+    def get_final_values(self):
+        """最終的な待ち時間とコストを取得"""
+        if len(self.training_history['wt_values']) > 0 and len(self.training_history['cost_values']) > 0:
+            return (self.training_history['wt_values'][-1], 
+                    self.training_history['cost_values'][-1])
+        return None, None
+
+    def train_with_history(self, num_episodes, early_stop_threshold=0.01, patience=50, min_episodes=100, record_interval=10):
+        """学習履歴を記録するバージョンのtrain関数"""
+        losses = []
+        best_loss = float('inf')
+        patience_counter = 0
+        avg_loss = float('inf')
+        min_loss_improvement = 0.001
+        window_size = 10
+        
+        # 学習履歴の初期化
+        training_history = {
+            'wt_values': [],    # 待ち時間の値
+            'cost_values': [],  # コストの値
+            'episodes': []      # 対応するエピソード番号
+        }
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            total_reward = 0
+            self.total_wt_reward = 0
+            self.total_cost_reward = 0
+            done = False
+            episode_steps = 0
+            episode_losses = []
+
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, scheduled, wt_step, done = self.env.step(action)
+                self.store_transition(state, action, reward, next_state, done)
+                
+                if len(self.memory) >= self.batch_size:
+                    loss = self.update_model()
+                    if loss is not None:
+                        episode_losses.append(loss)
+                
+                state = next_state
+                total_reward += reward[0] + reward[1]
+                self.total_wt_reward += reward[0]
+                self.total_cost_reward += reward[1]
+                episode_steps += 1
+            
+            self.env.finalize_window_history()
+            cost, makespan = self.env.calc_objective_values()
+            
+            # 学習経過の記録（一定間隔）
+            if episode % record_interval == 0:
+                training_history['episodes'].append(episode)
+                training_history['wt_values'].append(makespan)
+                training_history['cost_values'].append(cost)
+
+            if episode_losses:
+                avg_loss = sum(episode_losses) / len(episode_losses)
+                losses.append(avg_loss)
+                
+                # 移動平均の計算
+                if len(losses) >= window_size:
+                    current_avg = np.mean(losses[-window_size:])
+                    if len(losses) >= window_size * 2:
+                        prev_avg = np.mean(losses[-window_size*2:-window_size])
+                        improvement = (prev_avg - current_avg) / prev_avg
+                        
+                        # 早期終了の条件チェック
+                        if episode >= min_episodes:
+                            if improvement < min_loss_improvement:
+                                patience_counter += 1
+                            else:
+                                patience_counter = 0
+                            
+                            if patience_counter >= patience:
+                                print(f"\nEarly stopping at episode {episode}")
+                                print(f"Loss improvement below threshold: {improvement:.6f}")
+                                break
+
+            if episode % 10 == 0:
+                print(f"\nEpisode {episode}")
+                print(f"Total Reward: {total_reward:.2f}")
+                print(f"Waiting Time Reward: {self.total_wt_reward:.2f}")
+                print(f"Cost Reward: {self.total_cost_reward:.2f}")
+                print(f"Cost: {cost:.2f}")
+                print(f"Waiting Time: {makespan:.2f}")
+                if episode_losses:
+                    print(f"Average Loss: {avg_loss:.4f}")
+                print(f"Epsilon: {self.epsilon:.3f}")
+                if len(losses) >= window_size:
+                    print(f"Loss Moving Average: {current_avg:.4f}")
+
+        return losses, training_history

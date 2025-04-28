@@ -461,7 +461,7 @@ class SchedulingEnv(gym.core.Env):
     def calc_objective_values(self):
         # 待ち時間とコストを計算　
 
-        """待ち時間の定義は，ジョブが到着してから，ジョブが開始するまでの時間．
+        """return:cost,makespan 待ち時間の定義は，ジョブが到着してから，ジョブが開始するまでの時間．
         つまり，各ステップにおける遅延時間の総和をとればよい．
         """
         # self.waiting_time = 
@@ -773,4 +773,140 @@ class SchedulingEnv(gym.core.Env):
         right_edges = [np.max(np.where(row != 0)[0]) if np.any(row != 0) else -1 for row in self.cloud_window['job_id']]
         sorted_indices = np.argsort(right_edges)
         self.cloud_window['job_id'] = self.cloud_window['job_id'][sorted_indices]
- 
+
+    def visualize_evaluation_history(self, save_dir="evaluation_history"):
+        """評価履歴を可視化し、実際の値（実行時間とコスト）を表示"""
+        if not self.evaluation_history:
+            print("評価履歴がありません")
+            return
+        
+        # ディレクトリ作成
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 一意のIDを生成
+        import datetime
+        import random
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
+        
+        # 実際の値を抽出
+        all_actual_values = []
+        for history in self.evaluation_history:
+            # valuesには[value_cost, value_wt]の配列が保存されている
+            actual_values = []
+            for val in history['values']:
+                actual_values.append(val)  # [コスト, 実行時間]のリスト
+            all_actual_values.append(actual_values)
+        
+        # 表示範囲の計算
+        all_x_values = []  # 実行時間
+        all_y_values = []  # コスト値
+        
+        for values_list in all_actual_values:
+            for val in values_list:
+                # values[1]が実行時間、values[0]がコスト
+                all_x_values.append(val[1])  # 実行時間
+                all_y_values.append(val[0])  # コスト
+        
+        # 表示範囲の計算（少しマージンを追加）
+        if all_x_values and all_y_values:
+            x_min, x_max = min(all_x_values), max(all_x_values)
+            y_min, y_max = min(all_y_values), max(all_y_values)
+            x_margin = (x_max - x_min) * 0.1 if x_max != x_min else 1.0
+            y_margin = (y_max - y_min) * 0.1 if y_max != y_min else 1.0
+            x_range = [x_min - x_margin, x_max + x_margin]
+            y_range = [y_min - y_margin, y_max + y_margin]
+        else:
+            # デフォルト範囲（データがない場合）
+            x_range = [0, 10]
+            y_range = [0, 10]
+        
+        # パレートフロントの進化を可視化（実際の値を使用）
+        plt.figure(figsize=(15, 10))
+        
+        # 各評価時点のパレートフロントをプロット
+        colors = plt.cm.viridis(np.linspace(0, 1, len(self.evaluation_history)))
+        
+        for i, (history, step) in enumerate(zip(self.evaluation_history, self.global_steps_at_evaluation)):
+            # 非支配解のインデックスを抽出
+            non_dominated_inds = get_non_dominated_inds(np.array(history['all_returns']))
+            
+            # 非支配解に対応する実際の値を取得
+            actual_values = np.array(history['values'])
+            pareto_actual_values = actual_values[non_dominated_inds]
+            
+            # 実際の値をプロット（x軸：実行時間、y軸：コスト）
+            plt.scatter(
+                [val[1] for val in pareto_actual_values],  # 実行時間
+                [val[0] for val in pareto_actual_values],  # コスト
+                color=colors[i], 
+                label=f"Step {step}",
+                alpha=0.7
+            )
+        
+        plt.title("実際の値によるパレートフロントの進化")
+        plt.xlabel("実行時間")
+        plt.ylabel("コスト")
+        plt.xlim(x_range)
+        plt.ylim(y_range)
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.grid(True)
+        plt.tight_layout()
+        
+        # 一意のIDを含むファイル名で保存
+        pareto_png_filename = f"{save_dir}/pareto_evolution_actual_{unique_id}.png"
+        plt.savefig(pareto_png_filename)
+        plt.close()
+        
+        # 最終評価のスケジューリングマップを可視化
+        final_maps = self.evaluation_history[-1]['maps']
+        final_schedule_filename = f"{save_dir}/final_schedule_{unique_id}.png"
+        visualize_map(final_maps[0], final_maps[1], [], final_schedule_filename)
+        
+        # アニメーション作成（実際の値を使用）
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        def update(frame):
+            ax.clear()
+            history = self.evaluation_history[frame]
+            
+            # 全ての解の実際の値をプロット
+            all_actual_values = np.array(history['values'])
+            
+            # 非支配解のインデックスを取得
+            non_dominated_inds = get_non_dominated_inds(np.array(history['all_returns']))
+            pareto_actual_values = all_actual_values[non_dominated_inds]
+            
+            # 全ての解をプロット
+            ax.scatter(
+                [val[1] for val in all_actual_values],  # 実行時間
+                [val[0] for val in all_actual_values],  # コスト
+                alpha=0.3, color='blue', label="全ての解"
+            )
+            
+            # パレートフロントをプロット
+            ax.scatter(
+                [val[1] for val in pareto_actual_values],  # 実行時間
+                [val[0] for val in pareto_actual_values],  # コスト
+                color='red', s=80, label="パレートフロント"
+            )
+            
+            ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}での実際の値によるパレートフロント")
+            ax.set_xlabel("実行時間")
+            ax.set_ylabel("コスト")
+            ax.set_xlim(x_range)
+            ax.set_ylim(y_range)
+            ax.grid(True)
+            ax.legend()
+        
+        ani = FuncAnimation(fig, update, frames=len(self.evaluation_history), repeat=True)
+        
+        # 一意のIDを含むファイル名でGIFを保存
+        pareto_gif_filename = f"{save_dir}/pareto_animation_actual_{unique_id}.gif"
+        ani.save(pareto_gif_filename, writer='pillow', fps=2)
+        plt.close()
+        
+        print(f"実際の値による評価履歴の可視化を保存しました:")
+        print(f" - パレートフロント画像: {pareto_png_filename}")
+        print(f" - スケジュール画像: {final_schedule_filename}")
+        print(f" - アニメーションGIF: {pareto_gif_filename}") 
