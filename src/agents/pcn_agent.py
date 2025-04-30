@@ -410,7 +410,8 @@ class PCN(MOAgent, MOPolicy):
             obs = n_obs
             wt_sum += wt_step
             desired_return = np.clip(desired_return - reward, None, max_return, dtype=np.float32)
-            desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
+            if scheduled:
+                desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
         onpre_final = env.on_premise_window_history_full
         cloud_final = env.cloud_window_history_full
         value_cost, value_wt = env.calc_objective_values()
@@ -653,6 +654,7 @@ class PCN(MOAgent, MOPolicy):
 
         # fill buffer with random episodes
         self.experience_replay = []
+        num_count = 0
         for _ in range(num_er_episodes):
             transitions = []
             obs = self.env.reset()
@@ -663,16 +665,24 @@ class PCN(MOAgent, MOPolicy):
             while not done: #1周目のやつ
                 # print("obs: ",obs)
                 action = self.env.action_space.sample()
+                # print("action: ",action)
                 n_obs, reward, scheduled, wt_step, done = self.env.step(action)
                 # print("steped")
+                # print("reward: ",reward)
+                # print("scheduled: ",scheduled)
+                # input()
                 if done:
                     # print("terminated")
                     self.env.finalize_window_history()
+                    num_count += 1
                 # print("fifo", fifo)
                 # print("reward", reward)
                 transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, done))
                 obs = n_obs
                 self.global_step += 1
+                
+                if num_count % 1000 == 0 and num_count != 0 and (num_count // 1000) > (num_count - 1) // 1000:
+                    print("num_count: ", num_count)
 
             # self.env.render_map()
 

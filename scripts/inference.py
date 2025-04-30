@@ -46,15 +46,29 @@ env = SchedulingEnv(
     None, flag=0
 )
 
-# モデルファイルの確認
-model_path = "PCN_model_mini_long"
-model_file = f"weights/{model_path}.pt"
-if not os.path.exists(model_file):
-    print(f"エラー: モデルファイル {model_file} が見つかりません")
-    sys.exit(1)
-else:
-    file_size = os.path.getsize(model_file) / (1024 * 1024)
-    print(f"モデルファイルを確認: {model_file} (サイズ: {file_size:.2f} MB)")
+
+
+# モデルファイルの選択部分を対話型に変更
+print("\n利用可能なモデルファイル:")
+model_files = [f for f in os.listdir('weights') if f.endswith('.pt')]
+for i, file in enumerate(model_files, 1):
+    print(f"{i}. {file}")
+
+while True:
+    try:
+        choice = int(input("\n使用するモデルファイルの番号を入力してください: "))
+        if 1 <= choice <= len(model_files):
+            model_path = model_files[choice-1]
+            model_file = f"weights/{model_path}"
+            break
+        else:
+            print("無効な番号です。もう一度入力してください。")
+    except ValueError:
+        print("数値を入力してください。")
+
+print(f"\n選択されたモデル: {model_path}")
+file_size = os.path.getsize(model_file) / (1024 * 1024)
+print(f"モデルファイルのサイズ: {file_size:.2f} MB")
 
 # エージェントの初期化
 agent = PCN(
@@ -147,11 +161,11 @@ import numpy as np
 
 # -1000から1000までの対数スケールで20個の値を生成
 reward_ranges = [
-    np.linspace(-1000, 1000, 15).tolist(),  # 目標報酬1の候補
-    np.linspace(-1000, 1000, 15).tolist()   # 目標報酬2の候補
+    np.linspace(-1000, 1000, 250).tolist(),  # 目標報酬1の候補
+    np.linspace(-1000, 1000, 250).tolist()   # 目標報酬2の候補
 ]
 
-horizon_values = [150]  # ホライズンの候補
+horizon_values = [180]  # ホライズンの候補
 
 # 全組み合わせの生成
 param_combinations = []
