@@ -98,9 +98,9 @@ def set_and_train(nb_steps, lams, loops, how_many_episodes,ob_number,nb_jobs):
         env,
         device="auto",
         state_dim=1,
-        scaling_factor=np.array([1, 1, 1]),
-        learning_rate=1e-2,
-        batch_size=4096,
+        scaling_factor=np.array([1, 0.01, 1.0]),
+        learning_rate=1e-3,
+        batch_size=1024,
         hidden_dim=256,
         project_name="temp",
         experiment_name="PCN",
@@ -110,9 +110,9 @@ def set_and_train(nb_steps, lams, loops, how_many_episodes,ob_number,nb_jobs):
         eval_env=env,
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([-1000,-1000]),
-        num_er_episodes=10,
-        num_step_episodes=50,  
-        num_model_updates=2,
+        num_er_episodes=2000,
+        num_step_episodes=200,  
+        num_model_updates=1000,
         max_buffer_size=5000,
         known_pareto_front=[1, 1],
     )
@@ -257,23 +257,23 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         env,
         device="auto",
         state_dim=1,
-        scaling_factor=np.array([1, 1, 1]),
-        learning_rate=1e-2,
+        scaling_factor=np.array([0.01, 0.0003,1]),
+        learning_rate=1e-3,
         batch_size=4096,
         hidden_dim=256,
         project_name="temp",
         experiment_name="PCN",
-        log=True,
+        log=False,
     )
     
     agent.train(
         eval_env=env,
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([-1000,-1000]),
-        num_er_episodes=1000,
-        num_step_episodes=100,  
-        num_model_updates=100,
-        max_buffer_size=1024,
+        num_er_episodes=5000,
+        num_step_episodes=500,  
+        num_model_updates=500,
+        max_buffer_size=4096,
         known_pareto_front=[1, 1],
     )
 
@@ -650,10 +650,10 @@ if __name__ == "__main__":
         # 強化学習モードのパラメータ設定と実行
         loops = 0
         lams = [0.2] * loops
-        how_many_episodes = 2000000
+        how_many_episodes = 3000000
         #11ジョブなら70000でだいたい収束
         ob_number = 1
-        nb_jobs = 100
+        nb_jobs = args.nb_jobs
         mapmap = run_PCN_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
         print("PCN強化学習による実行が完了しました")
 
@@ -662,7 +662,7 @@ if __name__ == "__main__":
         lams = [0.2] * loops
         how_many_episodes = 50000
         ob_number = 1
-        nb_jobs = 11
+        nb_jobs = args.nb_jobs
         mapmap = run_single_rl_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
         print("単目的強化学習による実行が完了しました")
 
