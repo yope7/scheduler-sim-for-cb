@@ -196,127 +196,119 @@ class SchedulingEnv(gym.core.Env):
 
     # 各ステップで実行される操作
     def step(self, action_raw):
+        while True:
+            # print(self.job_queue)
+            # print(f"Current exe_mode: {exe_mode}")  # デバッグ用
+            scheduled = False
 
-        # print(self.job_queue)
-        # print(f"Current exe_mode: {exe_mode}")  # デバッグ用
-        scheduled = False
-
-        valid_action_cache = {}
+            valid_action_cache = {}
 
 
-        time_reward_new = 0
-        # self.user_wt = [[i,-100] for i in range(100)]
-        # 時刻
-        time = self.time
-        allocated_job = self.job_queue[0]
-        action = self.get_converted_action(action_raw)   
-        wt_step = 0
-        is_valid = False  # actionが有効かどうか
-
-        # print(self.on_premise_window)
-
-        # self.rearrange_window()
-        # print(self.on_premise_window)
-
-        is_valid, wt_real, position = self.check_is_valid_action(action)
-        # print("job_queue head: ",self.job_queue[0])
-        # print("is_valid: ",is_valid)
-
-        if is_valid == False:  # すきまがない場合or job_queueが空の場合
-            # print("allocated_job: ",allocated_job)
-            if np.all(allocated_job == 0):  # ジョブキューが空の場合
-                job_none = True
-                # 全体的に時間を進める必要がある場合は両方スライド
-                if action[1] == 0:
-                    self.time_transition(True, True)
-                else:
-                    self.time_transition(True, True)
-            else:  # ジョブキューが空でない場合
-                job_none = False
-                # どちらのリソースへの割当てが失敗したかを判断
-                if action[1] == 0:  # オンプレミスへの割当てが失敗した場合
-                    self.time_transition(True, True)  # オンプレミスのみスライド
-                else:  # クラウドへの割当てが失敗した場合
-                    self.time_transition(False, True)  # クラウドのみスライド
-            # print('is_valid: ' + str(is_valid))
-            # print("time_transition")
-
-            var_reward = 0
-            var_after = 0
+            time_reward_new = 0
+            # self.user_wt = [[i,-100] for i in range(100)]
+            # 時刻
+            time = self.time
+            allocated_job = self.job_queue[0]
+            action = self.get_converted_action(action_raw)   
             wt_step = 0
-            std_mean_before = 0
-            std_mean_after = 0
-            std_reward = 0
-        else:
-            job_none = False
-            job = self.job_queue[0]
-            is_valid = True
-            # print('valid action')
+            is_valid = False  # actionが有効かどうか
+
+            # print(self.on_premise_window)
+
+            # self.rearrange_window()
+            # print(self.on_premise_window)
+
+            is_valid, wt_real, position = self.check_is_valid_action(action)
+            # print("job_queue head: ",self.job_queue[0])
+            # print("is_valid: ",is_valid)
+
+            if is_valid == False:  # すきまがない場合or job_queueが空の場合
+                # print("allocated_job: ",allocated_job)
+                if np.all(allocated_job == 0):  # ジョブキューが空の場合
+                    job_none = True
+                    # 全体的に時間を進める必要がある場合は両方スライド
+                    self.time_transition(True, True)
+                else:  # ジョブキューが空でない場合
+                    job_none = False
+                    # どちらのリソースへの割当てが失敗したかを判断
+                    if action[1] == 0:  # オンプレミスへの割当てが失敗した場合
+                        self.time_transition(True, False)  # オンプレミスのみスライド
+                    else:  # クラウドへの割当てが失敗した場合
+                        self.time_transition(False, True)  # クラウドのみスライド
+                # print('is_valid: ' + str(is_valid))
+                # print("time_transition")
+
+                var_reward = 0
+                var_after = 0
+                wt_step = 0
+                std_mean_before = 0
+                std_mean_after = 0
+                std_reward = 0
+                continue
+            else:
+                job_none = False
+                job = self.job_queue[0]
+                is_valid = True
+                # print('valid action')
 
 
-            if action[1] == 0:
-                if (0,1) in valid_action_cache:
-                    is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,1)]
-                else:
-                    is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,1])
-                    valid_action_cache[(0,1)] = (is_valid_parallel,wt_parallel,piyo)
-            if action[1] == 1:
-                if (0,0) in valid_action_cache:
-                    is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,0)]
-                else:
-                    is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,0])
-                    valid_action_cache[(0,0)] = (is_valid_parallel,wt_parallel,piyo)
+                if action[1] == 0:
+                    if (0,1) in valid_action_cache:
+                        is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,1)]
+                    else:
+                        is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,1])
+                        valid_action_cache[(0,1)] = (is_valid_parallel,wt_parallel,piyo)
+                if action[1] == 1:
+                    if (0,0) in valid_action_cache:
+                        is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,0)]
+                    else:
+                        is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,0])
+                        valid_action_cache[(0,0)] = (is_valid_parallel,wt_parallel,piyo)
 
-            # 並列実行時の待ち時間と実際の待ち時間を比較して報酬を決定
-            time_reward_new = (
-                1 if wt_real < wt_parallel else  # 実際の方が短い
-                0 if wt_real == wt_parallel else # 同じ待ち時間
-                -1                               # 実際の方が長い
-            )
-            # print("time_reward_new: ",time_reward_new)
+                # 並列実行時の待ち時間と実際の待ち時間を比較して報酬を決定
+                time_reward_new = (
+                    1 if wt_real < wt_parallel else  # 実際の方が短い
+                    0 if wt_real == wt_parallel else # 同じ待ち時間
+                    -1                               # 実際の方が長い
+                )
+                # print("time_reward_new: ",time_reward_new)
 
-            if action[0] == 0:  # FIFO
-                # print('job_queue before fio\n',self.job_queue)
-                wt_step = self.do_schedule(action,job,position)
-                scheduled = True
-                # print("wt_step: ",wt_step)
-                # print('schedule fifo')
-                #ジョブキューをスライド
-                self.job_queue = np.roll(self.job_queue, -1, axis=0)
-                self.job_queue[-1] = 0
-                self.rear_job_queue -= 1
+                if action[0] == 0:  # FIFO
+                    # print('job_queue before fio\n',self.job_queue)
+                    wt_step = self.do_schedule(action,job,position)
+                    scheduled = True
+                    # print("wt_step: ",wt_step)
+                    # print('schedule fifo')
+                    #ジョブキューをスライド
+                    self.job_queue = np.roll(self.job_queue, -1, axis=0)
+                    self.job_queue[-1] = 0
+                    self.rear_job_queue -= 1
 
+                    # 観測データ(状態)を取得
+                    observation = self.get_observation()
+                    # 報酬を取得
+                    # reward = self.get_reward(action, allocated_job, time, is_valid, job_none)
+                    # コストを取得
+                    cost = self.compute_cost(action, allocated_job, is_valid)
 
-        
-        # 観測データ(状態)を取得
-        observation = self.get_observation()
-        # 報酬を取得
-        # reward = self.get_reward(action, allocated_job, time, is_valid, job_none)
-        # コストを取得
-        cost = self.compute_cost(action, allocated_job, is_valid)
+                    # エピソードの終了時刻を満たしているかの判定
+                    done = self.check_is_done()
+                    # done = False
+                    # print("done: ",done)
 
-        # エピソードの終了時刻を満たしているかの判定
-        done = self.check_is_done()
-        # done = False
-        # print("done: ",done)
+                    # print("self.job_queue: \n",self.job_queue)
+                    
+                    # self.show_final_window_history()
 
-        # print("self.job_queue: \n",self.job_queue)
-        
-        # self.show_final_window_history()
+                    # input()
 
-        # input()
+                    # print("time: ",time)
+                    # print('================================================')
+                    # print('self.user_wt: ',self.user_wt)
 
-        # print("time: ",time)
-        # print('================================================')
-        # print('self.user_wt: ',self.user_wt)
+                    rewards = np.array([time_reward_new,cost])
 
-        rewards = np.array([time_reward_new,cost])
-        # print("rewards cost: ",rewards[1])
-
-
-
-        #         return observation, reward, cost, time, waiting_time, done, info
-        return observation, rewards, scheduled, wt_step, done
+                    return observation, rewards, scheduled, wt_step, done
 
     def get_next_init_windows(self):
         return self.next_init_windows
