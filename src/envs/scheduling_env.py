@@ -581,13 +581,16 @@ class SchedulingEnv(gym.core.Env):
         # obs_cloud_window_job_id = self.cloud_window['job_id'].flatten()
 
         # ジョブキューの観測部分の観測データ
-        obs_job_queue_obs = self.job_queue[:10, :4].flatten()
+        obs_job_queue_obs = self.job_queue[:10].flatten()
 
         observation = np.concatenate([
             obs_on_premise_window_status,
             obs_cloud_window_status,
             obs_job_queue_obs
         ]).astype(np.float32)
+
+        print("observation: ", observation)
+        input()
 
         return observation
 
