@@ -111,8 +111,8 @@ def set_and_train(nb_steps, lams, loops, how_many_episodes,ob_number,nb_jobs):
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([-1000,-1000]),
         num_er_episodes=2000,
-        num_step_episodes=200,  
-        num_model_updates=1000,
+        num_step_episodes=20,  
+        num_model_updates=10,
         max_buffer_size=5000,
         known_pareto_front=[1, 1],
     )
@@ -176,9 +176,12 @@ def parse_args():
     # 既存の引数
     parser.add_argument('--how_many_episodes', type=int, default=1000)
     parser.add_argument('--nb_jobs', type=int, default=11)
+    # CNN関連の引数
+    parser.add_argument('--use_cnn', action='store_true', 
+                      help='PCNモードでCNNベースの拡張モデルを使用する')
     # NSGA-II用の引数
-    parser.add_argument('--pop_size', type=int, default=50, help='NSGA-IIの集団サイズ')
-    parser.add_argument('--num_generations', type=int, default=100, help='NSGA-IIの世代数')
+    parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
+    parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
     return parser.parse_args()
 
 def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
@@ -236,7 +239,7 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     return 0
 
 def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                ob_number: int, nb_jobs: int) -> list:
+                ob_number: int, nb_jobs: int, use_cnn: bool = True) -> list:
     """PCN強化学習モードの実行"""
     next_init_windows = None
     values_all = []
@@ -253,34 +256,37 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         next_init_windows, flag=0
     )
 
+    # CNN拡張モデルを使用するかどうかを設定
     agent = PCN(
         env,
         device="auto",
         state_dim=1,
-        scaling_factor=np.array([0.01, 0.0003,1]),
-        learning_rate=1e-3,
-        batch_size=1024,
+        scaling_factor=np.array([0.1, 0.01, 1]),
+        learning_rate=1e-2,
+        batch_size=512,
         hidden_dim=256,
         project_name="temp",
-        experiment_name="PCN",
+        experiment_name="PCN_Enhanced" if use_cnn else "PCN",
         log=False,
+        use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
+        debug_mode=False,  # デバッグモードをオフに設定
     )
     
     agent.train(
         eval_env=env,
         total_timesteps=int(how_many_episodes),
-        ref_point=np.array([-100,-100]),
-        num_er_episodes=5000,
+        ref_point=np.array([0,0]),
+        num_er_episodes=10000,
         num_step_episodes=500,  
-        num_model_updates=500,
-        max_buffer_size=4096,
+        num_model_updates=2,
+        max_buffer_size=10000,
         known_pareto_front=[1, 1],
+        max_return=np.array([1000, 1000]),
     )
 
     on_premise_map, cloud_map = env.get_windows()
     # print(env.calc_objective_values())
     # print(agent.get_e_returns())
-
 
     agent.visualize_evaluation_history()
 
@@ -485,7 +491,9 @@ def visualize_training_progress(training_histories):
     
     plt.xlabel('コスト', fontsize=14)
     plt.ylabel('待ち時間', fontsize=14)
-    plt.title('パレートフロント', fontsize=16)
+    plt.title("パレートフロントの進化", fontname='IPAexGothic')
+    plt.xlabel("時間報酬", fontname='IPAexGothic')
+    plt.ylabel("コスト", fontname='IPAexGothic')
     plt.grid(True, alpha=0.3)
     plt.legend(loc='best')
     
@@ -642,7 +650,6 @@ def visualize_nsga2_results(result):
         print(f"{i+1:2d} | {obj[0]:7.2f} | {obj[1]:7.2f}")
 
 if __name__ == "__main__":
-
     # コマンドライン引数の解析
     args = parse_args()
 
@@ -650,12 +657,16 @@ if __name__ == "__main__":
         # 強化学習モードのパラメータ設定と実行
         loops = 0
         lams = [0.2] * loops
-        how_many_episodes = 3000000
-        #11ジョブなら70000でだいたい収束
+        how_many_episodes = 1000000
         ob_number = 1
         nb_jobs = args.nb_jobs
-        mapmap = run_PCN_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
+        mapmap = run_PCN_mode(
+            nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
+            use_cnn=args.use_cnn  # CNNを使用するかどうかをコマンドライン引数から設定
+        )
         print("PCN強化学習による実行が完了しました")
+        if args.use_cnn:
+            print("CNNベースの拡張モデルを使用しました")
 
     elif args.mode == 'single':
         loops = 0
@@ -707,7 +718,7 @@ if __name__ == "__main__":
     # agent2 = PCN(
     #     env2,
     #     device = "cpu",
-    #     scaling_factor=np.array([1, 1,1]),
+    #     scaling_factor=np.array([1, 1,1])
     #     learning_rate=1e-3,
     #     batch_size=256,
     #     project_name="MORL-Baselines",

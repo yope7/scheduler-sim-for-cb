@@ -118,9 +118,13 @@ class SchedulingEnv(gym.core.Env):
         self.action_space = gym.spaces.Discrete(self.n_action)  # 行動空間
         self.tmp_queue = deque()  # 割り当てられなかったジョブを一時的に格納するキュー
         obs_space_size = (self.n_on_premise_node * self.n_window +
-                          self.n_cloud_node * self.n_window +
-                          4 * self.n_job_queue_obs + 1)
-        self.observation_space = spaces.Discrete(obs_space_size)
+                         self.n_cloud_node * self.n_window +
+                         8 * 5)  # 全ジョブ属性(8)×5ジョブ
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, 
+            shape=(obs_space_size,), 
+            dtype=np.float32
+        )
         self.reward_space = spaces.Box(low=-100, high=100, shape=(2,), dtype=np.float32)
         self.spec = EnvSpec(id='SimpleScheduling-v0', entry_point='schedulingEnv:SchedulingEnv')
 
@@ -573,25 +577,20 @@ class SchedulingEnv(gym.core.Env):
 
     # 観測データ(状態)を取得
     def get_observation(self):
-        # オンプレミスとクラウドのウィンドウの最後の10行を取得
+        # オンプレミスとクラウドのウィンドウ情報をフラット化
         obs_on_premise_window_status = self.on_premise_window['status'].flatten()
-
-        # obs_on_premise_window_job_id = self.on_premise_window['job_id'].flatten()
         obs_cloud_window_status = self.cloud_window['status'].flatten()
-        # obs_cloud_window_job_id = self.cloud_window['job_id'].flatten()
-
-        # ジョブキューの観測部分の観測データ
-        obs_job_queue_obs = self.job_queue[:10].flatten()
-
+        
+        # ジョブキューを全属性含めてフラット化
+        obs_job_queue_obs = self.job_queue[:5].flatten()
+        
+        # 1次元配列として連結
         observation = np.concatenate([
             obs_on_premise_window_status,
             obs_cloud_window_status,
             obs_job_queue_obs
         ]).astype(np.float32)
-
-        print("observation: ", observation)
-        input()
-
+        
         return observation
 
     # 報酬を取得

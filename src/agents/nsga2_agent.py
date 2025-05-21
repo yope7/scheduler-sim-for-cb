@@ -43,7 +43,7 @@ class NSGA2Agent:
                  pop_size: int = 50, 
                  num_generations: int = 100,
                  crossover_prob: float = 0.9,
-                 mutation_prob: float = 0.3
+                 mutation_prob: float = 0.6
                  ):
         """
         Args:
