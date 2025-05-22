@@ -862,8 +862,9 @@ class PCN(MOAgent, MOPolicy):
         # we will compute distance of each point with each non-dominated point,
         # duplicate each point with number of non_dominated to compute respective distance
         returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(non_dominated), 1))
-        # distance to closest non_dominated point
-        l2 = np.min(np.linalg.norm(returns_exp - non_dominated, axis=-1, dtype=np.float64), axis=-1) * -1
+        # distance to closest non_dominated point - np.linalg.normはdtype引数を受け付けないので、入力を先にキャスト
+        diff_array = (returns_exp - non_dominated).astype(np.float64)
+        l2 = np.min(np.linalg.norm(diff_array, axis=-1), axis=-1) * -1
         # all points that are too close together (crowding distance < threshold) get a penalty
         non_dominated_i = np.nonzero(non_dominated_i)[0]
         _, unique_i = np.unique(non_dominated, axis=0, return_index=True)
