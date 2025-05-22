@@ -538,6 +538,7 @@ class PCN(MOAgent, MOPolicy):
 
         model_class: Optional[Type[BasePCNModel]] = None,
         use_enhanced_model: bool = False,
+        log_episode_only: bool = True,
         debug_mode: bool = True,
     ) -> None:
         """Initialize PCN agent.
@@ -1130,6 +1131,7 @@ class PCN(MOAgent, MOPolicy):
         known_pareto_front: Optional[List[np.ndarray]] = None,
         num_points_pf: int = 200,
         log_episode_only: bool = True,
+        use_wandb: bool = True,
     ):
         """Train PCN with support for safe termination."""
         # シグナルハンドラを登録
