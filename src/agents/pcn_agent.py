@@ -1129,6 +1129,7 @@ class PCN(MOAgent, MOPolicy):
         max_return: np.ndarray = None,
         known_pareto_front: Optional[List[np.ndarray]] = None,
         num_points_pf: int = 200,
+        log_episode_only: bool = True,
     ):
         """Train PCN with support for safe termination."""
         # シグナルハンドラを登録
@@ -1154,6 +1155,7 @@ class PCN(MOAgent, MOPolicy):
                         "max_return": max_return.tolist(),
                         "max_buffer_size": max_buffer_size,
                         "num_points_pf": num_points_pf,
+                        "log_episode_only": log_episode_only,
                     }
                 )
                 
@@ -1198,6 +1200,10 @@ class PCN(MOAgent, MOPolicy):
                         # 1000エピソードごとに進捗表示
                         if num_count % 1000 == 0:
                             print(f"Completed {num_count} episodes for experience replay buffer.")
+                            
+                            # log_episode_onlyがTrueの場合は、エピソード数のみをログに記録
+                            if log_episode_only and self.log:
+                                wandb.log({"episodes": num_count})
                     
                     transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, done))
                     obs = n_obs
@@ -1240,7 +1246,7 @@ class PCN(MOAgent, MOPolicy):
 
                 # 既存のログコード
                 leaves_r = np.array([e[2][0].reward for e in self.experience_replay[len(self.experience_replay) // 2 :]])
-                if self.log:
+                if self.log and not log_episode_only:
                     hv = hypervolume(ref_point, leaves_r)
                     hv_est = hv
                     wandb.log(
@@ -1274,7 +1280,7 @@ class PCN(MOAgent, MOPolicy):
                     # エピソードごとの待ち時間とコストを取得
                     _, total_cost = self.env.get_episode_metrics()
 
-                    if self.log:
+                    if self.log and not log_episode_only:
                         wandb.log(
                             {
                                 "episode/wt_sum": wt_sum,
@@ -1290,9 +1296,13 @@ class PCN(MOAgent, MOPolicy):
                     break
 
                 total_episodes += num_step_episodes
+                
+                # log_episode_onlyがTrueの場合は、エピソード数のみをログに記録
+                if self.log and log_episode_only:
+                    wandb.log({"episodes": total_episodes})
 
                 # 既存のログ処理
-                if self.log and len(returns) > 0:  # 中断時に空の場合に備えて確認
+                if self.log and not log_episode_only and len(returns) > 0:  # 中断時に空の場合に備えて確認
                     wandb.log(
                         {
                             "train/episode": total_episodes,
