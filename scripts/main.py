@@ -4,38 +4,6 @@ import sys
 import argparse
 import itertools
 import matplotlib.pyplot as plt
-import signal  # シグナル処理のためのモジュールを追加
-
-# グローバル終了フラグ
-TERMINATE_SOFT = False  # 通常終了フラグ
-TERMINATE_HARD = False  # 強制終了フラグ
-
-# 強制終了用のシグナルハンドラを定義
-def force_quit_handler(sig, frame):
-    global TERMINATE_HARD
-    print("\n強制終了シグナルを受信しました。安全に終了します...")
-    TERMINATE_HARD = True
-
-# 通常終了用のシグナルハンドラを定義
-def normal_quit_handler(sig, frame):
-    global TERMINATE_SOFT
-    print("\n中断シグナルを受信しました。安全に終了するまでお待ちください...")
-    print("即座に強制終了するにはCtrl+\\を押してください。")
-    TERMINATE_SOFT = True
-
-# SIGQUITシグナル（Ctrl+\）をハンドラに登録
-signal.signal(signal.SIGQUIT, force_quit_handler)
-# SIGINTシグナル（Ctrl+C）をハンドラに登録
-signal.signal(signal.SIGINT, normal_quit_handler)
-
-# 終了フラグをチェックする関数
-def check_termination():
-    if TERMINATE_HARD:
-        print("強制終了を実行します。")
-        sys.exit(2)
-    if TERMINATE_SOFT:
-        print("安全に終了しています...")
-        sys.exit(0)
 
 from src.agents.pcn_agent import PCN  
 from src.envs.scheduling_env import SchedulingEnv
@@ -211,9 +179,6 @@ def parse_args():
     # CNN関連の引数
     parser.add_argument('--use_cnn', action='store_true', 
                       help='PCNモードでCNNベースの拡張モデルを使用する')
-    # wandb関連の引数
-    parser.add_argument('--use_wandb', action='store_true',
-                      help='wandbを使用してエピソード数を定期的に送信する')
     # NSGA-II用の引数
     parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
     parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
@@ -274,7 +239,7 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     return 0
 
 def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                 ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False) -> list:
+                ob_number: int, nb_jobs: int, use_cnn: bool = True) -> list:
     """PCN強化学習モードの実行"""
     next_init_windows = None
     values_all = []
@@ -291,9 +256,6 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         next_init_windows, flag=0
     )
 
-    # 終了フラグのチェック
-    check_termination()
-
     # CNN拡張モデルを使用するかどうかを設定
     agent = PCN(
         env,
@@ -305,62 +267,22 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         hidden_dim=256,
         project_name="temp",
         experiment_name="PCN_Enhanced" if use_cnn else "PCN",
-        log=use_wandb,  # wandbによるログ記録を設定
+        log=False,
         use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
         debug_mode=False,  # デバッグモードをオフに設定
     )
     
-    # PCNエージェントのtrainメソッドを修正して定期的に終了フラグをチェックするようなラッパー関数
-    def train_with_termination_check(agent, **kwargs):
-        # オリジナルのtrainメソッドの引数を保持
-        original_train = agent.train
-        
-        # 現在のステップ数を追跡する変数
-        current_step = 0
-        check_interval = 100  # 何ステップごとにチェックするか
-        
-        # ラップされたコールバック関数
-        def wrapped_callback(*args, **callback_kwargs):
-            nonlocal current_step
-            current_step += 1
-            
-            # 定期的に終了フラグをチェック
-            if current_step % check_interval == 0:
-                check_termination()
-            
-            # 元のコールバックがあれば呼び出す
-            if 'callback' in kwargs and kwargs['callback'] is not None:
-                return kwargs['callback'](*args, **callback_kwargs)
-            return True
-        
-        # コールバックを上書き
-        train_kwargs = kwargs.copy()
-        train_kwargs['callback'] = wrapped_callback
-        
-        # オリジナルのtrainメソッドを呼び出す
-        return original_train(**train_kwargs)
-    
-    # 終了フラグのチェック
-    check_termination()
-    
-    # 修正したtrainメソッドを使用
-    train_with_termination_check(
-        agent,
+    agent.train(
         eval_env=env,
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([0,0]),
-        num_er_episodes=5000,
-        num_step_episodes=50,  
+        num_er_episodes=10000,
+        num_step_episodes=500,  
         num_model_updates=2,
         max_buffer_size=10000,
         known_pareto_front=[1, 1],
         max_return=np.array([1000, 1000]),
-        use_wandb=use_wandb,  # wandbを使用するかどうかを設定
-        log_episode_only=True,  # エピソード数だけをwandbに送信する（常にTrue）
     )
-
-    # 終了フラグのチェック
-    check_termination()
 
     on_premise_map, cloud_map = env.get_windows()
     # print(env.calc_objective_values())
@@ -728,79 +650,66 @@ def visualize_nsga2_results(result):
         print(f"{i+1:2d} | {obj[0]:7.2f} | {obj[1]:7.2f}")
 
 if __name__ == "__main__":
-    try:
-        # コマンドライン引数の解析
-        args = parse_args()
+    # コマンドライン引数の解析
+    args = parse_args()
 
-        if args.mode == 'pcn':
-            # 強化学習モードのパラメータ設定と実行
-            loops = 0
-            lams = [0.2] * loops
-            how_many_episodes = 100000000
-            ob_number = 1
-            nb_jobs = args.nb_jobs
-            mapmap = run_PCN_mode(
-                nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
-                use_cnn=args.use_cnn,  # CNNを使用するかどうかをコマンドライン引数から設定
-                use_wandb=args.use_wandb  # wandbを使用するかどうかをコマンドライン引数から設定
-            )
-            print("PCN強化学習による実行が完了しました")
-            if args.use_cnn:
-                print("CNNベースの拡張モデルを使用しました")
-            if args.use_wandb:
-                print("wandbによるロギングを有効にしました")
+    if args.mode == 'pcn':
+        # 強化学習モードのパラメータ設定と実行
+        loops = 0
+        lams = [0.2] * loops
+        how_many_episodes = 1000000
+        ob_number = 1
+        nb_jobs = args.nb_jobs
+        mapmap = run_PCN_mode(
+            nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
+            use_cnn=args.use_cnn  # CNNを使用するかどうかをコマンドライン引数から設定
+        )
+        print("PCN強化学習による実行が完了しました")
+        if args.use_cnn:
+            print("CNNベースの拡張モデルを使用しました")
 
-        elif args.mode == 'single':
-            loops = 0
-            lams = [0.2] * loops
-            how_many_episodes = 50000
-            ob_number = 1
-            nb_jobs = args.nb_jobs
-            mapmap = run_single_rl_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
-            print("単目的強化学習による実行が完了しました")
+    elif args.mode == 'single':
+        loops = 0
+        lams = [0.2] * loops
+        how_many_episodes = 50000
+        ob_number = 1
+        nb_jobs = args.nb_jobs
+        mapmap = run_single_rl_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
+        print("単目的強化学習による実行が完了しました")
 
-        elif args.mode == 'pareto':     
-            how_many_episodes = 10000000
-            pareto_points_values= run_pareto_search(
-                nb_steps,
-                how_many_episodes,
-                nb_jobs=args.nb_jobs,
-                weight_steps=3 # 重みの分割数
-            )
-            print("\nPareto Front Points:")
-            for wt, cost in pareto_points_values:
-                print(f"Waiting Time: {wt:.2f}, Cost: {cost:.2f}")
-            
-        elif args.mode == 'all':
-            # 全探索モードの実行
-            results_reward = run_exhaustive_mode(args.nb_jobs)
-            print("全探索による実行が完了しました")
-            
-        elif args.mode == 'nsga2':
-            # NSGA-IIによる最適化
-            results = run_nsga2_mode(
-                nb_jobs=args.nb_jobs,
-                pop_size=args.pop_size,
-                num_generations=args.num_generations
-            )
-            print("NSGA-IIによる最適化が完了しました")
-            
-            # 結果の活用例：非支配解を取得して表示
-            non_dominated_inds = get_non_dominated_inds(results)
-            pareto_front = results[non_dominated_inds]
-            
-            print("\nNSGA-II Pareto Front (Non-dominated solutions):")
-            for i, solution in enumerate(pareto_front):
-                print(f"Solution {i+1}: Cost = {solution[0]:.2f}, Makespan = {solution[1]:.2f}")
-    
-    except KeyboardInterrupt:
-        print("\nプログラムがユーザーによって中断されました。")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n予期しないエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    elif args.mode == 'pareto':     
+        how_many_episodes = 10000000
+        pareto_points_values= run_pareto_search(
+            nb_steps,
+            how_many_episodes,
+            nb_jobs=args.nb_jobs,
+            weight_steps=3 # 重みの分割数
+        )
+        print("\nPareto Front Points:")
+        for wt, cost in pareto_points_values:
+            print(f"Waiting Time: {wt:.2f}, Cost: {cost:.2f}")
+        
+    elif args.mode == 'all':
+        # 全探索モードの実行
+        results_reward = run_exhaustive_mode(args.nb_jobs)
+        print("全探索による実行が完了しました")
+        
+    elif args.mode == 'nsga2':
+        # NSGA-IIによる最適化
+        results = run_nsga2_mode(
+            nb_jobs=args.nb_jobs,
+            pop_size=args.pop_size,
+            num_generations=args.num_generations
+        )
+        print("NSGA-IIによる最適化が完了しました")
+        
+        # 結果の活用例：非支配解を取得して表示
+        non_dominated_inds = get_non_dominated_inds(results)
+        pareto_front = results[non_dominated_inds]
+        
+        print("\nNSGA-II Pareto Front (Non-dominated solutions):")
+        for i, solution in enumerate(pareto_front):
+            print(f"Solution {i+1}: Cost = {solution[0]:.2f}, Makespan = {solution[1]:.2f}")
 
 
 
