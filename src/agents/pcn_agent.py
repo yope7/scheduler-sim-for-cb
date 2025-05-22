@@ -538,6 +538,7 @@ class PCN(MOAgent, MOPolicy):
 
         model_class: Optional[Type[BasePCNModel]] = None,
         use_enhanced_model: bool = False,
+        use_wandb: bool = True,
         log_episode_only: bool = True,
         debug_mode: bool = True,
     ) -> None:
@@ -1245,6 +1246,13 @@ class PCN(MOAgent, MOPolicy):
                     break
 
                 desired_return, desired_horizon = self._choose_commands(num_er_episodes)
+
+                if use_wandb and log_episode_only:
+                    wandb.log({
+                        "episodes": total_episodes,
+                        "global_step": self.global_step,
+                        "loss": np.mean(loss),
+                    })
 
                 # 既存のログコード
                 leaves_r = np.array([e[2][0].reward for e in self.experience_replay[len(self.experience_replay) // 2 :]])
