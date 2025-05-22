@@ -61,7 +61,10 @@ def get_non_dominated_inds(points):
     if len(points) == 0:
         return np.array([])
     
+    # データ型を浮動小数点の高精度型に変換して数値安定性を向上
+    points = np.array(points, dtype=np.float64)
     is_efficient = np.ones(len(points), dtype=bool)
+    
     for i, point in enumerate(points):
         if is_efficient[i]:
             # 他の解と比較して、すべての目的関数において同等以上で、
@@ -86,7 +89,10 @@ def get_non_dominated_inds_minimize(points):
     if len(points) == 0:
         return np.array([])
     
+    # データ型を浮動小数点の高精度型に変換して数値安定性を向上
+    points = np.array(points, dtype=np.float64)
     is_efficient = np.ones(len(points), dtype=bool)
+    
     for i, point in enumerate(points):
         if is_efficient[i]:
             # 最小化問題では、他の解と比較して、すべての目的関数において同等以下で、
@@ -102,6 +108,9 @@ def get_non_dominated_inds_minimize(points):
 
 def crowding_distance(points):
     """Compute the crowding distance of a set of points."""
+    # 数値の安定性向上のためfloat64を使用
+    points = np.array(points, dtype=np.float64)
+    
     # first normalize across dimensions
     points = (points - points.min(axis=0)) / (np.ptp(points, axis=0) + 1e-8)
     # sort points per dimension
@@ -843,7 +852,7 @@ class PCN(MOAgent, MOPolicy):
 
     def _nlargest(self, n, threshold=0.2):
         """See Section 4.4 of https://arxiv.org/pdf/2204.05036.pdf for details."""
-        returns = np.array([e[2][0].reward for e in self.experience_replay])
+        returns = np.array([e[2][0].reward for e in self.experience_replay], dtype=np.float64)
         # crowding distance of each point, check ones that are too close together
         distances = crowding_distance(returns)
         sma = np.argwhere(distances <= threshold).flatten()
@@ -854,7 +863,7 @@ class PCN(MOAgent, MOPolicy):
         # duplicate each point with number of non_dominated to compute respective distance
         returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(non_dominated), 1))
         # distance to closest non_dominated point
-        l2 = np.min(np.linalg.norm(returns_exp - non_dominated, axis=-1), axis=-1) * -1
+        l2 = np.min(np.linalg.norm(returns_exp - non_dominated, axis=-1, dtype=np.float64), axis=-1) * -1
         # all points that are too close together (crowding distance < threshold) get a penalty
         non_dominated_i = np.nonzero(non_dominated_i)[0]
         _, unique_i = np.unique(non_dominated, axis=0, return_index=True)
@@ -1005,8 +1014,9 @@ class PCN(MOAgent, MOPolicy):
 
         # 非支配解の取得
         # print("e_returns", e_returns)
-        non_dominated_inds = get_non_dominated_inds(np.array(e_returns))
-        pareto_front = np.array(e_returns)[non_dominated_inds]
+        e_returns_np = np.array(e_returns, dtype=np.float64)
+        non_dominated_inds = get_non_dominated_inds(e_returns_np)
+        pareto_front = e_returns_np[non_dominated_inds]
         if self.log:
             wandb.log({"pareto_front_eval_and_execute": wandb.Table(data=pareto_front, columns=["Objective1", "Objective2"])})
 
@@ -1078,10 +1088,13 @@ class PCN(MOAgent, MOPolicy):
             )
 
         # 非支配解を抽出（CPU上で実行）
-        non_dominated_inds_reward = get_non_dominated_inds(np.array(e_returns))
-        non_dominated_inds_values = get_non_dominated_inds_minimize(np.array(e_values))
-        pareto_front_reward = np.array(e_returns)[non_dominated_inds_reward]
-        pareto_front_values = np.array(e_values)[non_dominated_inds_values]
+        e_returns_np = np.array(e_returns, dtype=np.float64)  # float64でキャスト
+        e_values_np = np.array(e_values, dtype=np.float64)    # float64でキャスト
+        
+        non_dominated_inds_reward = get_non_dominated_inds(e_returns_np)
+        non_dominated_inds_values = get_non_dominated_inds_minimize(e_values_np)
+        pareto_front_reward = e_returns_np[non_dominated_inds_reward]
+        pareto_front_values = e_values_np[non_dominated_inds_values]
         
         # ======= 非支配解を経験再生バッファに追加（安全に行う） =======
         if len(non_dominated_inds_reward) > 0:
