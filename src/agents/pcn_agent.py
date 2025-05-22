@@ -1006,9 +1006,23 @@ class PCN(MOAgent, MOPolicy):
             e_values.append(value)
             all_transitions.append(transitions)  # transitionsを保存
         
-        distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
+        # CUDA対応の行列計算
+        if th.cuda.is_available():
+            # NumPy配列をPyTorchテンソルに変換してGPUに転送
+            returns_tensor = th.tensor(returns, device=self.device)
+            e_returns_tensor = th.tensor(e_returns, device=self.device)
+            
+            # GPU上で距離計算
+            with th.cuda.amp.autocast():
+                distances_tensor = th.norm(returns_tensor - e_returns_tensor, dim=1)
+            
+            # 結果をCPUに戻してNumPy配列に変換
+            distances = distances_tensor.cpu().numpy()
+        else:
+            # 従来通りNumPyで計算
+            distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
 
-        # 非支配解を抽出
+        # 非支配解を抽出（CPU上で実行）
         non_dominated_inds_reward = get_non_dominated_inds(np.array(e_returns))
         non_dominated_inds_values = get_non_dominated_inds_minimize(np.array(e_values))
         pareto_front_reward = np.array(e_returns)[non_dominated_inds_reward]
