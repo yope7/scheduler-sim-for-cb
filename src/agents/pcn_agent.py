@@ -1301,7 +1301,11 @@ class PCN(MOAgent, MOPolicy):
                 
                 # log_episode_onlyがTrueの場合は、エピソード数のみをログに記録
                 if self.log and log_episode_only:
-                    wandb.log({"episodes": total_episodes})
+                    wandb.log({
+                        "episodes": total_episodes,
+                        "global_step": self.global_step,
+                        "loss": np.mean(loss),
+                    })
 
                 # 既存のログ処理
                 if self.log and not log_episode_only and len(returns) > 0:  # 中断時に空の場合に備えて確認
