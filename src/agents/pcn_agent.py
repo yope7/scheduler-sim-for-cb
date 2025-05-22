@@ -10,6 +10,7 @@ import time
 import traceback
 
 import gymnasium as gym
+import gymnasium.spaces as spaces
 import numpy as np
 import torch as th
 import torch.nn as nn
@@ -43,9 +44,60 @@ except RuntimeError:
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
-from morl_baselines.common.pareto import get_non_dominated_inds, get_non_dominated_inds_minimize
 from morl_baselines.common.performance_indicators import hypervolume
 from src.utils.map_visualizer import visualize_map
+
+
+# 非支配解を取得する関数をファイル内に直接実装
+def get_non_dominated_inds(points):
+    """非支配解（最大化問題用）のインデックスを取得する関数
+    
+    Args:
+        points (np.ndarray): 評価点の配列（行が各解、列が各目的関数値）
+    
+    Returns:
+        np.ndarray: 非支配解のインデックス配列
+    """
+    if len(points) == 0:
+        return np.array([])
+    
+    is_efficient = np.ones(len(points), dtype=bool)
+    for i, point in enumerate(points):
+        if is_efficient[i]:
+            # 他の解と比較して、すべての目的関数において同等以上で、
+            # 少なくとも1つの目的関数において厳密に優れている場合、
+            # その他の解は支配されていると判定
+            is_efficient[is_efficient] = np.any(
+                points[is_efficient] > point, axis=1
+            ) | np.all(points[is_efficient] == point, axis=1)
+            is_efficient[i] = True  # 自分自身を再度非支配解としてマーク
+    
+    return np.nonzero(is_efficient)[0]
+
+def get_non_dominated_inds_minimize(points):
+    """非支配解（最小化問題用）のインデックスを取得する関数
+    
+    Args:
+        points (np.ndarray): 評価点の配列（行が各解、列が各目的関数値）
+    
+    Returns:
+        np.ndarray: 非支配解のインデックス配列
+    """
+    if len(points) == 0:
+        return np.array([])
+    
+    is_efficient = np.ones(len(points), dtype=bool)
+    for i, point in enumerate(points):
+        if is_efficient[i]:
+            # 最小化問題では、他の解と比較して、すべての目的関数において同等以下で、
+            # 少なくとも1つの目的関数において厳密に優れている（値が小さい）場合、
+            # その他の解は支配されていると判定
+            is_efficient[is_efficient] = np.any(
+                points[is_efficient] < point, axis=1
+            ) | np.all(points[is_efficient] == point, axis=1)
+            is_efficient[i] = True  # 自分自身を再度非支配解としてマーク
+    
+    return np.nonzero(is_efficient)[0]
 
 
 def crowding_distance(points):
@@ -1009,8 +1061,8 @@ class PCN(MOAgent, MOPolicy):
         # CUDA対応の行列計算
         if th.cuda.is_available():
             # NumPy配列をPyTorchテンソルに変換してGPUに転送
-            returns_tensor = th.tensor(returns, device=self.device)
-            e_returns_tensor = th.tensor(e_returns, device=self.device)
+            returns_tensor = th.tensor(np.array(returns), device=self.device)
+            e_returns_tensor = th.tensor(np.array(e_returns), device=self.device)
             
             # GPU上で距離計算
             with th.cuda.amp.autocast():
@@ -1019,8 +1071,11 @@ class PCN(MOAgent, MOPolicy):
             # 結果をCPUに戻してNumPy配列に変換
             distances = distances_tensor.cpu().numpy()
         else:
-            # 従来通りNumPyで計算
-            distances = np.linalg.norm(np.array(returns) - np.array(e_returns), axis=-1)
+            # 従来通りNumPyで計算（オーバーフロー防止のためfloat64を使用）
+            distances = np.linalg.norm(
+                np.array(returns, dtype=np.float64) - np.array(e_returns, dtype=np.float64), 
+                axis=-1
+            )
 
         # 非支配解を抽出（CPU上で実行）
         non_dominated_inds_reward = get_non_dominated_inds(np.array(e_returns))
@@ -1637,3 +1692,46 @@ class PCN(MOAgent, MOPolicy):
                     self.experience_replay.append((float(1.0), self.global_step, transitions))
         
         print(f"ヒューリスティック初期化完了: {len(self.experience_replay)}エピソード、{transitions_collected}ステップのデータを収集")
+
+    def extract_env_info(self, env: Optional[gym.Env]) -> None:
+        """Extracts all the features of the environment: observation space, action space, ..."""
+        if env is not None:
+            self.env = env
+            
+            # 辞書型観測空間の処理
+            if isinstance(self.env.unwrapped.observation_space, spaces.Dict):
+                # 辞書型観測空間の場合
+                self.observation_shape = None  # 形状は定義しない
+                # 全サブスペースの要素数の合計を計算（より安全な方法）
+                total_dim = 0
+                for space in self.env.unwrapped.observation_space.spaces.values():
+                    if hasattr(space, 'shape'):
+                        total_dim += int(np.prod(space.shape))
+                    elif hasattr(space, 'n'):
+                        total_dim += space.n
+                self.observation_dim = total_dim
+                self.is_dict_obs = True
+                
+            # 離散型観測空間の処理
+            elif isinstance(self.env.unwrapped.observation_space, spaces.Discrete):
+                self.observation_shape = (1,)
+                self.observation_dim = self.env.unwrapped.observation_space.n
+                self.is_dict_obs = False
+                
+            # 連続型観測空間の処理
+            else:
+                self.observation_shape = self.env.unwrapped.observation_space.shape
+                self.observation_dim = int(np.prod(self.observation_shape))
+                self.is_dict_obs = False
+
+            # 行動空間の処理
+            self.action_space = env.unwrapped.action_space
+            if isinstance(self.env.unwrapped.action_space, (spaces.Discrete, spaces.MultiBinary)):
+                self.action_shape = (1,)
+                self.action_dim = self.env.unwrapped.action_space.n
+            else:
+                self.action_shape = self.env.unwrapped.action_space.shape
+                self.action_dim = int(np.prod(self.action_shape))
+            
+            # 報酬次元
+            self.reward_dim = self.env.unwrapped.reward_space.shape[0]
