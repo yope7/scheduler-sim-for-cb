@@ -1623,3 +1623,46 @@ class PCN(MOAgent, MOPolicy):
                     self.experience_replay.append((float(1.0), self.global_step, transitions))
         
         print(f"ヒューリスティック初期化完了: {len(self.experience_replay)}エピソード、{transitions_collected}ステップのデータを収集")
+
+    def extract_env_info(self, env: Optional[gym.Env]) -> None:
+        """Extracts all the features of the environment: observation space, action space, ..."""
+        if env is not None:
+            self.env = env
+            
+            # 辞書型観測空間の処理
+            if isinstance(self.env.unwrapped.observation_space, spaces.Dict):
+                # 辞書型観測空間の場合
+                self.observation_shape = None  # 形状は定義しない
+                # 全サブスペースの要素数の合計を計算（より安全な方法）
+                total_dim = 0
+                for space in self.env.unwrapped.observation_space.spaces.values():
+                    if hasattr(space, 'shape'):
+                        total_dim += int(np.prod(space.shape))
+                    elif hasattr(space, 'n'):
+                        total_dim += space.n
+                self.observation_dim = total_dim
+                self.is_dict_obs = True
+                
+            # 離散型観測空間の処理
+            elif isinstance(self.env.unwrapped.observation_space, spaces.Discrete):
+                self.observation_shape = (1,)
+                self.observation_dim = self.env.unwrapped.observation_space.n
+                self.is_dict_obs = False
+                
+            # 連続型観測空間の処理
+            else:
+                self.observation_shape = self.env.unwrapped.observation_space.shape
+                self.observation_dim = int(np.prod(self.observation_shape))
+                self.is_dict_obs = False
+
+            # 行動空間の処理
+            self.action_space = env.unwrapped.action_space
+            if isinstance(self.env.unwrapped.action_space, (spaces.Discrete, spaces.MultiBinary)):
+                self.action_shape = (1,)
+                self.action_dim = self.env.unwrapped.action_space.n
+            else:
+                self.action_shape = self.env.unwrapped.action_space.shape
+                self.action_dim = int(np.prod(self.action_shape))
+            
+            # 報酬次元
+            self.reward_dim = self.env.unwrapped.reward_space.shape[0]
