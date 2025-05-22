@@ -179,6 +179,8 @@ def parse_args():
     # CNN関連の引数
     parser.add_argument('--use_cnn', action='store_true', 
                       help='PCNモードでCNNベースの拡張モデルを使用する')
+    parser.add_argument('--use_wandb', action='store_true', 
+                      help='Wandbを使用するかどうかを設定')
     # NSGA-II用の引数
     parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
     parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
@@ -239,7 +241,7 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     return 0
 
 def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                ob_number: int, nb_jobs: int, use_cnn: bool = True) -> list:
+                ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False) -> list:
     """PCN強化学習モードの実行"""
     next_init_windows = None
     values_all = []
@@ -267,7 +269,8 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         hidden_dim=256,
         project_name="temp",
         experiment_name="PCN_Enhanced" if use_cnn else "PCN",
-        log=False,
+        log=True,
+        use_wandb=use_wandb,  # CNNベースの拡張モデルを使用
         use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
         debug_mode=False,  # デバッグモードをオフに設定
     )
@@ -282,6 +285,7 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         max_buffer_size=10000,
         known_pareto_front=[1, 1],
         max_return=np.array([1000, 1000]),
+        log_episode_only=True,
     )
 
     on_premise_map, cloud_map = env.get_windows()
@@ -662,11 +666,14 @@ if __name__ == "__main__":
         nb_jobs = args.nb_jobs
         mapmap = run_PCN_mode(
             nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
-            use_cnn=args.use_cnn  # CNNを使用するかどうかをコマンドライン引数から設定
+            use_cnn=args.use_cnn,  # CNNを使用するかどうかをコマンドライン引数から設定
+            use_wandb=args.use_wandb  # Wandbを使用するかどうかをコマンドライン引数から設定
         )
         print("PCN強化学習による実行が完了しました")
         if args.use_cnn:
             print("CNNベースの拡張モデルを使用しました")
+        if args.use_wandb:
+            print("Wandbによるログ記録を有効にしました")
 
     elif args.mode == 'single':
         loops = 0
