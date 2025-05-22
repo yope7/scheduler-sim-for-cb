@@ -4,6 +4,24 @@ import sys
 import argparse
 import itertools
 import matplotlib.pyplot as plt
+import signal  # シグナル処理のためのモジュールを追加
+
+# 強制終了用のシグナルハンドラを定義
+def force_quit_handler(sig, frame):
+    print("\n強制終了します。")
+    sys.exit(2)  # 強制終了コード
+
+# 通常終了用のシグナルハンドラを定義
+def normal_quit_handler(sig, frame):
+    print("\n中断処理を開始します...")
+    print("終了するには再度Ctrl+Cを押すか、強制終了するにはCtrl+\\を押してください。")
+    # 元のハンドラに戻す（2回目のCtrl+Cで通常の動作を行うため）
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+# SIGQUITシグナル（Ctrl+\）をハンドラに登録
+signal.signal(signal.SIGQUIT, force_quit_handler)
+# SIGINTシグナル（Ctrl+C）をハンドラに登録
+signal.signal(signal.SIGINT, normal_quit_handler)
 
 from src.agents.pcn_agent import PCN  
 from src.envs.scheduling_env import SchedulingEnv
@@ -179,6 +197,9 @@ def parse_args():
     # CNN関連の引数
     parser.add_argument('--use_cnn', action='store_true', 
                       help='PCNモードでCNNベースの拡張モデルを使用する')
+    # wandb関連の引数
+    parser.add_argument('--use_wandb', action='store_true',
+                      help='wandbを使用してエピソード数を定期的に送信する')
     # NSGA-II用の引数
     parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
     parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
@@ -239,7 +260,7 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     return 0
 
 def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                ob_number: int, nb_jobs: int, use_cnn: bool = True) -> list:
+                ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False) -> list:
     """PCN強化学習モードの実行"""
     next_init_windows = None
     values_all = []
@@ -267,7 +288,7 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         hidden_dim=256,
         project_name="temp",
         experiment_name="PCN_Enhanced" if use_cnn else "PCN",
-        log=False,
+        log=use_wandb,  # wandbによるログ記録を設定
         use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
         debug_mode=False,  # デバッグモードをオフに設定
     )
@@ -277,11 +298,13 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([0,0]),
         num_er_episodes=10000,
-        num_step_episodes=500,  
+        num_step_episodes=50,  
         num_model_updates=2,
         max_buffer_size=10000,
         known_pareto_front=[1, 1],
         max_return=np.array([1000, 1000]),
+        use_wandb=use_wandb,  # wandbを使用するかどうかを設定
+        log_episode_only=True,  # エピソード数だけをwandbに送信する（常にTrue）
     )
 
     on_premise_map, cloud_map = env.get_windows()
@@ -657,16 +680,19 @@ if __name__ == "__main__":
         # 強化学習モードのパラメータ設定と実行
         loops = 0
         lams = [0.2] * loops
-        how_many_episodes = 1000000
+        how_many_episodes = 100000000
         ob_number = 1
         nb_jobs = args.nb_jobs
         mapmap = run_PCN_mode(
             nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
-            use_cnn=args.use_cnn  # CNNを使用するかどうかをコマンドライン引数から設定
+            use_cnn=args.use_cnn,  # CNNを使用するかどうかをコマンドライン引数から設定
+            use_wandb=args.use_wandb  # wandbを使用するかどうかをコマンドライン引数から設定
         )
         print("PCN強化学習による実行が完了しました")
         if args.use_cnn:
             print("CNNベースの拡張モデルを使用しました")
+        if args.use_wandb:
+            print("wandbによるロギングを有効にしました")
 
     elif args.mode == 'single':
         loops = 0
