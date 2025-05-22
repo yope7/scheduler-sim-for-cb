@@ -74,99 +74,6 @@ def evaluate_and_render(agent, env, objective_index):
 
     # Define environment
 
-def set_and_train(nb_steps, lams, loops, how_many_episodes,ob_number,nb_jobs):
-    next_init_windows = None
-    values_all = []
-    job_generator = JobGenerator(0,nb_steps, n_window, n_on_premise_node, n_cloud_node, config,nb_jobs,0.3,how_many_episodes)
-    jobs_set = job_generator.generate_jobs_set()
-
-    env = SchedulingEnv(
-        max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
-        weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
-        next_init_windows,flag=0
-    )
-
-    # デバッグモードで1エピソードを実行
-    # if DEBUG_MODE:
-    #     run_debug_episode(env)
-    # else:
-
-    # print("train_and_execute")
-
-    """NNの初期化→学習→割り当て"""
-    agent = PCN(
-        env,
-        device="auto",
-        state_dim=1,
-        scaling_factor=np.array([0.1, 0.1, 1.0]),
-        learning_rate=1e-3,
-        batch_size=1024,
-        hidden_dim=256,
-        project_name="temp",
-        experiment_name="PCN",
-        log=True,
-    )
-    agent.train(
-        eval_env=env,
-        total_timesteps=int(how_many_episodes),
-        ref_point=np.array([-1000,-1000]),
-        num_er_episodes=2000,
-        num_step_episodes=20,  
-        num_model_updates=10,
-        max_buffer_size=5000,
-        known_pareto_front=[1, 1],
-    )
-
-    # e_returns = agent.get_e_returns()
-    # transitions = agent.get_transitions()
-    mapmap = agent.get_mapmap()
-    # print("mapmap: ",mapmap)
-
-    import matplotlib.pyplot as plt
-
-    def visualize_map(mapmap):
-        # データの取得（最初の配列を使用）
-        map_data = mapmap[0]
-        
-        # プロットの設定
-        plt.figure(figsize=(12, 8))
-        
-        # ヒートマップの描画
-        plt.imshow(map_data, cmap='tab20', interpolation='nearest')
-        
-        # カラーバーの追加
-        plt.colorbar(label='Region ID')
-        
-        # タイトルと軸ラベルの設定
-        plt.title('マップの可視化')
-        plt.xlabel('X座標')
-        plt.ylabel('Y座標')
-        
-        # グリッドの表示
-        plt.grid(True, which='minor', color='black', linestyle='-', alpha=0.2)
-        
-        # 表示
-        plt.show()
-
-    return 0
-
-    # print("values: ",values)
-    #0 = waiting time , 1 = cost
-    for i in range(loops):
-        job_generator = JobGenerator(i,nb_steps, n_window, n_on_premise_node, n_cloud_node, config, nb_jobs,lams[i])
-        jobs_set = job_generator.generate_jobs_set()
-
-        next_init_windows = env.get_next_init_windows()
-        env = SchedulingEnv(
-            max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
-            weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
-            next_init_windows,flag=1,exe_mode=0
-        )
-        values = train_and_execute(env, how_many_episodes, ob_number)
-        print("values: ",i,values)
-        values_all.append(values)
-        print("values_all: ",values_all)
-    return values_all
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -184,6 +91,9 @@ def parse_args():
     # NSGA-II用の引数
     parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
     parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
+    parser.add_argument('--load_model', action='store_true', help='保存済みモデルを読み込む')
+    parser.add_argument('--model_path', type=str, default='PCN_model_latest', 
+                      help='読み込むモデルのパス（拡張子なし）')
     return parser.parse_args()
 
 def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
@@ -241,7 +151,7 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     return 0
 
 def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False) -> list:
+                ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False, load_model: bool = False, model_path: str = 'PCN_model_latest') -> list:
     """PCN強化学習モードの実行"""
     next_init_windows = None
     values_all = []
@@ -274,14 +184,27 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
         debug_mode=False,  # デバッグモードをオフに設定
     )
+
+    # 保存済みモデルが指定されている場合は読み込む
+    if load_model:
+        print(f"保存済みモデル weights/{model_path} を読み込みます...")
+        try:
+            agent.load(filename=model_path, savedir="weights")
+            print(f"モデルの読み込みが完了しました。学習を継続します。")
+        except Exception as e:
+            print(f"モデルの読み込み中にエラーが発生しました: {e}")
+            print("新規モデルから学習を開始します。")
+
+    agent.initialize_buffer_with_heuristics(env, num_episodes_per_pattern=20)
     
     agent.train(
         eval_env=env,
         total_timesteps=int(how_many_episodes),
         ref_point=np.array([0,0]),
-        num_er_episodes=10000,
+        num_er_episodes=10,
         num_step_episodes=30,  
         num_model_updates=2,
+        num_eval_episodes=100,
         max_buffer_size=10000,
         known_pareto_front=[1, 1],
         max_return=np.array([1000, 1000]),
@@ -667,13 +590,17 @@ if __name__ == "__main__":
         mapmap = run_PCN_mode(
             nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
             use_cnn=args.use_cnn,  # CNNを使用するかどうかをコマンドライン引数から設定
-            use_wandb=args.use_wandb  # Wandbを使用するかどうかをコマンドライン引数から設定
+            use_wandb=args.use_wandb,  # Wandbを使用するかどうかをコマンドライン引数から設定
+            load_model=args.load_model,  # 保存済みモデルを読み込むかどうかをコマンドライン引数から設定
+            model_path=args.model_path  # 読み込むモデルのパスをコマンドライン引数から設定
         )
         print("PCN強化学習による実行が完了しました")
         if args.use_cnn:
             print("CNNベースの拡張モデルを使用しました")
         if args.use_wandb:
             print("Wandbによるログ記録を有効にしました")
+        if args.load_model:
+            print(f"保存済みモデル weights/{args.model_path}の学習を引き継ぎました")
 
     elif args.mode == 'single':
         loops = 0

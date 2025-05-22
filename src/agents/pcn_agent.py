@@ -1131,6 +1131,7 @@ class PCN(MOAgent, MOPolicy):
         max_return: np.ndarray = None,
         known_pareto_front: Optional[List[np.ndarray]] = None,
         num_points_pf: int = 200,
+        num_eval_episodes: int = 30,
         log_episode_only: bool = True,
         use_wandb: bool = True,
     ):
@@ -1347,17 +1348,15 @@ class PCN(MOAgent, MOPolicy):
                         f"horizons {np.mean(horizons)}"
                     )
 
-                # 定期的な評価とチェックポイント
-                if self.global_step >= (n_checkpoints + 1) * total_timesteps / 1000:
-                    n_checkpoints += 1
-                    
-                    # 中断要求を確認
-                    if self.terminate_requested:
-                        break
-                        
-                    # 定期評価を実行
-                    print(f"Evaluating at step {self.global_step}...")
+                # 前回評価時のエピソード数を記録
+                if not hasattr(self, 'last_eval_episode'):
+                    self.last_eval_episode = 0
+
+                # より厳密な条件で評価実行
+                if total_episodes >= self.last_eval_episode + num_eval_episodes:
+                    print(f"エピソード{total_episodes}での評価を実行中...")
                     self.evaluate(eval_env, max_return, n=num_points_pf)
+                    self.last_eval_episode = total_episodes
                     
                     # 中断処理のために短いスリープを入れる（Ctrl+Cを処理する時間）
                     time.sleep(0.1)
@@ -1447,8 +1446,8 @@ class PCN(MOAgent, MOPolicy):
             )
         
         plt.title("パレートフロントの進化")
-        plt.xlabel("時間（実数）")
-        plt.ylabel("コスト（実数）")
+        plt.xlabel("コスト（実数）")
+        plt.ylabel("makespan（実数）")
         plt.xlim(x_range)
         plt.ylim(y_range)
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
@@ -1476,8 +1475,8 @@ class PCN(MOAgent, MOPolicy):
             ax.scatter([ret[0] for ret in pareto_front_values], [ret[1] for ret in pareto_front_values], color='red', s=80)
             
             ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}でのパレートフロント")
-            ax.set_xlabel("時間報酬")
-            ax.set_ylabel("コスト")
+            ax.set_xlabel("コスト（実数）")
+            ax.set_ylabel("makespan（実数）")
             ax.set_xlim(x_range)
             ax.set_ylim(y_range)
             ax.grid(True)
@@ -1564,3 +1563,63 @@ class PCN(MOAgent, MOPolicy):
         except Exception as e:
             print(f"ファイルの保存中にエラーが発生しました: {e}")
             return None
+
+    def initialize_buffer_with_heuristics(self, env, num_episodes_per_pattern=5):
+        """事前知識ベースの初期探索のためのバッファ初期化"""
+        print("ヒューリスティックパターンによるバッファ初期化を開始...")
+        
+        # 初期化前にリプレイバッファを空にする
+        self.experience_replay = []
+        
+        # 各パターンの実行比率（0と1の選択確率）
+        patterns = [
+            0.0,   # 常に0を選択（オンプレミス優先）
+            1.0,   # 常に1を選択（クラウド優先）
+            0.25,  # 25%の確率で1を選択
+            0.5,   # 50%の確率で1を選択
+            0.75   # 75%の確率で1を選択
+        ]
+        
+        transitions_collected = 0
+        
+        for p_idx, p in enumerate(patterns):
+            print(f"パターン {p_idx+1}/5: 1の選択確率 = {p:.2f}")
+            
+            for ep in range(num_episodes_per_pattern):
+                transitions = []
+                obs = env.reset()
+                done = False
+                
+                while not done:
+                    # パターンに基づいて0または1のスカラー値を選択
+                    action = 1 if self.np_random.random() < p else 0
+                    
+                    n_obs, reward, scheduled, wt_step, done = env.step(action)
+                    
+                    if done:
+                        env.finalize_window_history()
+                    
+                    # Transitionオブジェクトを作成して保存
+                    transitions.append(
+                        Transition(
+                            observation=obs,
+                            action=action,
+                            reward=np.float32(reward).copy(),
+                            next_observation=n_obs,
+                            terminal=done
+                        )
+                    )
+                    
+                    obs = n_obs
+                    transitions_collected += 1
+                
+                # 報酬の計算
+                for i in reversed(range(len(transitions) - 1)):
+                    transitions[i].reward += self.gamma * transitions[i + 1].reward
+                
+                # ヒープを使わず、単純なリストとして追加
+                if len(transitions) > 0:
+                    # ヒープキーの代わりにタプルを使用するが、実際のヒープ操作は行わない
+                    self.experience_replay.append((float(1.0), self.global_step, transitions))
+        
+        print(f"ヒューリスティック初期化完了: {len(self.experience_replay)}エピソード、{transitions_collected}ステップのデータを収集")
