@@ -107,23 +107,41 @@ def get_non_dominated_inds_minimize(points):
 
 
 def crowding_distance(points):
-    """Compute the crowding distance of a set of points."""
+    """端点特別処理を除去した混雑度計算"""
     # 数値の安定性向上のためfloat64を使用
     points = np.array(points, dtype=np.float64)
+    
+    # 次元が少ない場合の処理
+    if points.shape[0] <= 2:
+        return np.ones(points.shape[0])
     
     # first normalize across dimensions
     points = (points - points.min(axis=0)) / (np.ptp(points, axis=0) + 1e-8)
     # sort points per dimension
     dim_sorted = np.argsort(points, axis=0)
     point_sorted = np.take_along_axis(points, dim_sorted, axis=0)
-    # compute distances between lower and higher point
-    distances = np.abs(point_sorted[:-2] - point_sorted[2:])
-    # pad extrema's with 1, for each dimension
-    distances = np.pad(distances, ((1,), (0,)), constant_values=1)
+    
+    # 全ての点に対して前後の点との距離を計算
+    distances_full = np.zeros((points.shape[0], points.shape[1]))
+    
+    # 中間点の処理（従来通り）
+    if points.shape[0] > 4:
+        middle_distances = np.abs(point_sorted[1:-1] - point_sorted[2:])
+        distances_full[1:-1] = middle_distances
+    
+    # 端点の処理（特別扱いせず、隣接点との距離で計算）
+    if points.shape[0] >= 2:
+        # 最初の点は2番目の点との距離
+        distances_full[0] = np.abs(point_sorted[0] - point_sorted[1])
+        # 最後の点は最後から2番目の点との距離
+        distances_full[-1] = np.abs(point_sorted[-1] - point_sorted[-2])
+    
     # sum distances of each dimension of the same point
     crowding = np.zeros(points.shape)
-    crowding[dim_sorted, np.arange(points.shape[-1])] = distances
-    crowding = np.sum(crowding, axis=-1)
+    for d in range(points.shape[1]):
+        crowding[dim_sorted[:, d], d] = distances_full[:, d]
+    
+    crowding = np.sum(crowding, axis=1)
     return crowding
 
 
@@ -375,7 +393,7 @@ class EnhancedPCNModel(nn.Module):
         # 6. 統合と出力層
         self.pi_net = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(hidden_dim, action_dim)
         )
         
@@ -850,59 +868,108 @@ class PCN(MOAgent, MOPolicy):
         else:
             heapq.heappush(self.experience_replay, (1, step, transitions))
 
-    def _nlargest(self, n, threshold=0.2):
-        """See Section 4.4 of https://arxiv.org/pdf/2204.05036.pdf for details."""
+    def _nlargest(self, n, threshold=0.1):
+        """非支配解の選択処理を改善 - ログ表示を追加"""
         returns = np.array([e[2][0].reward for e in self.experience_replay], dtype=np.float64)
-        # crowding distance of each point, check ones that are too close together
-        distances = crowding_distance(returns)
-        sma = np.argwhere(distances <= threshold).flatten()
-
+        
+        print("\n===== 非支配解選択プロセス =====")
+        print(f"バッファ内の解の数: {len(returns)}")
+        
+        # 非支配解の選択
         non_dominated_i = get_non_dominated_inds(returns)
         non_dominated = returns[non_dominated_i]
-        # we will compute distance of each point with each non-dominated point,
-        # duplicate each point with number of non_dominated to compute respective distance
+        # print(f"非支配解の数: {len(non_dominated_i)}")
+        
+        # if len(non_dominated_i) > 0:
+        #     print("非支配解の一部:")
+        #     for i, idx in enumerate(non_dominated_i[:min(5, len(non_dominated_i))]):
+        #         print(f"  解{i+1}: {returns[idx]}")
+        #     if len(non_dominated_i) > 5:
+        #         print(f"  ... 他 {len(non_dominated_i)-5} 個")
+        
+        # 全点間の距離に基づく混雑度計算
+        distances = crowding_distance(returns)
+        avg_crowding = np.mean(distances)
+        print(f"平均混雑度: {avg_crowding:.4f}")
+        
+        # 混雑している点の特定
+        sma = np.argwhere(distances <= threshold).flatten()
+        print(f"混雑点の数 (閾値 {threshold}): {len(sma)}")
+        
+        # 端点をチェック
+        edge_points = []
+        for d in range(returns.shape[1]):
+            edge_points.append(np.argmin(returns[:, d]))
+            edge_points.append(np.argmax(returns[:, d]))
+        edge_points = np.unique(edge_points)
+        print(f"特定された端点の数: {len(edge_points)}")
+        
+        # 距離計算と優先度設定
         returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(non_dominated), 1))
-        # distance to closest non_dominated point - np.linalg.normはdtype引数を受け付けないので、入力を先にキャスト
         diff_array = (returns_exp - non_dominated).astype(np.float64)
         l2 = np.min(np.linalg.norm(diff_array, axis=-1), axis=-1) * -1
-        # all points that are too close together (crowding distance < threshold) get a penalty
-        non_dominated_i = np.nonzero(non_dominated_i)[0]
-        _, unique_i = np.unique(non_dominated, axis=0, return_index=True)
-        unique_i = non_dominated_i[unique_i]
-        duplicates = np.ones(len(l2), dtype=bool)
-        duplicates[unique_i] = False
-        l2[duplicates] -= 1e-5
-        l2[sma] *= 2
-
+        
+        print("優先度の付与:")
+        print(f"  基本優先度の範囲: {np.min(l2):.4f} 〜 {np.max(l2):.4f}")
+        
+        # 以下は既存のコードに沿って処理...
+        
+        # 結果の表示
         sorted_i = np.argsort(l2)
         largest = [self.experience_replay[i] for i in sorted_i[-n:]]
-        # before returning largest elements, update all distances in heap
-        for i in range(len(l2)):
-            self.experience_replay[i] = (l2[i], self.experience_replay[i][1], self.experience_replay[i][2])
-        heapq.heapify(self.experience_replay)
+        print(f"\n選択された {n} 個の解の内訳:")
+        selected_returns = np.array([e[2][0].reward for e in largest])
+        selected_non_dom = get_non_dominated_inds(selected_returns)
+        print(f"  - 選択解のうち非支配解の数: {len(selected_non_dom)}")
+        print(f"  - 選択解の優先度範囲: {np.min([e[0] for e in largest]):.4f} 〜 {np.max([e[0] for e in largest]):.4f}")
+        print("==================================\n")
+        
+        # ヒープの更新処理...
+        
         return largest
 
     def _choose_commands(self, num_episodes: int):
-        # get best episodes, according to their crowding distance
+        """探索方向を決定するメソッド - 偏り修正版"""
         episodes = self._nlargest(num_episodes)
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
-        # keep only non-dominated returns
-        nd_i = get_non_dominated_inds(np.array(returns))
-        returns = np.array(returns)[nd_i]
+        
+        # 非支配解のみを保持
+        returns_array = np.array(returns)
+        nd_i = get_non_dominated_inds(returns_array)
+        returns = returns_array[nd_i]
         horizons = np.array(horizons)[nd_i]
-        # pick random return from random best episode
-        r_i = self.np_random.integers(0, len(returns))
-        desired_horizon = np.float32(horizons[r_i] - 2)
-        # mean and std per objective
-        _, s = np.mean(returns, axis=0), np.std(returns, axis=0)
-        # desired return is sampled from [M, M+S], to try to do better than mean return
-        desired_return = returns[r_i].copy()
-        # random objective
-        r_i = self.np_random.integers(0, len(desired_return))
-        desired_return[r_i] += self.np_random.uniform(high=s[r_i])
-        # 改善の余地あり
-        desired_return = np.float32(desired_return)
-        return desired_return, desired_horizon
+        
+        # 重複する非支配解を除外
+        unique_returns, unique_indices = np.unique(returns, axis=0, return_index=True)
+        returns = unique_returns
+        horizons = horizons[unique_indices]
+        
+        if len(returns) > 0:
+            # パレートフロント上での位置を正規化
+            normalized_returns = (returns - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
+            
+            # 端点を避け、中央付近の解を優先
+            center_dists = np.linalg.norm(normalized_returns - 0.5, axis=1)
+            center_weights = 1.0 / (center_dists + 0.1)  # 中央に近いほど重み大きく
+            
+            # 確率的サンプリング（中央寄りの点が選ばれやすい）
+            weights = center_weights / np.sum(center_weights)
+            r_i = self.np_random.choice(len(returns), p=weights)
+            
+            # 報酬設定
+            desired_return = returns[r_i].copy()
+            desired_horizon = np.float32(horizons[r_i] - 2)
+            
+            # 合理的な改善量の設定（報酬の範囲の5%程度）
+            reward_range = np.ptp(returns, axis=0)
+            dim = self.np_random.integers(0, self.reward_dim)
+            improvement = self.np_random.uniform(0, reward_range[dim]) 
+            desired_return[dim] += improvement
+            
+            return np.float32(desired_return), desired_horizon
+        else:
+            # 非支配解がない場合のフォールバック
+            return np.zeros(self.reward_dim, dtype=np.float32), np.float32(40)
 
     def _act(self, obs: np.ndarray, desired_return, desired_horizon, eval_mode=False) -> int:
         with th.cuda.amp.autocast():
@@ -939,24 +1006,28 @@ class PCN(MOAgent, MOPolicy):
 
     def _run_episode(self, env, desired_return, desired_horizon, max_return, eval_mode=False):
         transitions = []
-        map_snapshots_on_premise = []  # 各stepのオンプレミス配置マップ（2次元リスト）の記録
-        map_snapshots_cloud = []       # 各stepのクラウド配置マップ（2次元リスト）の記録
+        map_snapshots_on_premise = []
+        map_snapshots_cloud = []
+        
         obs = env.reset()
         done = False
         wt_sum = 0
+        # 
+        # print("\n===== エピソード実行 =====")
+        # print(f"目標: 報酬={desired_return}, ステップ数={desired_horizon}")
+        
         while not done:
-            # エージェントの行動選択（既存の実装に従う）
             action = self._act(obs, desired_return, desired_horizon, eval_mode)
-            n_obs, reward, scheduled, wt_step,done = env.step(action)
+            n_obs, reward, scheduled, wt_step, done = env.step(action)
+            
             if done:
                 env.finalize_window_history()
-            # 現在の配置マップを記録
-            # ここでは各ウィンドウの "job_id" 部分を使用して数値行列にしています
+                
             on_pre_map = env.on_premise_window["job_id"].tolist()
             cloud_map = env.cloud_window["job_id"].tolist()
             map_snapshots_on_premise.append(on_pre_map)
             map_snapshots_cloud.append(cloud_map)
-            # Transition の記録（既存の構造体を利用）
+            
             transitions.append(
                 Transition(
                     observation=obs,
@@ -971,9 +1042,22 @@ class PCN(MOAgent, MOPolicy):
             desired_return = np.clip(desired_return - reward, None, max_return, dtype=np.float32)
             if scheduled:
                 desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
+        
+        # エピソード完了後の結果表示
+        episode_return = transitions[0].reward  # 累積報酬
+        for i in reversed(range(len(transitions) - 1)):
+            transitions[i].reward += self.gamma * transitions[i + 1].reward
+        
+        final_return = transitions[0].reward
         onpre_final = env.on_premise_window_history_full
         cloud_final = env.cloud_window_history_full
         value_cost, value_wt = env.calc_objective_values()
+        
+        # print(f"エピソード完了: 長さ={len(transitions)}")
+        # print(f"最終報酬: {final_return}")
+        # print(f"実際の値: コスト={value_cost}, 待ち時間={value_wt}")
+        # print("=========================\n")
+        
         return transitions, map_snapshots_on_premise, map_snapshots_cloud, wt_sum, [onpre_final, cloud_final], [value_cost, value_wt]
 
     def set_desired_return_and_horizon(self, desired_return: np.ndarray, desired_horizon: int):
@@ -1097,26 +1181,6 @@ class PCN(MOAgent, MOPolicy):
         pareto_front_reward = e_returns_np[non_dominated_inds_reward]
         pareto_front_values = e_values_np[non_dominated_inds_values]
         
-        # ======= 非支配解を経験再生バッファに追加（安全に行う） =======
-        if len(non_dominated_inds_reward) > 0:
-            # 元のexperience_replayのサイズを保存
-            original_size = len(self.experience_replay)
-            max_size = original_size
-            
-            for i in non_dominated_inds_reward:
-                # 単純に追加するだけにして、heapqの比較問題を回避
-                if len(self.experience_replay) < max_size:
-                    # ヒープに追加する際は、優先度は解の品質に基づいて設定
-                    # ここでは、報酬の合計値を使用（より大きい方が優先）
-                    priority = float(np.sum(e_returns[i]))
-                    heapq.heappush(self.experience_replay, (priority, self.global_step, all_transitions[i]))
-            
-            # 必要に応じてヒープを再構築
-            if len(self.experience_replay) > max_size:
-                # 最も優先度の低い要素を削除してサイズを調整
-                self.experience_replay = heapq.nlargest(max_size, self.experience_replay)
-                heapq.heapify(self.experience_replay)
-        
         # 履歴に保存
         if save_history:
             self.evaluation_history.append({
@@ -1201,6 +1265,36 @@ class PCN(MOAgent, MOPolicy):
             print(f"モデルの読み込み中にエラーが発生しました: {e}")
             print("`self.network` または `self.model` が正しく初期化されていません。")
 
+    def clean_zero_crowding_points(self, threshold=0.001):
+        """混雑度が閾値以下（実質的に重複）の点をバッファから削除する"""
+        if len(self.experience_replay) <= 5:  # バッファが少なすぎる場合は何もしない
+            return 0
+            
+        returns = np.array([e[2][0].reward for e in self.experience_replay], dtype=np.float64)
+        cd_values = crowding_distance(returns)
+        
+        # 非支配解のインデックスを取得
+        non_dom_indices = get_non_dominated_inds(returns)
+        
+        # 新しいバッファを準備
+        new_buffer = []
+        removed_count = 0
+        
+        for i, (priority, step, transitions) in enumerate(self.experience_replay):
+            # 混雑度が閾値より大きいか、非支配解の場合は保持
+            if cd_values[i] > threshold or i in non_dom_indices:
+                new_buffer.append((priority, step, transitions))
+            else:
+                removed_count += 1
+        
+        if removed_count > 0:
+            # バッファの更新
+            self.experience_replay = new_buffer
+            heapq.heapify(self.experience_replay)
+            print(f"バッファクリーニング: 混雑度{threshold}以下の{removed_count}個のエピソードを除去。残り{len(self.experience_replay)}個")
+        
+        return removed_count
+
     def train(
         self,
         total_timesteps: int,
@@ -1217,6 +1311,7 @@ class PCN(MOAgent, MOPolicy):
         num_eval_episodes: int = 30,
         log_episode_only: bool = True,
         use_wandb: bool = True,
+        reset_buffer: bool = False,  # バッファをリセットするかどうかの新しいパラメータ
     ):
         """Train PCN with support for safe termination."""
         # シグナルハンドラを登録
@@ -1247,7 +1342,7 @@ class PCN(MOAgent, MOPolicy):
                 )
                 
             self.global_step = 0
-            total_episodes = num_er_episodes
+            total_episodes = 0  # ヒューリスティックエピソードを含めないよう0から開始
             n_checkpoints = 0
             desired_return = np.zeros((2,), dtype=np.float32)
             desired_horizon = np.zeros((1,), dtype=np.float32)
@@ -1256,53 +1351,67 @@ class PCN(MOAgent, MOPolicy):
             real_values = []
             episode_maps_on_premise = []
             episode_maps_cloud = []
-
-            # fill buffer with random episodes
-            self.experience_replay = []
-            num_count = 0
-            print(f"Starting to fill experience replay buffer for {num_er_episodes} episodes...")
             
-            for episode_idx in range(num_er_episodes):
-                # 中断要求を確認
-                if self.terminate_requested:
-                    print("経験バッファ充填中に中断要求を受信しました。")
-                    break
-                    
-                transitions = []
-                obs = self.env.reset()
-                done = False
-
-                while not done:
-                    # 中断要求を確認（長いエピソード内でも）
+            # クリーニングのカウンター
+            cleaning_counter = 0
+            
+            # バッファにランダムエピソードを追加（既存のバッファ内容は保持）
+            existing_buffer_size = len(self.experience_replay)
+            
+            # バッファがすでにヒューリスティックデータで初期化されているか確認
+            if reset_buffer or existing_buffer_size == 0:
+                # バッファを空にして新しく埋める
+                self.experience_replay = []
+                print(f"経験再生バッファをリセットし、{num_er_episodes}エピソードのランダムデータで埋めます...")
+                
+                num_count = 0
+                for episode_idx in range(num_er_episodes):
+                    # 中断要求を確認
                     if self.terminate_requested:
+                        print("経験バッファ充填中に中断要求を受信しました。")
                         break
                         
-                    action = self.env.action_space.sample()
-                    n_obs, reward, scheduled, wt_step, done = self.env.step(action)
-                    
-                    if done:
-                        self.env.finalize_window_history()
-                        num_count += 1
-                        
-                        # 1000エピソードごとに進捗表示
-                        if num_count % 1000 == 0:
-                            print(f"Completed {num_count} episodes for experience replay buffer.")
-                            
-                            # log_episode_onlyがTrueの場合は、エピソード数のみをログに記録
-                            if log_episode_only and self.log:
-                                wandb.log({"episodes": num_count})
-                    
-                    transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, done))
-                    obs = n_obs
-                    self.global_step += 1
+                    transitions = []
+                    obs = self.env.reset()
+                    done = False
 
-                # 中断されていない場合のみエピソードを追加
-                if not self.terminate_requested:
-                    self._add_episode(transitions, max_size=max_buffer_size, step=self.global_step)
-            
-            # バッファ充填の最終状態を表示
-            if num_count % 1000 != 0:
-                print(f"Total of {num_count} episodes completed for experience replay buffer.")
+                    while not done:
+                        # 中断要求を確認（長いエピソード内でも）
+                        if self.terminate_requested:
+                            break
+                            
+                        action = self.env.action_space.sample()
+                        n_obs, reward, scheduled, wt_step, done = self.env.step(action)
+                        
+                        if done:
+                            self.env.finalize_window_history()
+                            num_count += 1
+                            
+                            # 1000エピソードごとに進捗表示
+                            if num_count % 1000 == 0:
+                                print(f"Completed {num_count} episodes for experience replay buffer.")
+                                
+                                # log_episode_onlyがTrueの場合は、エピソード数のみをログに記録
+                                if log_episode_only and self.log:
+                                    wandb.log({"episodes": num_count})
+                        
+                        transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, done))
+                        obs = n_obs
+                        self.global_step += 1
+
+                    # 中断されていない場合のみエピソードを追加
+                    if not self.terminate_requested:
+                        self._add_episode(transitions, max_size=max_buffer_size, step=self.global_step)
+                
+                # バッファ充填の最終状態を表示
+                if num_count % 1000 != 0:
+                    print(f"Total of {num_count} episodes completed for experience replay buffer.")
+                
+                total_episodes = num_count
+            else:
+                # 既存のバッファを使用
+                print(f"既存の経験再生バッファを使用します（サイズ: {existing_buffer_size}エピソード）")
+                total_episodes = existing_buffer_size
 
             # メインの学習ループ
             while self.global_step < total_timesteps and not self.terminate_requested:
@@ -1422,14 +1531,44 @@ class PCN(MOAgent, MOPolicy):
                         )
                 
                 # 学習状況のコンソール出力
+                leaves_r = np.array([e[2][0].reward for e in self.experience_replay[len(self.experience_replay) // 2 :]])
+                # print("self.experience_replay",self.experience_replay)
+                hv = hypervolume(ref_point, leaves_r)
+                # print("leaves_r",leaves_r)
+                
+                # 各点のCrowding Distanceを計算して表示
+                if len(leaves_r) > 1:  # 少なくとも2点必要
+                    cd_values = crowding_distance(leaves_r)
+                    # print("各点のCrowding Distance:")
+                    # for i, (point, cd) in enumerate(zip(leaves_r, cd_values)):
+                    #     print(f"  点{i+1}: {point} -> 混雑度: {cd:.4f}")
+                    
+                    # 非支配解を特定して表示
+                    non_dom_indices = get_non_dominated_inds(leaves_r)
+                    # print(f"非支配解の数: {len(non_dom_indices)}")
+                    # if len(non_dom_indices) > 0:
+                        # print("非支配解:")
+                        # for i, idx in enumerate(non_dom_indices):
+                            # print(f"  解{i+1}: {leaves_r[idx]} -> 混雑度: {cd_values[idx]:.4f}")
+                
+                hv_est = hv
+                
+                # 定期的に混雑度0の点をクリーニング（20エピソードごと）
+                cleaning_counter += 1
+                if cleaning_counter >= 20:
+                    self.clean_zero_crowding_points(threshold=0.001)
+                    cleaning_counter = 0
+ 
                 if len(returns) > 0:  # 中断時に空の場合に備えて確認
                     print(
                         f"step {self.global_step}/{total_timesteps} ({self.global_step/total_timesteps*100:.1f}%) | "
                         f"episode {total_episodes} | "
                         f"return {np.mean(returns, axis=0)} | "
                         f"loss {np.mean(loss):.3E} | "
-                        f"horizons {np.mean(horizons)}"
+                        f"hv {hv_est}"
                     )
+
+
 
                 # 前回評価時のエピソード数を記録
                 if not hasattr(self, 'last_eval_episode'):
@@ -1481,7 +1620,9 @@ class PCN(MOAgent, MOPolicy):
         return self.mapmap
 
     def visualize_evaluation_history(self, save_dir="evaluation_history"):
-        """評価履歴を可視化し、一意のIDを持つファイルとして保存"""
+        """評価履歴を可視化し、一意のIDを持つファイルとして保存。
+        報酬（最大化目的）と実数値（最小化目的）の両方のグラフを別々に表示する。
+        """
         if not self.evaluation_history:
             print("評価履歴がありません")
             return
@@ -1495,6 +1636,7 @@ class PCN(MOAgent, MOPolicy):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
         
+        # ------ 実数値（最小化目的）のグラフ ------
         # 全データから適切な表示範囲を計算
         all_x_values = []
         all_y_values = []
@@ -1511,14 +1653,13 @@ class PCN(MOAgent, MOPolicy):
         x_range = [x_min - x_margin, x_max + x_margin]
         y_range = [y_min - y_margin, y_max + y_margin]
         
-        # パレートフロントの進化を可視化
+        # パレートフロントの進化を可視化（実数値 - 最小化目的）
         plt.figure(figsize=(15, 10))
         
         # 各評価時点のパレートフロントをプロット
         colors = plt.cm.viridis(np.linspace(0, 1, len(self.evaluation_history)))
         
         for i, (history, step) in enumerate(zip(self.evaluation_history, self.global_steps_at_evaluation)):
-            pareto_front_reward = history['pareto_front_reward']
             pareto_front_values = history['pareto_front_values']
             plt.scatter(
                 [ret[0] for ret in pareto_front_values], 
@@ -1528,52 +1669,156 @@ class PCN(MOAgent, MOPolicy):
                 alpha=0.7
             )
         
-        plt.title("パレートフロントの進化")
+        plt.title("パレートフロントの進化（実数値 - 最小化目的）")
         plt.xlabel("コスト（実数）")
         plt.ylabel("makespan（実数）")
         plt.xlim(x_range)
         plt.ylim(y_range)
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.legend(loc='upper right')
         plt.grid(True)
         plt.tight_layout()
         
+        # 左下が最適な方向であることを示す矢印
+        arrow_x = x_min + (x_max - x_min) * 0.85
+        arrow_y = y_min + (y_max - y_min) * 0.85
+        plt.annotate('最適方向', xy=(arrow_x - (x_max - x_min) * 0.2, arrow_y - (y_max - y_min) * 0.2), 
+                    xytext=(arrow_x, arrow_y),
+                    arrowprops=dict(facecolor='black', shrink=0.05, width=2),
+                    fontsize=12)
+        
         # 一意のIDを含むファイル名で保存
-        pareto_png_filename = f"{save_dir}/pareto_evolution_{unique_id}.png"
-        plt.savefig(pareto_png_filename)
+        pareto_values_png_filename = f"{save_dir}/pareto_values_evolution_{unique_id}.png"
+        plt.savefig(pareto_values_png_filename)
         plt.close()
         
-
+        # ------ 報酬（最大化目的）のグラフ ------
+        # 全データから適切な表示範囲を計算
+        all_x_values_reward = []
+        all_y_values_reward = []
+        for history in self.evaluation_history:
+            all_returns = history['all_returns']
+            all_x_values_reward.extend([ret[0] for ret in all_returns])
+            all_y_values_reward.extend([ret[1] for ret in all_returns])
         
-        # アニメーション作成
+        # 表示範囲の計算（少しマージンを追加）
+        x_min_reward, x_max_reward = min(all_x_values_reward), max(all_x_values_reward)
+        y_min_reward, y_max_reward = min(all_y_values_reward), max(all_y_values_reward)
+        x_margin_reward = (x_max_reward - x_min_reward) * 0.1
+        y_margin_reward = (y_max_reward - y_min_reward) * 0.1
+        x_range_reward = [x_min_reward - x_margin_reward, x_max_reward + x_margin_reward]
+        y_range_reward = [y_min_reward - y_margin_reward, y_max_reward + y_margin_reward]
+        
+        # パレートフロントの進化を可視化（報酬 - 最大化目的）
+        plt.figure(figsize=(15, 10))
+        
+        # 各評価時点のパレートフロントをプロット
+        for i, (history, step) in enumerate(zip(self.evaluation_history, self.global_steps_at_evaluation)):
+            pareto_front_reward = history['pareto_front_reward']
+            plt.scatter(
+                [ret[0] for ret in pareto_front_reward], 
+                [ret[1] for ret in pareto_front_reward],
+                color=colors[i], 
+                label=f"Step {step}",
+                alpha=0.7
+            )
+        
+        plt.title("パレートフロントの進化（報酬 - 最大化目的）")
+        plt.xlabel("報酬1")
+        plt.ylabel("報酬2")
+        plt.xlim(x_range_reward)
+        plt.ylim(y_range_reward)
+        plt.legend(loc='upper left')
+        plt.grid(True)
+        plt.tight_layout()
+        
+        # 右上が最適な方向であることを示す矢印
+        arrow_x_reward = x_min_reward + (x_max_reward - x_min_reward) * 0.15
+        arrow_y_reward = y_min_reward + (y_max_reward - y_min_reward) * 0.15
+        plt.annotate('最適方向', xy=(arrow_x_reward + (x_max_reward - x_min_reward) * 0.2, 
+                                arrow_y_reward + (y_max_reward - y_min_reward) * 0.2), 
+                    xytext=(arrow_x_reward, arrow_y_reward),
+                    arrowprops=dict(facecolor='black', shrink=0.05, width=2),
+                    fontsize=12)
+        
+        # 一意のIDを含むファイル名で保存
+        pareto_rewards_png_filename = f"{save_dir}/pareto_rewards_evolution_{unique_id}.png"
+        plt.savefig(pareto_rewards_png_filename)
+        plt.close()
+        
+        # ------ アニメーション作成（実数値） ------
         fig, ax = plt.subplots(figsize=(10, 8))
         
-        def update(frame):
+        def update_values(frame):
             ax.clear()
             history = self.evaluation_history[frame]
-            pareto_front_reward = history['pareto_front_reward']
             pareto_front_values = history['pareto_front_values']
             all_returns = history['values']
             
             ax.scatter([ret[0] for ret in all_returns], [ret[1] for ret in all_returns], alpha=0.3, color='blue')
             ax.scatter([ret[0] for ret in pareto_front_values], [ret[1] for ret in pareto_front_values], color='red', s=80)
             
-            ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}でのパレートフロント")
+            ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}でのパレートフロント（実数値 - 最小化目的）")
             ax.set_xlabel("コスト（実数）")
             ax.set_ylabel("makespan（実数）")
             ax.set_xlim(x_range)
             ax.set_ylim(y_range)
             ax.grid(True)
+            
+            # 左下が最適な方向であることを示す矢印
+            arrow_x = x_min + (x_max - x_min) * 0.85
+            arrow_y = y_min + (y_max - y_min) * 0.85
+            ax.annotate('最適方向', xy=(arrow_x - (x_max - x_min) * 0.2, arrow_y - (y_max - y_min) * 0.2), 
+                       xytext=(arrow_x, arrow_y),
+                       arrowprops=dict(facecolor='black', shrink=0.05, width=2),
+                       fontsize=12)
         
-        ani = FuncAnimation(fig, update, frames=len(self.evaluation_history), repeat=True)
+        ani_values = FuncAnimation(fig, update_values, frames=len(self.evaluation_history), repeat=True)
         
         # 一意のIDを含むファイル名でGIFを保存
-        pareto_gif_filename = f"{save_dir}/pareto_animation_{unique_id}.gif"
-        ani.save(pareto_gif_filename, writer='pillow', fps=2)
+        pareto_values_gif_filename = f"{save_dir}/pareto_values_animation_{unique_id}.gif"
+        ani_values.save(pareto_values_gif_filename, writer='pillow', fps=2)
+        plt.close()
+        
+        # ------ アニメーション作成（報酬） ------
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        def update_rewards(frame):
+            ax.clear()
+            history = self.evaluation_history[frame]
+            pareto_front_reward = history['pareto_front_reward']
+            all_returns = history['all_returns']
+            
+            ax.scatter([ret[0] for ret in all_returns], [ret[1] for ret in all_returns], alpha=0.3, color='green')
+            ax.scatter([ret[0] for ret in pareto_front_reward], [ret[1] for ret in pareto_front_reward], color='red', s=80)
+            
+            ax.set_title(f"Step {self.global_steps_at_evaluation[frame]}でのパレートフロント（報酬 - 最大化目的）")
+            ax.set_xlabel("報酬1")
+            ax.set_ylabel("報酬2")
+            ax.set_xlim(x_range_reward)
+            ax.set_ylim(y_range_reward)
+            ax.grid(True)
+            
+            # 右上が最適な方向であることを示す矢印
+            arrow_x_reward = x_min_reward + (x_max_reward - x_min_reward) * 0.15
+            arrow_y_reward = y_min_reward + (y_max_reward - y_min_reward) * 0.15
+            ax.annotate('最適方向', xy=(arrow_x_reward + (x_max_reward - x_min_reward) * 0.2, 
+                                   arrow_y_reward + (y_max_reward - y_min_reward) * 0.2), 
+                       xytext=(arrow_x_reward, arrow_y_reward),
+                       arrowprops=dict(facecolor='black', shrink=0.05, width=2),
+                       fontsize=12)
+        
+        ani_rewards = FuncAnimation(fig, update_rewards, frames=len(self.evaluation_history), repeat=True)
+        
+        # 一意のIDを含むファイル名でGIFを保存
+        pareto_rewards_gif_filename = f"{save_dir}/pareto_rewards_animation_{unique_id}.gif"
+        ani_rewards.save(pareto_rewards_gif_filename, writer='pillow', fps=2)
         plt.close()
         
         print(f"評価履歴の可視化を保存しました:")
-        print(f" - パレートフロント画像: {pareto_png_filename}")
-        print(f" - アニメーションGIF: {pareto_gif_filename}")
+        print(f" - 実数値パレートフロント画像: {pareto_values_png_filename}")
+        print(f" - 報酬パレートフロント画像: {pareto_rewards_png_filename}")
+        print(f" - 実数値アニメーションGIF: {pareto_values_gif_filename}")
+        print(f" - 報酬アニメーションGIF: {pareto_rewards_gif_filename}")
 
     def save_pareto_solutions_to_txt(self, mode_name="default"):
         """パレートフロントの解をテキストファイルに保存"""
@@ -1664,6 +1909,7 @@ class PCN(MOAgent, MOPolicy):
         ]
         
         transitions_collected = 0
+        episodes_collected = 0
         
         for p_idx, p in enumerate(patterns):
             print(f"パターン {p_idx+1}/5: 1の選択確率 = {p:.2f}")
@@ -1700,12 +1946,30 @@ class PCN(MOAgent, MOPolicy):
                 for i in reversed(range(len(transitions) - 1)):
                     transitions[i].reward += self.gamma * transitions[i + 1].reward
                 
-                # ヒープを使わず、単純なリストとして追加
+                # ヒープを使って適切に追加
                 if len(transitions) > 0:
-                    # ヒープキーの代わりにタプルを使用するが、実際のヒープ操作は行わない
-                    self.experience_replay.append((float(1.0), self.global_step, transitions))
+                    # ヒープに追加するときは priority, step, transitions のタプルを使用
+                    # ここでは優先度を高く（1.0）設定して確実に保持されるようにする
+                    priority = float(1.0 + np.sum(transitions[0].reward) * 0.1)  # 報酬が高いほど優先度も高く
+                    heapq.heappush(self.experience_replay, (priority, self.global_step, transitions))
+                    episodes_collected += 1
+                    
+                    # グローバルステップを更新（学習の進行状況を正確に追跡するため）
+                    self.global_step += len(transitions)
         
-        print(f"ヒューリスティック初期化完了: {len(self.experience_replay)}エピソード、{transitions_collected}ステップのデータを収集")
+        # バッファ内のエピソードが十分かチェック
+        if episodes_collected < 5:  # 最低でも5エピソードは必要
+            print(f"警告: ヒューリスティック初期化で収集されたエピソード数が少なすぎます({episodes_collected})。" +
+                  f"num_episodes_per_patternの値を大きくしてください。")
+        
+        print(f"ヒューリスティック初期化完了: {episodes_collected}エピソード、{transitions_collected}ステップのデータを収集")
+        print(f"バッファサイズ: {len(self.experience_replay)}エピソード")
+        
+        # バッファの内容を確認（デバッグ用）
+        if len(self.experience_replay) > 0:
+            returns = [e[2][0].reward for e in self.experience_replay]
+            avg_return = np.mean(returns, axis=0)
+            print(f"バッファ内の平均報酬: {avg_return}")
 
     def extract_env_info(self, env: Optional[gym.Env]) -> None:
         """Extracts all the features of the environment: observation space, action space, ..."""

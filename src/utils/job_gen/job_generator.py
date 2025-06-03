@@ -58,10 +58,9 @@ class JobGenerator:
 
         # csvファイルからジョブを読み込む
         elif self.job_type == 2:
-            jobs = pd.read_csv('jobs.csv')
-            jobs = jobs.values.tolist()
+            jobgen = JobSimulator(self.seed, n_jobs=self.n_jobs, n_users=self.n_jobs, lam=self.lam)
             for episode in range(self.nb_episodes + 1):
-                self.jobs_set[episode] = jobs
+                self.jobs_set[episode] = jobgen.generate_jobs(np.random.randint(0, 1000000))
 
         # ランダムの場合，必要な変数を指定
         elif self.job_type == 3:
