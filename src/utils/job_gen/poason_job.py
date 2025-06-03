@@ -13,9 +13,10 @@ class JobSimulator:
         self.min_processing_time = min_processing_time
         self.max_processing_time = max_processing_time
 
-    def generate_jobs(self):
+    def generate_jobs(self,seed=None):
         # ランダムシードを固定
-        np.random.seed(self.seed)
+        if seed is not None:
+            np.random.seed(seed)
         #到着時間は指数分布に基づく整数値
         inter_arrivals = np.random.exponential(self.lam, self.n_jobs)
         arrival_times = np.ceil(np.cumsum(inter_arrivals))

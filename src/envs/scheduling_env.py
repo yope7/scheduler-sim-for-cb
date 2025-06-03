@@ -310,7 +310,7 @@ class SchedulingEnv(gym.core.Env):
                     # print('================================================')
                     # print('self.user_wt: ',self.user_wt)
 
-                    rewards = np.array([time_reward_new,cost])
+                    rewards = np.array([time_reward_new,-cost])
 
                     return observation, rewards, scheduled, wt_step, done
 
@@ -460,11 +460,48 @@ class SchedulingEnv(gym.core.Env):
         """return:cost,makespan 待ち時間の定義は，ジョブが到着してから，ジョブが開始するまでの時間．
         つまり，各ステップにおける遅延時間の総和をとればよい．
         """
-        # self.waiting_time = 
         
-        #costはcloud_window_history_fullで-1じゃないマスを総計すればいい．ただし，next_init_windowsがある場合は，その分を引く．
-        self.cost = np.count_nonzero(self.cloud_window_history_full[self.cloud_window_history_full != -1])
-        #makespanは二次元配列で要素が入っているものの中で一番右側（インデックス）の値をとる
+        # クラウドに割り当てられたジョブのコスト計算
+        total_cost = 0
+        
+        # デバッグ出力
+        # print("=== デバッグ情報 ===")
+        # print(f"クラウドウィンドウ履歴: {self.cloud_window_history_full}")
+        
+        # クラウドウィンドウに記録されているジョブIDを取得
+        unique_job_ids = np.unique(self.cloud_window_history_full)
+        unique_job_ids = unique_job_ids[unique_job_ids >= 0]  # -1を除外
+        # print(f"検出されたジョブID: {unique_job_ids}")
+        
+        # 利用できるジョブ情報を確認
+        # print(f"ジョブ数: {len(self.jobs)}")
+        # for job in self.jobs[:5]:  # 最初の5件だけ表示
+        #     print(f"ジョブ情報: {job}")
+        
+        # 各クラウドジョブに対してコストを計算
+        for job_id in unique_job_ids:
+            # 対応するジョブを検索
+            matching_jobs = [job for job in self.jobs if int(job[5]) == job_id]
+            
+            if matching_jobs:
+                job = matching_jobs[0]
+                # ジョブのサイズからコストを計算
+                job_width = int(job[1])  # 処理時間
+                job_height = int(job[2])  # ノード数
+                job_cost = job_width * job_height
+                total_cost += job_cost
+                # print(f"ジョブID {job_id}: 処理時間={job_width}, ノード数={job_height}, コスト={job_cost}")
+            else:
+                # print(f"警告: ジョブID {job_id} に対応するジョブが見つかりません")
+                # クラウドウィンドウでの実際のセル数を代わりに使用
+                job_cells = np.count_nonzero(self.cloud_window_history_full == job_id)
+                total_cost += job_cells
+                # print(f"  代替計算: セル数={job_cells} をコストとして使用")
+        
+        self.cost = total_cost
+        # print(f"総コスト: {total_cost}")
+        
+        # makespanは二次元配列で要素が入っているものの中で一番右側（インデックス）の値をとる
         def calculate_makespan(matrix):
             matrix = np.array(matrix)
             latest_index = -1
@@ -635,7 +672,7 @@ class SchedulingEnv(gym.core.Env):
             if action[1] == 0:  # オンプレミスに割り当てる場合
                 cost = 0
             elif action[1] == 1:  # クラウドに割り当てる場合
-                cost = -1*((allocated_job[0] * allocated_job[1]))  # (処理時間)*(クラウドで使うノード数)をコストとする
+                cost = 1*((allocated_job[0] * allocated_job[1]))  # (処理時間)*(クラウドで使うノード数)をコストとする
                 #todo マジックナンバーの解消
             else:  # 割り当てない場合
                 cost = 0

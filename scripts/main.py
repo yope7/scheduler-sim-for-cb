@@ -89,8 +89,8 @@ def parse_args():
     parser.add_argument('--use_wandb', action='store_true', 
                       help='Wandbを使用するかどうかを設定')
     # NSGA-II用の引数
-    parser.add_argument('--pop_size', type=int, default=200, help='NSGA-IIの集団サイズ')
-    parser.add_argument('--num_generations', type=int, default=200, help='NSGA-IIの世代数')
+    parser.add_argument('--pop_size', type=int, default=100, help='NSGA-IIの集団サイズ')
+    parser.add_argument('--num_generations', type=int, default=100, help='NSGA-IIの世代数')
     parser.add_argument('--load_model', action='store_true', help='保存済みモデルを読み込む')
     parser.add_argument('--model_path', type=str, default='PCN_model_latest', 
                       help='読み込むモデルのパス（拡張子なし）')
@@ -173,8 +173,8 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
         env,
         device="auto",
         state_dim=1,
-        scaling_factor=np.array([0.1, 0.01, 1]),
-        learning_rate=1e-2,
+        scaling_factor=np.array([1, 1, 1]),
+        learning_rate=1e-3,
         batch_size=512,
         hidden_dim=256,
         project_name="temp",
@@ -195,20 +195,21 @@ def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int,
             print(f"モデルの読み込み中にエラーが発生しました: {e}")
             print("新規モデルから学習を開始します。")
 
-    agent.initialize_buffer_with_heuristics(env, num_episodes_per_pattern=20)
+    agent.initialize_buffer_with_heuristics(env, num_episodes_per_pattern=50)
     
     agent.train(
         eval_env=env,
         total_timesteps=int(how_many_episodes),
-        ref_point=np.array([0,0]),
-        num_er_episodes=10,
-        num_step_episodes=30,  
-        num_model_updates=2,
+        ref_point=np.array([-100000,-100000]),
+        num_er_episodes=1000,
+        num_step_episodes=20,  
+        num_model_updates=10,
         num_eval_episodes=100,
         max_buffer_size=10000,
         known_pareto_front=[1, 1],
         max_return=np.array([1000, 1000]),
         log_episode_only=True,
+        reset_buffer=False,  # ヒューリスティックで初期化されたバッファを保持する
     )
 
     on_premise_map, cloud_map = env.get_windows()

@@ -14,7 +14,14 @@ class ExhaustiveSearchAgent:
             nb_jobs: ジョブの数
         """
         # 各ジョブに対するアクション（0 または 1）の全組み合わせを生成
-        all_action_sets = list(itertools.product([0, 1], repeat=nb_jobs))
+        # all_action_sets = list(itertools.product([1, 0], repeat=nb_jobs))
+        # nb_jobsの長さだけ1のみの行列を生成
+        # all_action_sets = [[1] * nb_jobs]  # 2次元配列として定義
+        # 1と0がランダムで続く2次元配列を1要素生成
+        np.random.seed(5
+                       )
+        all_action_sets = np.random.randint(0, 2, (1, nb_jobs))
+
         print(f"Total action sets: {len(all_action_sets)}")
 
         results = []
@@ -25,7 +32,6 @@ class ExhaustiveSearchAgent:
         # 各組み合わせごとにエピソードをシミュレーション
         for i, action_set in enumerate(all_action_sets):
             print(f"Processing action set {i+1}/{len(all_action_sets)}: {action_set}")
-            
             # 環境のリセット
             obs = env.reset()
             done = False
@@ -53,6 +59,7 @@ class ExhaustiveSearchAgent:
             reward_summary.append([total_reward[0], total_reward[1]])
             value_cost, value_wt = env.calc_objective_values()
             results.append([value_cost, value_wt])
+            print(f"Episode {i+1} completed. value_cost:{value_cost}, value_wt:{value_wt}")
 
         # パレートフロントの計算
         non_dominated_inds = get_non_dominated_inds_minimize(np.array(results))
