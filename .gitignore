@@ -180,3 +180,20 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+result_jsons/
+pareto_solutions/
+num30update2
+nsga2_results/
+no-cnn/
+maps/
+evaluation_history/
+cnn-long/
+weights/
+# ルートディレクトリ直下の.pngファイルを無視
+/*.png
+
+# サブディレクトリ内の.pngファイルは無視しない
+!*/**/*.png
+
+/*.csv
