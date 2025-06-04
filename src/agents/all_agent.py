@@ -63,15 +63,12 @@ def evaluate_action_set_batch(action_sets: List[List[int]], env_config: Dict) ->
 
 class ExhaustiveSearchAgent:
     def __init__(self):
-        # Rayの初期化（ダッシュボードを有効化）
+        # Rayの初期化（シンプルな設定）
         if not ray.is_initialized():
             ray.init(
-                dashboard_host="127.0.0.1",
-                dashboard_port=8265,
-                _system_config={
-                    "object_spilling_threshold": 0.8,  # メモリ使用量が80%を超えたらスピル
-                    "max_direct_memory_object_store_size": 10 * 1024 * 1024 * 1024,  # 10GB
-                }
+                ignore_reinit_error=True,
+                local_mode=False,
+                num_cpus=None  # 利用可能な全CPUコアを使用
             )
         
         # メトリクスの初期化
@@ -94,7 +91,6 @@ class ExhaustiveSearchAgent:
         all_action_sets = list(itertools.product([0, 1], repeat=nb_jobs))
         total_sets = len(all_action_sets)
         print(f"Total action sets: {total_sets}")
-        print(f"Ray Dashboard URL: http://127.0.0.1:8265")
 
         # 環境の設定を準備
         env_config = {
