@@ -241,7 +241,7 @@ def run_exhaustive_mode(nb_jobs: int):
     agent = ExhaustiveSearchAgent()
     search_results = agent.run_exhaustive_search(env, nb_jobs)
     
-    print("results: ", search_results['results'])
+    # print("results: ", search_results['results'])
     print("pareto_front: ", search_results['pareto_front'])
     
     return search_results['results']
