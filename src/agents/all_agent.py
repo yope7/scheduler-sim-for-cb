@@ -115,7 +115,7 @@ class ExhaustiveSearchAgent:
 
         # バッチサイズの設定（CPUコア数に基づいて調整）
         num_cpus = ray.available_resources()['CPU']
-        batch_size = max(1, min(100, total_sets // (num_cpus * 4)))  # 各CPUコアあたり4バッチ
+        batch_size = int(max(1, min(100, total_sets // (num_cpus * 4))))  # 各CPUコアあたり4バッチ
         print(f"Using batch size: {batch_size}")
 
         # アクションセットをバッチに分割
