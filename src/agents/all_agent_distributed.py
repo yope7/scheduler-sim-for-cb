@@ -2,10 +2,13 @@ import numpy as np
 import itertools
 from morl_baselines.common.pareto import get_non_dominated_inds_minimize
 from numba import jit
+import ray
 from typing import List, Dict, Tuple
 from src.envs.scheduling_env import SchedulingEnv
+from ray.util.metrics import Counter, Histogram
 import time
 
+@ray.remote
 def evaluate_action_set_batch(action_sets: List[List[int]], env_config: Dict) -> List[Dict]:
     """
     複数のアクションセットをバッチで評価する関数
@@ -60,14 +63,25 @@ def evaluate_action_set_batch(action_sets: List[List[int]], env_config: Dict) ->
 
 class ExhaustiveSearchAgent:
     def __init__(self):
+        # Rayの初期化（シンプルな設定）
+        if not ray.is_initialized():
+            ray.init(
+                ignore_reinit_error=True,
+                local_mode=False,
+                num_cpus=None  # 利用可能な全CPUコアを使用
+            )
+        
         # メトリクスの初期化
-        self.total_tasks = 0
-        self.completed_tasks = 0
-        self.execution_times = []
+        self.total_tasks = Counter("total_tasks")
+        self.completed_tasks = Counter("completed_tasks")
+        self.execution_time = Histogram(
+            "execution_time",
+            boundaries=[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+        )
     
     def run_exhaustive_search(self, env, nb_jobs: int):
         """
-        全探索による最適なスケジューリングの探索（逐次実行）
+        全探索による最適なスケジューリングの探索（Rayによる並列化）
         
         Args:
             env: 初期化済みのSchedulingEnv環境
@@ -97,30 +111,36 @@ class ExhaustiveSearchAgent:
         }
 
         # メトリクスの更新
-        self.total_tasks = total_sets
+        self.total_tasks.inc(total_sets)
 
-        # バッチサイズの設定
-        batch_size = 1  # 1つずつ処理
+        # バッチサイズの設定（CPUコア数に基づいて調整）
+        num_cpus = ray.available_resources()['CPU']
+        batch_size = int(max(1, min(100, total_sets // (num_cpus * 4))))  # 各CPUコアあたり4バッチ
         print(f"Using batch size: {batch_size}")
 
         # アクションセットをバッチに分割
         action_batches = [all_action_sets[i:i + batch_size] for i in range(0, len(all_action_sets), batch_size)]
         
-        # 逐次評価の実行
+        # 並列評価の実行
+        futures = [evaluate_action_set_batch.remote(batch, env_config) for batch in action_batches]
+        
+        # 進捗監視用の変数
+        completed = 0
+        start_time = time.time()
+        
+        # 結果の収集と進捗表示
         all_results = []
         all_reward_summary = []
         all_epi_summary = []
         
-        completed = 0
-        start_time = time.time()
-        
-        for batch in action_batches:
-            batch_results = evaluate_action_set_batch(batch, env_config)
+        while futures:
+            done_id, futures = ray.wait(futures)
+            batch_results = ray.get(done_id[0])
             
             for result in batch_results:
                 # メトリクスの更新
-                self.completed_tasks += 1
-                self.execution_times.append(result['execution_time'])
+                self.completed_tasks.inc(1)
+                self.execution_time.observe(result['execution_time'])
                 
                 # 結果の保存
                 all_results.append(result['results'])

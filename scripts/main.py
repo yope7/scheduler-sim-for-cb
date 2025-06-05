@@ -11,7 +11,7 @@ from src.utils.job_gen.job_generator import JobGenerator
 from src.utils.map_visualizer import visualize_map
 from src.agents.dqn_agent import DQNAgent
 from numba import jit
-from src.agents.all_agent import ExhaustiveSearchAgent
+from src.agents.all_agent_distributed import ExhaustiveSearchAgent
 np.set_printoptions(linewidth=np.inf) 
 import itertools
 from morl_baselines.common.pareto import get_non_dominated_inds
