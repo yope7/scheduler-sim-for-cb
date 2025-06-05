@@ -730,15 +730,94 @@ pcn_inference = np.array([
     [0, 130]
 ])
 
+all_pareto = np.array([
+    [26, 122],
+    [28, 120],
+    [70, 107],
+    [54, 112],
+    [94, 103],
+    [0, 130],
+    [42, 116],
+    [86, 104],
+    [102, 99],
+    [158, 89],
+    [182, 85],
+    [224, 79],
+    [237, 78],
+    [210, 81],
+    [252, 75],
+    [177, 87],
+    [303, 69],
+    [331, 65],
+    [411, 55],
+    [290, 70],
+    [368, 60],
+    [448, 50],
+    [551, 39],
+    [546, 40],
+    [359, 62],
+    [439, 52],
+    [658, 28],
+    [748, 19],
+    [142, 91],
+    [118, 95],
+    [166, 88],
+    [194, 84],
+    [574, 36],
+    [684, 25],
+    [674, 26],
+    [769, 17],
+    [593, 34],
+    [262, 73],
+    [342, 63],
+    [304, 67],
+    [384, 57],
+    [469, 48],
+    [238, 77],
+    [473, 47],
+    [558, 38],
+    [319, 66],
+    [399, 56],
+    [631, 30],
+    [626, 31],
+    [726, 21],
+    [500, 45],
+    [483, 46],
+    [712, 22],
+    [702, 23],
+    [738, 20],
+    [647, 29],
+    [379, 59],
+    [459, 49],
+    [421, 53],
+    [501, 43],
+    [521, 42],
+    [611, 32],
+    [601, 33],
+    [205, 82],
+    [247, 76],
+    [181, 86],
+    [565, 37],
+    [665, 27],
+    [530, 41],
+    [283, 72],
+    [340, 64],
+    [420, 54],
+    [778, 16],
+    [689, 24],
+    [757, 18]
+])
+
 
 
 # plot pareto front
 # plt.scatter(pareto_front_all[:, 0], pareto_front_all[:, 1], label='Pareto Front')
-plt.scatter(pareto_pcn[:, 0], pareto_pcn[:, 1], label='PCN')
+# plt.scatter(pareto_pcn[:, 0], pareto_pcn[:, 1], label='PCN')
 # plt.scatter(pareto_drl[:, 0], pareto_drl[:, 1], label='DRL')
-plt.scatter(pareto_nsga2[:, 0], pareto_nsga2[:, 1], label='NSGA-II')
+# plt.scatter(pareto_nsga2[:, 0], pareto_nsga2[:, 1], label='NSGA-II')
 # plt.scatter(pcn_inference[:, 0], pcn_inference[:, 1], label='PCN Inference')
-# plt.scatter(all[:, 0], all[:, 1], label='All')
+# plt.scatter(all_pareto[:, 0], all_pareto[:, 1], label='All')
+plt.scatter(all_pareto[:, 0], all_pareto[:, 1], label='All')
 plt.xlabel('cost')
 plt.ylabel('makespan')
 plt.title('Pareto Front')
