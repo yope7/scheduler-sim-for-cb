@@ -197,3 +197,7 @@ weights/
 !*/**/*.png
 
 /*.csv
+*.gif
+*.png
+*.prof
+*.html*
