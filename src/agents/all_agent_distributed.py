@@ -61,7 +61,7 @@ def evaluate_action_set_batch(action_sets: List[List[int]], env_config: Dict) ->
     
     return results
 
-class ExhaustiveSearchAgent:
+class ExhaustiveSearchAgentDistributed:
     def __init__(self):
         # Rayの初期化（シンプルな設定）
         if not ray.is_initialized():

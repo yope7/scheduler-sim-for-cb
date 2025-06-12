@@ -11,11 +11,13 @@ from src.utils.job_gen.job_generator import JobGenerator
 from src.utils.map_visualizer import visualize_map
 from src.agents.dqn_agent import DQNAgent
 from numba import jit
-from src.agents.all_agent_distributed import ExhaustiveSearchAgent
+from src.agents.all_agent import ExhaustiveSearchAgent
+from src.agents.all_agent_distributed import ExhaustiveSearchAgentDistributed
 np.set_printoptions(linewidth=np.inf) 
 import itertools
 from morl_baselines.common.pareto import get_non_dominated_inds
 from src.agents.nsga2_agent import NSGA2Agent
+from multiprocessing import Pool
 
 with open('config/config.yml', 'r') as yml:
     config = yaml.safe_load(yml)
@@ -78,8 +80,8 @@ def evaluate_and_render(agent, env, objective_index):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='single', 
-                      choices=['single', 'pareto', 'pcn', 'all', 'nsga2'], 
-                      help='実行モード（single: 単一重み, pareto: パレートフロント探索, pcn: PCN, all: 全探索, nsga2: NSGA-II）')
+                      choices=['single', 'pareto', 'pcn', 'all', 'all_distributed', 'nsga2'], 
+                      help='実行モード（single: 単一重み, pareto: パレートフロント探索, pcn: PCN, all: 全探索, all_distributed: 分散処理による全探索, nsga2: NSGA-II）')
     # 既存の引数
     parser.add_argument('--how_many_episodes', type=int, default=1000)
     parser.add_argument('--nb_jobs', type=int, default=11)
@@ -239,6 +241,32 @@ def run_exhaustive_mode(nb_jobs: int):
     
     # エージェントの初期化と実行
     agent = ExhaustiveSearchAgent()
+    search_results = agent.run_exhaustive_search(env, nb_jobs)
+    
+    # print("results: ", search_results['results'])
+    print("pareto_front: ", search_results['pareto_front'])
+    
+    return search_results['results']
+
+def run_exhaustive_mode_distributed(nb_jobs: int):
+    """全探索モードの実行"""
+    # 環境パラメータの設定
+    next_init_windows = None
+    np.random.seed(0)
+    job_generator = JobGenerator(0, nb_steps, n_window, n_on_premise_node, 
+                               n_cloud_node, config, nb_jobs, 0.2, 0)
+
+    jobs_set = job_generator.generate_jobs_set()
+
+    # 環境の初期化
+    env = SchedulingEnv(
+        max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
+        weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
+        next_init_windows, flag=1
+    )
+    
+    # エージェントの初期化と実行
+    agent = ExhaustiveSearchAgentDistributed()
     search_results = agent.run_exhaustive_search(env, nb_jobs)
     
     # print("results: ", search_results['results'])
@@ -628,6 +656,11 @@ if __name__ == "__main__":
         # 全探索モードの実行
         results_reward = run_exhaustive_mode(args.nb_jobs)
         print("全探索による実行が完了しました")
+        
+    elif args.mode == 'all_distributed':
+        # 分散処理による全探索モードの実行
+        results_reward = run_exhaustive_mode_distributed(args.nb_jobs)
+        print("分散処理による全探索の実行が完了しました")
         
     elif args.mode == 'nsga2':
         # NSGA-IIによる最適化
