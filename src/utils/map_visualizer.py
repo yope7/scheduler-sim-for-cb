@@ -3,6 +3,54 @@ import numpy as np
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import os
 import glob
+
+# Linuxで使用可能なフォントを自動設定
+def setup_linux_fonts():
+    """Linuxで使用可能なフォントを自動設定"""
+    import matplotlib.font_manager as fm
+    import platform
+    
+    # Linuxシステムでのみ実行
+    if platform.system() == 'Linux':
+        # 利用可能なフォントを取得
+        available_fonts = [f.name for f in fm.fontManager.ttflist]
+        
+        # 優先順位付きでフォントを選択
+        preferred_fonts = [
+            'DejaVu Sans',
+            'Liberation Sans',
+            'Ubuntu',
+            'Noto Sans CJK JP',
+            'Noto Sans',
+            'Arial',
+            'Helvetica'
+        ]
+        
+        # 利用可能なフォントから選択
+        selected_font = None
+        for font in preferred_fonts:
+            if font in available_fonts:
+                selected_font = font
+                break
+        
+        # フォントが見つからない場合は、利用可能なフォントから最初のものを使用
+        if selected_font is None and available_fonts:
+            # sans-serif系のフォントを優先
+            sans_serif_fonts = [f for f in available_fonts if 'sans' in f.lower() or 'sans' in f.lower()]
+            if sans_serif_fonts:
+                selected_font = sans_serif_fonts[0]
+            else:
+                selected_font = available_fonts[0]
+        
+        if selected_font:
+            plt.rcParams['font.family'] = selected_font
+            plt.rcParams['font.sans-serif'] = [selected_font]
+            print(f"フォントを設定しました: {selected_font}")
+        else:
+            print("警告: 利用可能なフォントが見つかりませんでした")
+
+# Linuxフォントを自動設定
+# setup_linux_fonts()
 #行列をprintしたときに省略しないためのオプション
 np.set_printoptions(threshold=np.inf)
 

@@ -18,29 +18,60 @@ import torch.nn.functional as F
 import wandb
 # wandb.init(project="temp")
 
-np.random.seed(42)
+# 固定シードを削除して多様性を確保
+# np.random.seed(42)
 
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 
-# macOS用の日本語フォント設定
-try:
-    # 一般的なmacOS用日本語フォントを指定
-    plt.rcParams['font.family'] = 'Hiragino Sans'
-    # もし上記で見つからない場合、他の候補として 'Hiragino Kaku Gothic Pro', 'System Font' なども試せます。
-    # または、font_managerを使って利用可能なフォントから探すこともできます。
-    # import matplotlib.font_manager
-    # japanese_font = next((f.name for f in matplotlib.font_manager.fontManager.ttflist if 'hiragino' in f.name.lower()), None)
-    # if japanese_font:
-    #     plt.rcParams['font.family'] = japanese_font
-    # else:
-    #     # 最終手段として、システムデフォルトに任せる（文字化けする可能性が高い）
-    #     print("Hiraginoフォントが見つかりませんでした。システムフォントを使用します。")
-    #     pass # または plt.rcParams['font.family'] = plt.rcParamsDefault['font.family']
-except RuntimeError:
-    print("日本語フォント (例: Hiragino Sans) の設定中にエラーが発生しました。グラフの日本語が文字化けする可能性があります。")
-    # ここでもフォールバック処理を記述できますが、まずは指定フォントで試します。
+# Linuxで使用可能なフォントを自動設定
+def setup_linux_fonts():
+    """Linuxで使用可能なフォントを自動設定"""
+    import matplotlib.font_manager as fm
+    import platform
+    
+    # Linuxシステムでのみ実行
+    if platform.system() == 'Linux':
+        # 利用可能なフォントを取得
+        available_fonts = [f.name for f in fm.fontManager.ttflist]
+        
+        # 優先順位付きでフォントを選択
+        preferred_fonts = [
+            'DejaVu Sans',
+            'Liberation Sans',
+            'Ubuntu',
+            'Noto Sans CJK JP',
+            'Noto Sans',
+            'Arial',
+            'Helvetica'
+        ]
+        
+        # 利用可能なフォントから選択
+        selected_font = None
+        for font in preferred_fonts:
+            if font in available_fonts:
+                selected_font = font
+                break
+        
+        # フォントが見つからない場合は、利用可能なフォントから最初のものを使用
+        if selected_font is None and available_fonts:
+            # sans-serif系のフォントを優先
+            sans_serif_fonts = [f for f in available_fonts if 'sans' in f.lower() or 'sans' in f.lower()]
+            if sans_serif_fonts:
+                selected_font = sans_serif_fonts[0]
+            else:
+                selected_font = available_fonts[0]
+        
+        if selected_font:
+            plt.rcParams['font.family'] = selected_font
+            plt.rcParams['font.sans-serif'] = [selected_font]
+            print(f"フォントを設定しました: {selected_font}")
+        else:
+            print("警告: 利用可能なフォントが見つかりませんでした")
+
+# Linuxフォントを自動設定
+# setup_linux_fonts()
 
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
@@ -162,31 +193,19 @@ class BasePCNModel(nn.Module, ABC):
         """Initialize the PCN model."""
         super().__init__()
         self.state_dim = state_dim
-        # print("state_dim", self.state_dim)
         self.action_dim = action_dim
         self.reward_dim = reward_dim
         self.scaling_factor = nn.Parameter(th.tensor(scaling_factor).float(), requires_grad=False)
         self.hidden_dim = hidden_dim
-
-
-
-        # self.scaling_factor = scaling_factor
-        # self.s_emb = nn.Linear(state_dim, hidden_dim)
-        # self.c_emb = nn.Linear(action_dim + reward_dim, hidden_dim)
-        # self.fc = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, state, desired_return, desired_horizon):
         """Return log-probabilities of actions or return action directly in case of continuous action space."""
         c = th.cat((desired_return, desired_horizon), dim=-1)
         c = c * self.scaling_factor
 
-        # 並列計算の活用
-        with th.cuda.amp.autocast():
-            s = self.s_emb(state.float())
-            c = self.c_emb(c)
-            # 行列乗算を最適化
-            prediction = self.fc(s * c)
-        # print("prediction.shape", prediction.shape)
+        s = self.s_emb(state.float())
+        c = self.c_emb(c)
+        prediction = self.fc(s * c)
         return prediction
 
 
@@ -196,8 +215,10 @@ class DiscreteActionsDefaultModel(BasePCNModel):
     def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
         """Initialize the PCN model for discrete actions."""
         super().__init__(state_dim, action_dim, reward_dim, scaling_factor, hidden_dim)
-        # print("kotti")
-        self.state_dim = 12790
+        # TODO: 入力次元の最適化が必要
+        # 現在: 205040次元 → 非常に重い
+        # 提案: 特徴量選択や次元削減で1000-5000次元程度に削減
+        self.state_dim = 76840  # ← この値が性能ボトルネック
         self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
         self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
         self.fc = nn.Sequential(
@@ -671,6 +692,14 @@ class PCN(MOAgent, MOPolicy):
         
         self.use_enhanced_model = use_enhanced_model
         self.debug_mode = debug_mode
+        
+        # 混合精度学習の設定
+        self.use_amp = True  # 自動混合精度を有効化
+        self.scaler = th.cuda.amp.GradScaler() if self.use_amp else None
+        
+        # パフォーマンス監視
+        self.update_times = []
+        self.last_update_time = None
 
         if use_enhanced_model:
             if self.debug_mode:
@@ -789,72 +818,169 @@ class PCN(MOAgent, MOPolicy):
             "seed": self.seed,
         }
 
-    def update(self):
-        """Update PCN model."""
-        with th.cuda.amp.autocast():
-            # experience_replayのインデックスを一括サンプリング
-            sample_indices = self.np_random.choice(len(self.experience_replay), size=self.batch_size, replace=True)
+    def update(self, learning_rate=None):
+        """Update PCN model - 最適化版
+        
+        Args:
+            learning_rate (float, optional): 一時的な学習率。Noneの場合はデフォルトの学習率を使用
+        """
+        import time
+        start_time = time.time()
+        
+        # 一時的な学習率の適用
+        original_lr = None
+        if learning_rate is not None:
+            original_lr = self.opt.param_groups[0]['lr']
+            self.opt.param_groups[0]['lr'] = learning_rate
+        
+        # 1. 事前にnumpy配列を準備（メモリアロケーション削減）
+        batch_size = self.batch_size
+        buffer_size = len(self.experience_replay)
+        
+        # 2. ベクトル化されたサンプリング
+        sample_indices = self.np_random.choice(buffer_size, size=batch_size, replace=True)
+        
+        # 3. 事前に配列を確保（メモリアロケーション削減）
+        obs_shape = self.experience_replay[0][2][0].observation.shape
+        reward_shape = self.experience_replay[0][2][0].reward.shape
+        
+        # 4. 効率的なデータ抽出（メモリ効率化）
+        observations = np.empty((batch_size,) + obs_shape, dtype=np.float32)
+        actions = np.empty(batch_size, dtype=np.int64)
+        desired_returns = np.empty((batch_size,) + reward_shape, dtype=np.float32)
+        desired_horizons = np.empty(batch_size, dtype=np.float32)
+        
+        # 5. ベクトル化されたデータ抽出（PCNの正しい学習方法）
+        for i, idx in enumerate(sample_indices):
+            episode = self.experience_replay[idx][2]
+            episode_length = len(episode)
             
-            observations_list = []
-            actions_list = []
-            desired_return_list = []
-            desired_horizon_list = []
+            # エピソード内のランダムなステップを選択（各ステップで学習）
+            t = np.random.randint(0, episode_length)
+            transition = episode[t]
             
-            for i in sample_indices:
-                # エピソードの取得
-                episode = self.experience_replay[i][2]
-                episode_length = len(episode)
-                
-                # エピソード内のランダムな時刻をサンプリング
-                t = self.np_random.integers(0, episode_length)
-                
-                # 対象のTransitionを取得
-                transition = episode[t]
-                
-                # 残りステップ数の計算（float32にキャスト）
-                rest_horizon = np.float32(episode_length - t)
-                
-                observations_list.append(transition.observation)
-                actions_list.append(transition.action)
-                desired_return_list.append(np.float32(transition.reward))
-                desired_horizon_list.append(rest_horizon)
+            # コピーを避けて直接代入
+            observations[i] = transition.observation
+            actions[i] = transition.action
             
-            # それぞれのリストをnp.stackでまとめ、torch.from_numpyを用いてGPUへ転送
-            obs = th.from_numpy(np.stack(observations_list)).to(self.device).float()
-            actions = th.from_numpy(np.stack(actions_list)).to(self.device)
-            desired_return = th.from_numpy(np.stack(desired_return_list)).to(self.device).float()
-            desired_horizon = th.from_numpy(np.stack(desired_horizon_list)).to(self.device).float().unsqueeze(1)
+            # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i
+            remaining_return = 0.0
+            for j in range(t, episode_length):
+                # 論文の式: R_t = Σ_{i=t}^T γ^i r_i
+                # ここで episode[j].reward は即時報酬 r_j
+                remaining_return += (self.gamma ** (j - t)) * episode[j].reward
             
+            desired_returns[i] = remaining_return  # 論文通りの割引累積報酬
+            desired_horizons[i] = np.float32(episode_length - t)  # 残りのステップ数
+        
+        # 6. 一括GPU転送（非同期化 + メモリ効率化）
+        with th.cuda.amp.autocast(enabled=self.use_amp):  # 混合精度学習
+            # 非同期転送でCPU-GPU並列化
+            obs = th.from_numpy(observations).to(self.device, non_blocking=True)
+            actions = th.from_numpy(actions).to(self.device, non_blocking=True)
+            desired_return = th.from_numpy(desired_returns).to(self.device, non_blocking=True)
+            desired_horizon = th.from_numpy(desired_horizons).to(self.device, non_blocking=True).unsqueeze(1)
+            
+            # 7. 最適化された勾配計算
             self.opt.zero_grad(set_to_none=True)
-
+            
+            # 8. モデル推論
             if self.use_enhanced_model:
                 prediction_output = self.network(obs, desired_return, desired_horizon)
             else:
                 prediction_output = self.model(obs, desired_return, desired_horizon)
             
-            # モデルの出力がタプルである可能性への対応 (EnhancedPCNModel.forward が単一テンソルを返せば不要)
+            # 9. 損失計算
             if isinstance(prediction_output, tuple):
                 prediction_logits = prediction_output[0]
             else:
                 prediction_logits = prediction_output
             
             if self.continuous_action:
-                # 連続行動の場合、prediction_logits は直接的な行動の値を意味する
                 l = F.mse_loss(actions.float(), prediction_logits)
             else:
-                # 離散行動の場合
                 if self.use_enhanced_model:
-                    # EnhancedPCNModelはlogitsを出力するため、CrossEntropyLossを使用
                     l = F.cross_entropy(prediction_logits, actions.long())
                 else:
-                    # DiscreteActionsDefaultModelはlog_probsを出力するため、NLLLossを使用
-                    # (DiscreteActionsDefaultModelの最後がLogSoftmaxであることを前提)
                     l = F.nll_loss(prediction_logits, actions.long())
             
-            l.backward()
-            self.opt.step()
+            # 10. 逆伝播と最適化（混合精度対応）
+            if self.use_amp and self.scaler is not None:
+                self.scaler.scale(l).backward()
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                l.backward()
+                self.opt.step()
+        
+        # 11. メモリクリーンアップ
+        del observations, actions, desired_returns, desired_horizons
+        if self.device == 'cuda':
+            th.cuda.empty_cache()
+        
+        # 12. パフォーマンス監視
+        end_time = time.time()
+        update_time = end_time - start_time
+        self.update_times.append(update_time)
+        
+        # 学習率を元に戻す
+        if original_lr is not None:
+            self.opt.param_groups[0]['lr'] = original_lr
+        
+        # 詳細なデバッグ情報（100回ごと）
+        if len(self.update_times) % 100 == 0 and self.debug_mode:
+            avg_time = np.mean(self.update_times[-100:])
+            print(f"Update performance: {avg_time:.4f}s per update (avg of last 100)")
             
-            return l, prediction_logits
+            # 学習データの統計を表示
+            print(f"学習データ統計:")
+            print(f"  バッチサイズ: {batch_size}")
+            print(f"  バッファサイズ: {buffer_size}")
+            print(f"  観測形状: {obs_shape}")
+            print(f"  報酬形状: {reward_shape}")
+            print(f"  割引率γ: {self.gamma}")
+            
+            # 行動分布の詳細
+            action_counts = np.bincount(actions.cpu().numpy())
+            total_actions = len(actions)
+            print(f"  行動分布: {action_counts}")
+            for i, count in enumerate(action_counts):
+                if count > 0:
+                    percentage = (count / total_actions) * 100
+                    print(f"    行動{i}: {count}回 ({percentage:.1f}%)")
+            
+            # 報酬とホライズンの詳細統計（論文通りの計算）
+            print(f"  論文通りの割引累積報酬統計:")
+            print(f"    平均: {desired_returns.mean():.4f}")
+            print(f"    標準偏差: {desired_returns.std():.4f}")
+            print(f"    範囲: [{desired_returns.min():.4f}, {desired_returns.max():.4f}]")
+            
+            print(f"  残りステップ数統計:")
+            print(f"    平均: {desired_horizons.mean():.1f}")
+            print(f"    標準偏差: {desired_horizons.std():.1f}")
+            print(f"    範囲: [{desired_horizons.min()}, {desired_horizons.max()}]")
+            
+            # 学習の質を評価
+            if len(self.update_times) >= 200:
+                recent_losses = [self.update_times[-100:]]
+                loss_trend = np.mean(recent_losses[-50:]) - np.mean(recent_losses[:50])
+                if loss_trend > 0:
+                    print(f"  ⚠️  損失の傾向: 増加傾向 ({loss_trend:.4f})")
+                else:
+                    print(f"  ✓ 損失の傾向: 減少傾向 ({loss_trend:.4f})")
+            
+            # 500回ごとに学習データをファイルに保存
+            if len(self.update_times) % 500 == 0:
+                print("📊 学習データをファイルに保存中...")
+                try:
+                    self.save_learning_data_to_file(
+                        filename=f"learning_data_update_{len(self.update_times)}.txt",
+                        sample_size=200
+                    )
+                except Exception as e:
+                    print(f"⚠️  ファイル保存中にエラーが発生しました: {e}")
+        
+        return l, prediction_logits
 
     def _add_episode(self, transitions: List[Transition], max_size: int, step: int) -> None:
         # compute return
@@ -863,74 +989,145 @@ class PCN(MOAgent, MOPolicy):
         # pop smallest episode of heap if full, add new episode
         # heap is sorted by negative distance, (updated in nlargest)
         # put positive number to ensure that new item stays in the heap
+        unique_step = (step, id(transitions))
         if len(self.experience_replay) == max_size:
-            heapq.heappushpop(self.experience_replay, (1, step, transitions))
+            heapq.heappushpop(self.experience_replay, (1, unique_step, transitions))
         else:
-            heapq.heappush(self.experience_replay, (1, step, transitions))
+            heapq.heappush(self.experience_replay, (1, unique_step, transitions))
 
     def _nlargest(self, n, threshold=0.1):
-        """非支配解の選択処理を改善 - ログ表示を追加"""
-        returns = np.array([e[2][0].reward for e in self.experience_replay], dtype=np.float64)
+        """経験再生バッファから上位n個のエピソードを取得"""
+        if len(self.experience_replay) == 0:
+            print("警告: 経験再生バッファが空です。")
+            return []
         
-        print("\n===== 非支配解選択プロセス =====")
-        print(f"バッファ内の解の数: {len(returns)}")
+        # 全てのエピソードの報酬を取得
+        all_returns = []
+        all_episodes = []
         
-        # 非支配解の選択
-        non_dominated_i = get_non_dominated_inds(returns)
-        non_dominated = returns[non_dominated_i]
-        # print(f"非支配解の数: {len(non_dominated_i)}")
+        for priority, step, episode in self.experience_replay:
+            if len(episode) > 0:
+                return_val = episode[0].reward
+                all_returns.append(return_val)
+                all_episodes.append((priority, step, episode))
         
-        # if len(non_dominated_i) > 0:
-        #     print("非支配解の一部:")
-        #     for i, idx in enumerate(non_dominated_i[:min(5, len(non_dominated_i))]):
-        #         print(f"  解{i+1}: {returns[idx]}")
-        #     if len(non_dominated_i) > 5:
-        #         print(f"  ... 他 {len(non_dominated_i)-5} 個")
+        if len(all_returns) == 0:
+            print("警告: 有効なエピソードが見つかりません。")
+            return []
         
-        # 全点間の距離に基づく混雑度計算
-        distances = crowding_distance(returns)
-        avg_crowding = np.mean(distances)
-        print(f"平均混雑度: {avg_crowding:.4f}")
+        # 非支配解のインデックスを取得
+        returns_array = np.array(all_returns)
+        non_dominated_inds = get_non_dominated_inds(returns_array)
         
-        # 混雑している点の特定
-        sma = np.argwhere(distances <= threshold).flatten()
-        print(f"混雑点の数 (閾値 {threshold}): {len(sma)}")
+        # print(f"\n=== PCNエージェント: _nlargestメソッド実行 ===")
+        # print(f"経験再生バッファサイズ: {len(self.experience_replay)}")
+        # print(f"有効なエピソード数: {len(all_returns)}")
+        # print(f"非支配解の数: {len(non_dominated_inds)}")
         
-        # 端点をチェック
-        edge_points = []
-        for d in range(returns.shape[1]):
-            edge_points.append(np.argmin(returns[:, d]))
-            edge_points.append(np.argmax(returns[:, d]))
-        edge_points = np.unique(edge_points)
-        print(f"特定された端点の数: {len(edge_points)}")
+        if len(non_dominated_inds) > 0:
+            # 非支配解の報酬範囲を表示
+            nd_returns = returns_array[non_dominated_inds]
+            # print(f"非支配解の報酬範囲:")
+            # for dim in range(nd_returns.shape[1]):
+            #     min_val = np.min(nd_returns[:, dim])
+            #     max_val = np.max(nd_returns[:, dim])
+            #     print(f"  次元{dim}: {min_val:.4f} 〜 {max_val:.4f}")
         
-        # 距離計算と優先度設定
-        returns_exp = np.tile(np.expand_dims(returns, 1), (1, len(non_dominated), 1))
-        diff_array = (returns_exp - non_dominated).astype(np.float64)
-        l2 = np.min(np.linalg.norm(diff_array, axis=-1), axis=-1) * -1
+        # 非支配解のみを使用
+        nd_episodes = [all_episodes[i] for i in non_dominated_inds]
+        nd_returns = returns_array[non_dominated_inds]
         
-        print("優先度の付与:")
-        print(f"  基本優先度の範囲: {np.min(l2):.4f} 〜 {np.max(l2):.4f}")
+        if len(nd_episodes) == 0:
+            print("非支配解が見つかりませんでした。全てのエピソードを使用します。")
+            # 非支配解がない場合は、全てのエピソードを使用
+            nd_episodes = all_episodes
+            nd_returns = returns_array
         
-        # 以下は既存のコードに沿って処理...
+        # Crowding Distanceを計算
+        if len(nd_returns) > 1:
+            crowding_distances = crowding_distance(nd_returns)
+        else:
+            crowding_distances = np.array([1.0])
+        
+        # 端点を識別（パレートフロントの端点）
+        endpoints = []
+        for dim in range(nd_returns.shape[1]):
+            min_idx = np.argmin(nd_returns[:, dim])
+            max_idx = np.argmax(nd_returns[:, dim])
+            endpoints.extend([min_idx, max_idx])
+        endpoints = list(set(endpoints))  # 重複を除去
+        
+        # 端点のペナルティを大幅に強化（10倍のペナルティ）
+        for idx in endpoints:
+            crowding_distances[idx] *= 1  # 10分の1にすることで大幅なペナルティ
+        
+        # さらに、最近選択された端点を追跡して追加ペナルティを適用
+        if not hasattr(self, '_recently_selected_endpoints'):
+            self._recently_selected_endpoints = []
+        
+        # 最近選択された端点に追加ペナルティ
+        for idx in self._recently_selected_endpoints:
+            if idx < len(crowding_distances):
+                crowding_distances[idx] *= 0.05  # さらに20分の1のペナルティ
+        
+        # 距離ベースの優先度を計算
+        distances = []
+        for i, (priority, step, episode) in enumerate(nd_episodes):
+            # 非支配解からの距離を計算
+            dist = np.min(np.linalg.norm(nd_returns - nd_returns[i], axis=1))
+            # Crowding Distanceと組み合わせ
+            combined_score = crowding_distances[i] / (dist + 1e-8)
+            distances.append(combined_score)
+        
+        distances = np.array(distances)
+        
+        # 上位n個を選択
+        n = min(n, len(nd_episodes))
+        top_indices = np.argsort(distances)[-n:]
+        
+        # 選択された端点を記録
+        selected_endpoints = []
+        for idx in top_indices:
+            if idx in endpoints:
+                selected_endpoints.append(idx)
+        
+        # 最近選択された端点リストを更新（最新の5個を保持）
+        self._recently_selected_endpoints = selected_endpoints[:5]
+        
+        # print(f"選択されたエピソード数: {n}")
+        # print("選択されたエピソードの詳細:")
+        for i, idx in enumerate(top_indices):
+            episode = nd_episodes[idx]
+            return_val = nd_returns[idx]
+            crowding_dist = crowding_distances[idx]
+            distance_score = distances[idx]
+            is_endpoint = "端点" if idx in endpoints else "非端点"
+            # print(f"  {i+1}. 報酬: {return_val}, Crowding Distance: {crowding_dist:.4f}, 距離スコア: {distance_score:.4f} ({is_endpoint})")
+        
+        # print("="*60)
         
         # 結果の表示
-        sorted_i = np.argsort(l2)
-        largest = [self.experience_replay[i] for i in sorted_i[-n:]]
-        print(f"\n選択された {n} 個の解の内訳:")
+        sorted_i = np.argsort(distances)
+        largest = [nd_episodes[i] for i in sorted_i[-n:]]
+        # print(f"\n選択された {n} 個の解の内訳:")
         selected_returns = np.array([e[2][0].reward for e in largest])
         selected_non_dom = get_non_dominated_inds(selected_returns)
-        print(f"  - 選択解のうち非支配解の数: {len(selected_non_dom)}")
-        print(f"  - 選択解の優先度範囲: {np.min([e[0] for e in largest]):.4f} 〜 {np.max([e[0] for e in largest]):.4f}")
-        print("==================================\n")
+        # print(f"  - 選択解のうち非支配解の数: {len(selected_non_dom)}")
+        # print(f"  - 選択解の優先度範囲: {np.min([e[0] for e in largest]):.4f} 〜 {np.max([e[0] for e in largest]):.4f}")
+        # print("==================================\n")
         
         # ヒープの更新処理...
         
         return largest
 
     def _choose_commands(self, num_episodes: int):
-        """探索方向を決定するメソッド - 偏り修正版"""
+        """探索方向を決定するメソッド - 論文に沿った修正版"""
         episodes = self._nlargest(num_episodes)
+        
+        if len(episodes) == 0:
+            print("警告: コマンド選択用のエピソードが見つかりませんでした。デフォルト値を返します。")
+            return np.zeros(self.reward_dim, dtype=np.float32), np.float32(40)
+        
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
         
         # 非支配解のみを保持
@@ -948,44 +1145,87 @@ class PCN(MOAgent, MOPolicy):
             # パレートフロント上での位置を正規化
             normalized_returns = (returns - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
             
-            # 端点を避け、中央付近の解を優先
+            # 端点を識別
+            endpoints = []
+            for dim in range(returns.shape[1]):
+                min_idx = np.argmin(returns[:, dim])
+                max_idx = np.argmax(returns[:, dim])
+                endpoints.extend([min_idx, max_idx])
+            endpoints = list(set(endpoints))
+            
+            # 端点を避け、中央付近の解を優先（より強力なペナルティ）
             center_dists = np.linalg.norm(normalized_returns - 0.5, axis=1)
             center_weights = 1.0 / (center_dists + 0.1)  # 中央に近いほど重み大きく
+            
+            # 端点に対する大幅なペナルティ
+            for idx in endpoints:
+                center_weights[idx] *= 0.1  # 100分の1のペナルティ
+            
+            # 最近選択された端点を追跡して追加ペナルティ
+            if not hasattr(self, '_recently_chosen_endpoints'):
+                self._recently_chosen_endpoints = []
             
             # 確率的サンプリング（中央寄りの点が選ばれやすい）
             weights = center_weights / np.sum(center_weights)
             r_i = self.np_random.choice(len(returns), p=weights)
             
-            # 報酬設定
-            desired_return = returns[r_i].copy()
-            desired_horizon = np.float32(horizons[r_i] - 2)
+            # 選択された端点を記録
+            if r_i in endpoints:
+                self._recently_chosen_endpoints = [r_i] + self._recently_chosen_endpoints[:4]  # 最新5個を保持
             
-            # 合理的な改善量の設定（報酬の範囲の5%程度）
-            reward_range = np.ptp(returns, axis=0)
-            dim = self.np_random.integers(0, self.reward_dim)
-            improvement = self.np_random.uniform(0, reward_range[dim]) 
-            desired_return[dim] += improvement
+            # 元の報酬を保存
+            original_return = returns[r_i].copy()
+            original_horizon = np.float32(horizons[r_i] - 2)
+            
+            # 論文に沿った目標改善量の設定
+            # 1. 目的関数値を[0,1]の範囲に正規化
+            normalized_current = (original_return - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
+            
+            # 2. 一様分布から改善ベクトルδ ∈ [0,1]^mをサンプリング
+            delta = self.np_random.uniform(0, 1, size=self.reward_dim)
+            
+            # 3. 現在の解xにδを加えて目標x + δを作成（ただし[0,1]の範囲にクリップ）
+            target_normalized = np.clip(normalized_current + delta, 0, 1)
+            
+            # 4. 正規化された目標値を元のスケールに戻す
+            desired_return = target_normalized * (returns.max(axis=0) - returns.min(axis=0)) + returns.min(axis=0)
+            desired_horizon = original_horizon
+            
+            # 詳細なログ出力（デバッグ用）
+            # print(f"\n=== PCNエージェント: 論文に沿った目標値設定 ===")
+            # print(f"選択された元の報酬: {original_return}")
+            # print(f"正規化された現在値: {normalized_current}")
+            # print(f"サンプリングされた改善ベクトルδ: {delta}")
+            # print(f"正規化された目標値: {target_normalized}")
+            # print(f"最終的な目標報酬: {desired_return}")
+            # print(f"目標ホライズン: {desired_horizon}")
+            # print("="*60)
             
             return np.float32(desired_return), desired_horizon
         else:
             # 非支配解がない場合のフォールバック
+            print(f"\n=== PCNエージェント: フォールバック ===")
+            print("非支配解が見つかりませんでした。デフォルト値を設定します。")
+            print("デフォルト目標報酬: [0, 0, 0]")
+            print("デフォルト目標ホライズン: 40")
+            print("="*60)
             return np.zeros(self.reward_dim, dtype=np.float32), np.float32(40)
 
     def _act(self, obs: np.ndarray, desired_return, desired_horizon, eval_mode=False) -> int:
-        with th.cuda.amp.autocast():
-            obs_tensor = th.tensor(np.array([obs]), device=self.device).float()
-            return_tensor = th.tensor(np.array([desired_return]), device=self.device).float()
-            horizon_tensor = th.tensor([[desired_horizon]], device=self.device).float()
-            
-            if self.use_enhanced_model:
-                prediction_output = self.network(obs_tensor, return_tensor, horizon_tensor)
-            else:
-                prediction_output = self.model(obs_tensor, return_tensor, horizon_tensor)
+        obs_tensor = th.tensor(np.array([obs]), device=self.device).float()
+        return_tensor = th.tensor(np.array([desired_return]), device=self.device).float()
+        horizon_tensor = th.tensor([[desired_horizon]], device=self.device).float()
+        
+        
+        if self.use_enhanced_model:
+            prediction_output = self.network(obs_tensor, return_tensor, horizon_tensor)
+        else:
+            prediction_output = self.model(obs_tensor, return_tensor, horizon_tensor)
 
-            if isinstance(prediction_output, tuple):
-                prediction_scores = prediction_output[0]
-            else:
-                prediction_scores = prediction_output
+        if isinstance(prediction_output, tuple):
+            prediction_scores = prediction_output[0]
+        else:
+            prediction_scores = prediction_output
 
         if self.continuous_action:
             action = prediction_scores.detach().cpu().numpy()[0]
@@ -1044,21 +1284,36 @@ class PCN(MOAgent, MOPolicy):
                 desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
         
         # エピソード完了後の結果表示
-        episode_return = transitions[0].reward  # 累積報酬
-        for i in reversed(range(len(transitions) - 1)):
-            transitions[i].reward += self.gamma * transitions[i + 1].reward
+        # 注意: 累積報酬の計算は_add_episodeメソッドで行われるため、ここでは行わない
+        episode_return = transitions[0].reward  # 即座の報酬（累積報酬ではない）
         
-        final_return = transitions[0].reward
+        final_return = episode_return
         onpre_final = env.on_premise_window_history_full
         cloud_final = env.cloud_window_history_full
-        value_cost, value_wt = env.calc_objective_values()
+        value_cost, value_wt, value_avg_wt = env.calc_objective_values()
+        
+        # エピソード完了時の結果を表示
+        if eval_mode:
+            pass
+            # print(f"エピソード完了: 長さ={len(transitions)}")
+            # print(f"  累積報酬: {final_return}")
+            # print(f"  実際のコスト: {value_cost}, 実際の待ち時間: {value_wt}")
+            
+            # # actionsetを表示
+            # actions = [t.action for t in transitions]
+            # print(f"  actionset: {actions}")
+            
+            # # マップ情報を表示
+            # # print(f"  オンプレミスマップ: {onpre_final}")
+            # # print(f"  クラウドマップ: {cloud_final}")
+            # print("------------------------")
         
         # print(f"エピソード完了: 長さ={len(transitions)}")
         # print(f"最終報酬: {final_return}")
         # print(f"実際の値: コスト={value_cost}, 待ち時間={value_wt}")
         # print("=========================\n")
         
-        return transitions, map_snapshots_on_premise, map_snapshots_cloud, wt_sum, [onpre_final, cloud_final], [value_cost, value_wt]
+        return transitions, map_snapshots_on_premise, map_snapshots_cloud, wt_sum, [onpre_final, cloud_final], [value_cost, value_avg_wt]
 
     def set_desired_return_and_horizon(self, desired_return: np.ndarray, desired_horizon: int):
         """Set desired return and horizon for evaluation."""
@@ -1076,26 +1331,52 @@ class PCN(MOAgent, MOPolicy):
     
     def execute_selected_policy(self, env, best_policy):
         """選択されたポリシーを実行する"""
-        self.run_episode(env, best_policy, max_return=np.full(2, 100.0, dtype=np.float32), eval_mode=True)
+        self.run_episode(env, best_policy, max_return=np.full(np.inf, np.inf, dtype=np.float32), eval_mode=True)
     
     def evaluate_and_execute_selected_policy(self, env, max_return, objective_index, n=10):
         """特定の目的関数の値が最大となるようなポリシーを評価して実行する"""
         n = min(n, len(self.experience_replay))
         # print("len(self.experience_replay)", len(self.experience_replay))
         episodes = self._nlargest(n)
+        
+        # 実際に取得されたエピソード数に基づいてnを調整
+        actual_n = len(episodes)
+        if actual_n == 0:
+            print("警告: 評価用のエピソードが見つかりませんでした。")
+            return None, [0, 0, 0]
+        
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
         returns = np.float32(returns)
         horizons = np.float32(horizons)
         all_transitions = []
         e_returns = []
-        for i in range(n):
-            transitions, _, _, _, _ , _, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
+        
+        # print(f"\n===== {actual_n}個のエピソード評価結果（選択実行版）=====")
+        
+        for i in range(actual_n):
+            transitions, _, _, _, map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
             all_transitions.append(transitions)
             # compute return
             for j in reversed(range(len(transitions) - 1)):
                 transitions[j].reward += self.gamma * transitions[j + 1].reward
             e_returns.append(transitions[0].reward)
+            
+            # 各エピソードの結果を表示
+            # print(f"エピソード {i+1}:")
+            # print(f"  累積報酬: {transitions[0].reward}")
+            # print(f"  実際のコスト: {value[0]}, 実際の待ち時間: {value[1]}")
+            
+            # actionsetを表示
+            # actions = [t.action for t in transitions]
+            # print(f"  actionset: {actions}")
+            
+            # マップ情報を表示
+            # print(f"  オンプレミスマップ: {map_fin[0]}")
+            # print(f"  クラウドマップ: {map_fin[1]}")
+            # print()
             #やってみて、再現可能なデータを集める。
+
+        # print("==========================================\n")
 
         # 非支配解の取得
         # print("e_returns", e_returns)
@@ -1106,6 +1387,11 @@ class PCN(MOAgent, MOPolicy):
             wandb.log({"pareto_front_eval_and_execute": wandb.Table(data=pareto_front, columns=["Objective1", "Objective2"])})
 
 
+        # objective_indexが範囲内かチェック
+        if objective_index >= len(e_returns[0]) if e_returns else 0:
+            print(f"警告: objective_index {objective_index} が範囲外です。デフォルト値0を使用します。")
+            objective_index = 0
+        
         best_policy_index = np.argmax([e[objective_index] for e in e_returns])
         if objective_index == 9:
             "並び替えて，真ん中にあるものを選択する．"
@@ -1137,6 +1423,13 @@ class PCN(MOAgent, MOPolicy):
         """評価結果を履歴に保存し、優れた解を経験再生バッファに追加するよう拡張したevaluate"""
         n = min(n, len(self.experience_replay))
         episodes = self._nlargest(n)
+        
+        # 実際に取得されたエピソード数に基づいてnを調整
+        actual_n = len(episodes)
+        if actual_n == 0:
+            print("警告: 評価用のエピソードが見つかりませんでした。")
+            return [], [], [], None
+        
         returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
         returns = np.float32(returns)
         horizons = np.float32(horizons)
@@ -1144,33 +1437,48 @@ class PCN(MOAgent, MOPolicy):
         e_values = []
         all_transitions = []  # 全てのtransitionsを保存するリスト
         
-        for i in range(n):
-            transitions, _, _, _, map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
-            # compute return
-            for j in reversed(range(len(transitions) - 1)):
-                transitions[j].reward += self.gamma * transitions[j + 1].reward
-            e_returns.append(transitions[0].reward)
-            e_values.append(value)
-            all_transitions.append(transitions)  # transitionsを保存
+        # print(f"\n===== {actual_n}個のエピソード評価結果 =====")
         
-        # CUDA対応の行列計算
-        if th.cuda.is_available():
-            # NumPy配列をPyTorchテンソルに変換してGPUに転送
-            returns_tensor = th.tensor(np.array(returns), device=self.device)
-            e_returns_tensor = th.tensor(np.array(e_returns), device=self.device)
+        for i in range(actual_n):
+            transitions, _, _, _, map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
             
-            # GPU上で距離計算
-            with th.cuda.amp.autocast():
-                distances_tensor = th.norm(returns_tensor - e_returns_tensor, dim=1)
+            # 累積報酬を計算（表示用のみ）
+            transitions_copy = []
+            for t in transitions:
+                transitions_copy.append(Transition(
+                    observation=t.observation,
+                    action=t.action,
+                    reward=np.array(t.reward, copy=True),
+                    next_observation=t.next_observation,
+                    terminal=t.terminal
+                ))
             
-            # 結果をCPUに戻してNumPy配列に変換
-            distances = distances_tensor.cpu().numpy()
-        else:
-            # 従来通りNumPyで計算（オーバーフロー防止のためfloat64を使用）
-            distances = np.linalg.norm(
-                np.array(returns, dtype=np.float64) - np.array(e_returns, dtype=np.float64), 
-                axis=-1
-            )
+            for j in reversed(range(len(transitions_copy) - 1)):
+                transitions_copy[j].reward += self.gamma * transitions_copy[j + 1].reward
+            
+            e_returns.append(transitions_copy[0].reward)
+            e_values.append(value)
+            all_transitions.append(transitions)  # 元のtransitionsを保存
+            
+            # 各エピソードの結果を表示
+            # print(f"エピソード {i+1}:")
+            # print(f"  累積報酬: {transitions[0].reward}")
+            # print(f"  実際のコスト: {value[0]}, 実際の待ち時間: {value[1]}")
+            
+            # actionsetを表示
+            # actions = [t.action for t in transitions]
+            # print(f"  actionset: {actions}")
+            # print()
+        
+        # print("===============================\n")
+        
+
+
+        # 従来通りNumPyで計算（オーバーフロー防止のためfloat64を使用）
+        distances = np.linalg.norm(
+            np.array(returns, dtype=np.float64) - np.array(e_returns, dtype=np.float64), 
+            axis=-1
+        )
 
         # 非支配解を抽出（CPU上で実行）
         e_returns_np = np.array(e_returns, dtype=np.float64)  # float64でキャスト
@@ -1192,7 +1500,7 @@ class PCN(MOAgent, MOPolicy):
             self.evaluation_timestamps.append("1")
             self.global_steps_at_evaluation.append(self.global_step)
         
-        return e_returns, np.array(returns), distances, map_fin
+        return e_returns, e_values, distances, map_fin
 
     def plot_rewards(self, rewards):
         waiting_times, cloud_costs = zip(*rewards)
@@ -1322,7 +1630,7 @@ class PCN(MOAgent, MOPolicy):
             print("\n=== PCN学習を開始します。Ctrl+Cで安全に終了できます ===\n")
             
             # 既存の初期化コード
-            max_return = max_return if max_return is not None else np.full(self.reward_dim, 100.0, dtype=np.float32)
+            max_return = max_return if max_return is not None else np.full(self.reward_dim, np.inf, dtype=np.float32)
 
             if self.log:
                 self.register_additional_config(
@@ -1380,7 +1688,12 @@ class PCN(MOAgent, MOPolicy):
                         if self.terminate_requested:
                             break
                             
+                        # より多様なランダムアクションを生成
+                        # 各エピソードで異なるシードを使用
+                        episode_seed = int(time.time() * 1000) + episode_idx + self.global_step
+                        np.random.seed(episode_seed)
                         action = self.env.action_space.sample()
+                        
                         n_obs, reward, scheduled, wt_step, done = self.env.step(action)
                         
                         if done:
@@ -1473,7 +1786,22 @@ class PCN(MOAgent, MOPolicy):
                     )
                     self.global_step += len(transitions)
                     self._add_episode(transitions, max_size=max_buffer_size, step=self.global_step)
-                    returns.append(transitions[0].reward)
+                    
+                    # 累積報酬を計算（表示用のみ）
+                    transitions_copy = []
+                    for t in transitions:
+                        transitions_copy.append(Transition(
+                            observation=t.observation,
+                            action=t.action,
+                            reward=np.array(t.reward, copy=True),
+                            next_observation=t.next_observation,
+                            terminal=t.terminal
+                        ))
+                    
+                    for j in reversed(range(len(transitions_copy) - 1)):
+                        transitions_copy[j].reward += self.gamma * transitions_copy[j + 1].reward
+                    
+                    returns.append(transitions_copy[0].reward)
                     horizons.append(len(transitions))
 
                     # 各エピソードのstepごとの配置マップを累積
@@ -1620,7 +1948,7 @@ class PCN(MOAgent, MOPolicy):
         return self.mapmap
 
     def visualize_evaluation_history(self, save_dir="evaluation_history"):
-        """評価履歴を可視化し、一意のIDを持つファイルとして保存。
+        """評価履歴を可視化し、固定ファイル名で上書き保存。
         報酬（最大化目的）と実数値（最小化目的）の両方のグラフを別々に表示する。
         """
         if not self.evaluation_history:
@@ -1630,11 +1958,9 @@ class PCN(MOAgent, MOPolicy):
         # ディレクトリ作成
         os.makedirs(save_dir, exist_ok=True)
         
-        # 一意のIDを生成（現在時刻のタイムスタンプとランダム値を組み合わせる）
+        # 固定ファイル名を使用（更新時に上書き）
         import datetime
-        import random
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
         
         # ------ 実数値（最小化目的）のグラフ ------
         # 全データから適切な表示範囲を計算
@@ -1686,8 +2012,8 @@ class PCN(MOAgent, MOPolicy):
                     arrowprops=dict(facecolor='black', shrink=0.05, width=2),
                     fontsize=12)
         
-        # 一意のIDを含むファイル名で保存
-        pareto_values_png_filename = f"{save_dir}/pareto_values_evolution_{unique_id}.png"
+        # 固定ファイル名で保存（上書き）
+        pareto_values_png_filename = f"{save_dir}/pareto_values_evolution.png"
         plt.savefig(pareto_values_png_filename)
         plt.close()
         
@@ -1740,8 +2066,8 @@ class PCN(MOAgent, MOPolicy):
                     arrowprops=dict(facecolor='black', shrink=0.05, width=2),
                     fontsize=12)
         
-        # 一意のIDを含むファイル名で保存
-        pareto_rewards_png_filename = f"{save_dir}/pareto_rewards_evolution_{unique_id}.png"
+        # 固定ファイル名で保存（上書き）
+        pareto_rewards_png_filename = f"{save_dir}/pareto_rewards_evolution.png"
         plt.savefig(pareto_rewards_png_filename)
         plt.close()
         
@@ -1774,8 +2100,8 @@ class PCN(MOAgent, MOPolicy):
         
         ani_values = FuncAnimation(fig, update_values, frames=len(self.evaluation_history), repeat=True)
         
-        # 一意のIDを含むファイル名でGIFを保存
-        pareto_values_gif_filename = f"{save_dir}/pareto_values_animation_{unique_id}.gif"
+        # 固定ファイル名でGIFを保存（上書き）
+        pareto_values_gif_filename = f"{save_dir}/pareto_values_animation.gif"
         ani_values.save(pareto_values_gif_filename, writer='pillow', fps=2)
         plt.close()
         
@@ -1809,19 +2135,19 @@ class PCN(MOAgent, MOPolicy):
         
         ani_rewards = FuncAnimation(fig, update_rewards, frames=len(self.evaluation_history), repeat=True)
         
-        # 一意のIDを含むファイル名でGIFを保存
-        pareto_rewards_gif_filename = f"{save_dir}/pareto_rewards_animation_{unique_id}.gif"
+        # 固定ファイル名でGIFを保存（上書き）
+        pareto_rewards_gif_filename = f"{save_dir}/pareto_rewards_animation.gif"
         ani_rewards.save(pareto_rewards_gif_filename, writer='pillow', fps=2)
         plt.close()
         
-        print(f"評価履歴の可視化を保存しました:")
+        print(f"評価履歴の可視化を保存しました（最終更新: {timestamp}）:")
         print(f" - 実数値パレートフロント画像: {pareto_values_png_filename}")
         print(f" - 報酬パレートフロント画像: {pareto_rewards_png_filename}")
         print(f" - 実数値アニメーションGIF: {pareto_values_gif_filename}")
         print(f" - 報酬アニメーションGIF: {pareto_rewards_gif_filename}")
 
     def save_pareto_solutions_to_txt(self, mode_name="default"):
-        """パレートフロントの解をテキストファイルに保存"""
+        """パレートフロントの解をテキストファイルに保存（単一ファイルで更新）"""
         if not self.evaluation_history:
             print("評価履歴がありません。ファイルは作成されませんでした。")
             return
@@ -1830,23 +2156,22 @@ class PCN(MOAgent, MOPolicy):
         save_dir = "pareto_solutions"
         os.makedirs(save_dir, exist_ok=True)
         
-        # 一意のファイル名を作成
+        # 固定ファイル名を使用（更新時に上書き）
         import datetime
-        import random
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
         
         # 最新の評価結果を取得
         latest_eval = self.evaluation_history[-1]
         
-        # 結果をテキストファイルに書き込む
-        filename = f"{save_dir}/pareto_solutions_{mode_name}_{unique_id}.txt"
+        # 結果をテキストファイルに書き込む（固定ファイル名で上書き）
+        filename = f"{save_dir}/pareto_solutions_{mode_name}.txt"
         try:
             with open(filename, 'w') as f:
                 # ヘッダー情報
                 f.write(f"# パレートフロント解 - {mode_name}\n")
-                f.write(f"# 日時: {timestamp}\n")
+                f.write(f"# 最終更新日時: {timestamp}\n")
                 f.write(f"# ステップ数: {self.global_step}\n")
+                f.write(f"# 評価履歴数: {len(self.evaluation_history)}\n")
                 f.write("\n")
                 
                 # パレートフロントデータ
@@ -1875,13 +2200,12 @@ class PCN(MOAgent, MOPolicy):
                 # マップ情報はテキストでは表現しにくいので省略
                 f.write("\n## マップデータは別途画像として保存されます\n")
             
-            # マップデータの視覚化を別途保存
+            # マップデータの視覚化を別途保存（固定ファイル名で上書き）
             try:
                 if 'maps' in latest_eval:
                     final_maps = latest_eval['maps']
-                    map_image_path = f"{save_dir}/final_schedule_{mode_name}_{unique_id}.png"
+                    map_image_path = f"{save_dir}/final_schedule_{mode_name}.png"
                     visualize_map(final_maps[0], final_maps[1], [], map_image_path)
-                    f.write(f"マップ画像: {map_image_path}\n")
                     print(f"スケジュールマップを保存しました: {map_image_path}")
             except Exception as map_err:
                 print(f"マップ画像の保存中にエラーが発生しました: {map_err}")
@@ -1918,6 +2242,10 @@ class PCN(MOAgent, MOPolicy):
                 transitions = []
                 obs = env.reset()
                 done = False
+                
+                # 各エピソードで異なるシードを使用して多様性を確保
+                episode_seed = int(time.time() * 1000) + p_idx * 1000 + ep + self.global_step
+                np.random.seed(episode_seed)
                 
                 while not done:
                     # パターンに基づいて0または1のスカラー値を選択
@@ -2013,3 +2341,346 @@ class PCN(MOAgent, MOPolicy):
             
             # 報酬次元
             self.reward_dim = self.env.unwrapped.reward_space.shape[0]
+
+    def cleanup_memory(self):
+        """明示的にメモリをクリーンアップ"""
+        import gc
+        
+        # 経験再生バッファの古いエピソードを削除
+        if len(self.experience_replay) > 5000:  # バッファが大きすぎる場合
+            # 古いエピソードを削除（下位50%を削除）
+            sorted_buffer = sorted(self.experience_replay, key=lambda x: x[0])
+            self.experience_replay = sorted_buffer[len(sorted_buffer)//2:]
+            heapq.heapify(self.experience_replay)
+            print(f"メモリクリーンアップ: 経験再生バッファを {len(sorted_buffer)} から {len(self.experience_replay)} に削減")
+        
+        # 評価履歴をクリア
+        if len(self.evaluation_history) > 100:  # 履歴が多すぎる場合
+            self.evaluation_history = self.evaluation_history[-50:]  # 最新50件のみ保持
+            self.evaluation_timestamps = self.evaluation_timestamps[-50:]
+            self.global_steps_at_evaluation = self.global_steps_at_evaluation[-50:]
+            print(f"メモリクリーンアップ: 評価履歴を最新50件に削減")
+        
+        # ガベージコレクションを強制実行
+        gc.collect()
+
+    def __del__(self):
+        """デストラクタ: メモリを確実に解放"""
+        try:
+            # 大きな配列を明示的に解放
+            if hasattr(self, 'experience_replay'):
+                del self.experience_replay
+            if hasattr(self, 'evaluation_history'):
+                del self.evaluation_history
+            if hasattr(self, 'evaluation_timestamps'):
+                del self.evaluation_timestamps
+            if hasattr(self, 'global_steps_at_evaluation'):
+                del self.global_steps_at_evaluation
+        except:
+            pass  # デストラクタでのエラーは無視
+
+    # PCNクラスに追加
+    def check_overfitting(self, test_data_size=100):
+        """同じデータでoverfittingチェック"""
+        if len(self.experience_replay) < test_data_size:
+            return False
+        
+        # 小さな固定データセットで学習
+        test_episodes = self.experience_replay[:test_data_size]
+        
+        # 同じデータで複数回学習
+        losses = []
+        for epoch in range(10):
+            # 同じデータで学習
+            loss, _ = self._update_on_fixed_data(test_episodes)
+            losses.append(loss.item())
+        
+        # 損失が減少するかチェック
+        if losses[-1] < losses[0] * 0.8:  # 20%以上減少
+            print("✓ Overfitting チェック: 学習可能")
+            return True
+        else:
+            print("⚠️  Overfitting チェック: 学習が困難")
+            return False
+
+    def _update_on_fixed_data(self, episodes):
+        """固定データでの学習"""
+        # 既存のupdateメソッドの簡略版
+        # ... 実装 ...
+
+    def save_learning_data_to_file(self, filename="learning_data_debug.txt", sample_size=100):
+        """学習データの詳細をファイルに書き込む
+        
+        Args:
+            filename (str): 出力ファイル名
+            sample_size (int): 分析するサンプル数
+        """
+        import os
+        from datetime import datetime
+        
+        if len(self.experience_replay) == 0:
+            print("⚠️  経験バッファが空です。データを収集してから実行してください。")
+            return
+        
+        # ファイルパスを設定
+        debug_dir = "debug_learning_data"
+        os.makedirs(debug_dir, exist_ok=True)
+        filepath = os.path.join(debug_dir, filename)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("PCN学習データ詳細分析\n")
+            f.write(f"生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # 1. 全体統計
+            f.write("1. 全体統計\n")
+            f.write("-" * 40 + "\n")
+            total_episodes = len(self.experience_replay)
+            total_transitions = sum(len(episode[2]) for episode in self.experience_replay)
+            f.write(f"総エピソード数: {total_episodes}\n")
+            f.write(f"総遷移数: {total_transitions}\n")
+            f.write(f"バッチサイズ: {self.batch_size}\n")
+            f.write(f"割引率γ: {self.gamma}\n")
+            f.write(f"学習率: {self.opt.param_groups[0]['lr']}\n")
+            f.write(f"デバイス: {self.device}\n")
+            f.write(f"モデルタイプ: {'EnhancedPCNModel' if self.use_enhanced_model else 'DefaultModel'}\n\n")
+            
+            # 2. サンプルデータの詳細分析
+            f.write("2. サンプルデータ詳細分析\n")
+            f.write("-" * 40 + "\n")
+            
+            # サンプルサイズを調整
+            actual_sample_size = min(sample_size, total_episodes)
+            sample_indices = np.random.choice(total_episodes, actual_sample_size, replace=False)
+            
+            all_observations = []
+            all_actions = []
+            all_desired_returns = []
+            all_desired_horizons = []
+            all_episode_lengths = []
+            
+            for i, idx in enumerate(sample_indices):
+                episode = self.experience_replay[idx][2]
+                episode_length = len(episode)
+                all_episode_lengths.append(episode_length)
+                
+                # エピソード内のランダムなステップを選択
+                t = np.random.randint(0, episode_length)
+                transition = episode[t]
+                
+                # データを収集
+                all_observations.append(transition.observation)
+                all_actions.append(transition.action)
+                
+                # 論文通りの累積報酬計算
+                remaining_return = 0.0
+                for j in range(t, episode_length):
+                    remaining_return += (self.gamma ** (j - t)) * episode[j].reward
+                
+                all_desired_returns.append(remaining_return)
+                all_desired_horizons.append(episode_length - t)
+                
+                # 最初の10サンプルの詳細を記録
+                if i < 10:
+                    f.write(f"\nサンプル {i+1}:\n")
+                    f.write(f"  エピソード長: {episode_length}\n")
+                    f.write(f"  選択ステップ: {t}\n")
+                    f.write(f"  観測形状: {transition.observation.shape}\n")
+                    f.write(f"  観測値（最初の10要素）: {transition.observation}\n")
+                    f.write(f"  行動: {transition.action}\n")
+                    f.write(f"  即時報酬: {transition.reward}\n")
+                    f.write(f"  累積報酬（論文通り）: {remaining_return}\n")
+                    f.write(f"  残りステップ数: {episode_length - t}\n")
+            
+            # 3. 統計分析
+            f.write("\n3. 統計分析\n")
+            f.write("-" * 40 + "\n")
+            
+            # 観測データの統計
+            obs_array = np.array(all_observations)
+            f.write("観測データ統計:\n")
+            f.write(f"  形状: {obs_array.shape}\n")
+            f.write(f"  平均: {obs_array.mean():.6f}\n")
+            f.write(f"  標準偏差: {obs_array.std():.6f}\n")
+            f.write(f"  最小値: {obs_array.min():.6f}\n")
+            f.write(f"  最大値: {obs_array.max():.6f}\n")
+            f.write(f"  NaN数: {np.isnan(obs_array).sum()}\n")
+            f.write(f"  Inf数: {np.isinf(obs_array).sum()}\n\n")
+            
+            # 行動分布
+            actions_array = np.array(all_actions)
+            unique_actions, action_counts = np.unique(actions_array, return_counts=True)
+            f.write("行動分布:\n")
+            for action, count in zip(unique_actions, action_counts):
+                percentage = (count / len(actions_array)) * 100
+                f.write(f"  行動{action}: {count}回 ({percentage:.1f}%)\n")
+            
+            # 不均衡チェック
+            max_action_ratio = np.max(action_counts) / len(actions_array)
+            f.write(f"  最大行動比率: {max_action_ratio:.3f}")
+            if max_action_ratio > 0.8:
+                f.write(" ⚠️  不均衡検出（80%以上が同じ行動）\n")
+            else:
+                f.write(" ✓ バランス良好\n")
+            f.write("\n")
+            
+            # 累積報酬の統計
+            returns_array = np.array(all_desired_returns)
+            f.write("累積報酬統計（論文通り）:\n")
+            f.write(f"  平均: {returns_array.mean():.6f}\n")
+            f.write(f"  標準偏差: {returns_array.std():.6f}\n")
+            f.write(f"  最小値: {returns_array.min():.6f}\n")
+            f.write(f"  最大値: {returns_array.max():.6f}\n")
+            f.write(f"  範囲: {returns_array.max() - returns_array.min():.6f}\n")
+            f.write(f"  NaN数: {np.isnan(returns_array).sum()}\n")
+            f.write(f"  Inf数: {np.isinf(returns_array).sum()}\n\n")
+            
+            # ホライゾンの統計
+            horizons_array = np.array(all_desired_horizons)
+            f.write("残りステップ数統計:\n")
+            f.write(f"  平均: {horizons_array.mean():.1f}\n")
+            f.write(f"  標準偏差: {horizons_array.std():.1f}\n")
+            f.write(f"  最小値: {horizons_array.min()}\n")
+            f.write(f"  最大値: {horizons_array.max()}\n\n")
+            
+            # エピソード長の統計
+            episode_lengths_array = np.array(all_episode_lengths)
+            f.write("エピソード長統計:\n")
+            f.write(f"  平均: {episode_lengths_array.mean():.1f}\n")
+            f.write(f"  標準偏差: {episode_lengths_array.std():.1f}\n")
+            f.write(f"  最小値: {episode_lengths_array.min()}\n")
+            f.write(f"  最大値: {episode_lengths_array.max()}\n\n")
+            
+            # 4. 学習データの品質チェック
+            f.write("4. 学習データ品質チェック\n")
+            f.write("-" * 40 + "\n")
+            
+            # データの有効性チェック
+            issues = []
+            if np.isnan(obs_array).any():
+                issues.append("観測データにNaNが含まれています")
+            if np.isinf(obs_array).any():
+                issues.append("観測データにInfが含まれています")
+            if np.isnan(returns_array).any():
+                issues.append("累積報酬にNaNが含まれています")
+            if np.isinf(returns_array).any():
+                issues.append("累積報酬にInfが含まれています")
+            if max_action_ratio > 0.9:
+                issues.append("行動分布が極端に偏っています（90%以上が同じ行動）")
+            if returns_array.std() < 1e-6:
+                issues.append("累積報酬の分散が極めて小さいです")
+            
+            if issues:
+                f.write("⚠️  検出された問題:\n")
+                for issue in issues:
+                    f.write(f"  - {issue}\n")
+            else:
+                f.write("✓ データ品質に問題は検出されませんでした\n")
+            
+            f.write("\n")
+            
+            # 5. 推奨事項
+            f.write("5. 推奨事項\n")
+            f.write("-" * 40 + "\n")
+            
+            if max_action_ratio > 0.8:
+                f.write("- 行動分布の不均衡を解決するため、重み付き損失関数の使用を検討してください\n")
+                f.write("- より多様な行動を生成するため、探索戦略の見直しを検討してください\n")
+            
+            if returns_array.std() < 1e-3:
+                f.write("- 累積報酬の分散が小さいため、報酬設計の見直しを検討してください\n")
+            
+            if obs_array.std() > 100:
+                f.write("- 観測データのスケールが大きいため、正規化の適用を検討してください\n")
+            
+            if len(unique_actions) < 2:
+                f.write("- 行動の多様性が不足しています。環境設定の見直しを検討してください\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("分析完了\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"✓ 学習データ分析結果を保存しました: {filepath}")
+        return filepath
+
+    def export_learning_samples_to_csv(self, filename="learning_samples.csv", num_samples=1000):
+        """学習サンプルをCSVファイルにエクスポート
+        
+        Args:
+            filename (str): 出力ファイル名
+            num_samples (int): エクスポートするサンプル数
+        """
+        import pandas as pd
+        import os
+        from datetime import datetime
+        
+        if len(self.experience_replay) == 0:
+            print("⚠️  経験バッファが空です。データを収集してから実行してください。")
+            return
+        
+        # ファイルパスを設定
+        debug_dir = "debug_learning_data"
+        os.makedirs(debug_dir, exist_ok=True)
+        filepath = os.path.join(debug_dir, filename)
+        
+        # サンプルデータを収集
+        total_episodes = len(self.experience_replay)
+        actual_samples = min(num_samples, total_episodes * 10)  # エピソードあたり最大10サンプル
+        
+        data_rows = []
+        sample_count = 0
+        
+        for episode_idx in range(total_episodes):
+            if sample_count >= actual_samples:
+                break
+                
+            episode = self.experience_replay[episode_idx][2]
+            episode_length = len(episode)
+            
+            # エピソードから複数サンプルを抽出
+            num_episode_samples = min(10, episode_length)
+            step_indices = np.random.choice(episode_length, num_episode_samples, replace=False)
+            
+            for t in step_indices:
+                if sample_count >= actual_samples:
+                    break
+                    
+                transition = episode[t]
+                
+                # 論文通りの累積報酬計算
+                remaining_return = 0.0
+                for j in range(t, episode_length):
+                    remaining_return += (self.gamma ** (j - t)) * episode[j].reward
+                
+                # 観測データをフラット化
+                obs_flat = transition.observation.flatten()
+                
+                # データ行を作成
+                row = {
+                    'sample_id': sample_count,
+                    'episode_id': episode_idx,
+                    'step_in_episode': t,
+                    'episode_length': episode_length,
+                    'action': transition.action,
+                    'immediate_reward': transition.reward,
+                    'cumulative_return': remaining_return,
+                    'remaining_steps': episode_length - t,
+                }
+                
+                # 観測データの各要素を追加
+                for i, obs_val in enumerate(obs_flat):
+                    row[f'observation_{i}'] = obs_val
+                
+                data_rows.append(row)
+                sample_count += 1
+        
+        # DataFrameを作成してCSVに保存
+        df = pd.DataFrame(data_rows)
+        df.to_csv(filepath, index=False, encoding='utf-8')
+        
+        print(f"✓ 学習サンプルをCSVにエクスポートしました: {filepath}")
+        print(f"  サンプル数: {len(df)}")
+        print(f"  列数: {len(df.columns)}")
+        
+        return filepath

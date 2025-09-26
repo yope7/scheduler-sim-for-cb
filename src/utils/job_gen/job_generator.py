@@ -51,6 +51,7 @@ class JobGenerator:
     # 最終的にenvに渡すジョブのまとまりを生成
     def generate_jobs_set(self):
         if self.job_type == 1:
+            np.random.seed(self.seed)
             jobgen = JobSimulator(self.seed, n_jobs=self.n_jobs, n_users=self.n_jobs, lam=self.lam)
             jobs = jobgen.generate_jobs()
             for episode in range(self.nb_episodes + 1):

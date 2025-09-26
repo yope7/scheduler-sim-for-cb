@@ -192,6 +192,23 @@ cnn-long/
 weights/
 # ルートディレクトリ直下の.pngファイルを無視
 /*.png
+/*.pdf
+/*.npz
+/*.pkl
+/*.pt
+/*.pth
+/*.pth.tar
+/*.pth.tar.gz
+/*.pth.tar.bz2
+/*.txt
+*/pareto_details*
+/evaluation
+/execution*/
+/pareto_front_visualization/
+/debug_training_data*/
+/debug_learning_data*/
+/distributed_*/
+/data/
 
 # サブディレクトリ内の.pngファイルは無視しない
 !*/**/*.png

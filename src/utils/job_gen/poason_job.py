@@ -1,7 +1,7 @@
 import numpy as np
 
 class JobSimulator:
-    def __init__(self, seed, n_jobs=50, n_users=50, lam=0.5, mean_processing_time=10, std_processing_time=2, min_processing_time=1, max_processing_time=19, min_required_nodes=1, max_required_nodes=9):
+    def __init__(self, seed, n_jobs=50, n_users=50, lam=0.5, mean_processing_time=50, std_processing_time=0, min_processing_time=1, max_processing_time=100, min_required_nodes=1, max_required_nodes=256):
         self.n_jobs = n_jobs
         self.n_users = n_users
         self.lam = lam
@@ -20,7 +20,7 @@ class JobSimulator:
         #到着時間は指数分布に基づく整数値
         inter_arrivals = np.random.exponential(self.lam, self.n_jobs)
         arrival_times = np.ceil(np.cumsum(inter_arrivals))
-        processing_times = np.clip(np.random.normal(self.mean_processing_time, self.std_processing_time, self.n_jobs), self.min_processing_time , self.max_processing_time).astype(int)  
+        processing_times = np.random.randint(self.min_processing_time, self.max_processing_time, self.n_jobs)
         required_nodes = np.random.randint(self.min_required_nodes, self.max_required_nodes, self.n_jobs)
         can_use_cloud = np.full(self.n_jobs, 1)
         user_ids = np.full(self.n_jobs, 0)

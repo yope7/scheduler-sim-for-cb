@@ -109,6 +109,9 @@ class SchedulingEnv(gym.core.Env):
         self.dtype = [('status', 'i4'), ('job_id', 'i4')]
         self.done_flag = False
 
+        # 観測用の固定長パラメータ（現在時刻から見るスロット数）
+        self.obs_window_size = 30  # 現在時刻から10スロット先までを観測
+
         # オンプレミスとクラウドのスライドウィンドウを構造化配列で管理
         self.on_premise_window = np.zeros((self.n_on_premise_node, self.n_window), dtype=self.dtype)
         self.cloud_window = np.zeros((self.n_cloud_node, self.n_window), dtype=self.dtype)
@@ -117,11 +120,11 @@ class SchedulingEnv(gym.core.Env):
         self.n_action = 2  # 行動数
         self.action_space = gym.spaces.Discrete(self.n_action)  # 行動空間
         self.tmp_queue = deque()  # 割り当てられなかったジョブを一時的に格納するキュー
-        obs_space_size = (self.n_on_premise_node * self.n_window +
-                         self.n_cloud_node * self.n_window +
+        obs_space_size = (self.n_on_premise_node * self.obs_window_size +
+                         self.n_cloud_node * self.obs_window_size +
                          8 * 5)  # 全ジョブ属性(8)×5ジョブ
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, 
+            low=0, high=1, 
             shape=(obs_space_size,), 
             dtype=np.float32
         )
@@ -195,52 +198,81 @@ class SchedulingEnv(gym.core.Env):
         self.total_jobs_count = 0
         # 処理完了したジョブ数
         self.jobs_processed_count = 0
+        
+        # 待ち時間を記録するリスト
+        self.waiting_times = []
 
 
+
+    def __del__(self):
+        """デストラクタ: メモリを確実に解放"""
+        try:
+            # 大きな配列を明示的に解放
+            if hasattr(self, 'on_premise_window_history_full'):
+                del self.on_premise_window_history_full
+            if hasattr(self, 'cloud_window_history_full'):
+                del self.cloud_window_history_full
+            if hasattr(self, 'on_premise_window'):
+                del self.on_premise_window
+            if hasattr(self, 'cloud_window'):
+                del self.cloud_window
+            if hasattr(self, 'job_queue'):
+                del self.job_queue
+            if hasattr(self, 'jobs'):
+                del self.jobs
+        except:
+            pass  # デストラクタでのエラーは無視
+
+    def cleanup_memory(self):
+        """明示的にメモリをクリーンアップ"""
+        import gc
+        
+        # 大きな配列を明示的に解放
+        if hasattr(self, 'on_premise_window_history_full'):
+            del self.on_premise_window_history_full
+        if hasattr(self, 'cloud_window_history_full'):
+            del self.cloud_window_history_full
+        
+        # ガベージコレクションを強制実行
+        gc.collect()
+
+    def optimize_window_history(self):
+        """ウィンドウ履歴のサイズを最適化"""
+        # 履歴が大きすぎる場合（1000列以上）は古い部分を削除
+        if hasattr(self, 'on_premise_window_history_full') and self.on_premise_window_history_full.shape[1] > 1000:
+            # 最新の500列のみを保持
+            self.on_premise_window_history_full = self.on_premise_window_history_full[:, -500:]
+            print(f"オンプレミス履歴を最適化: 最新500列のみ保持")
+        
+        if hasattr(self, 'cloud_window_history_full') and self.cloud_window_history_full.shape[1] > 1000:
+            # 最新の500列のみを保持
+            self.cloud_window_history_full = self.cloud_window_history_full[:, -500:]
+            print(f"クラウド履歴を最適化: 最新500列のみ保持")
 
     # 各ステップで実行される操作
     def step(self, action_raw):
         while True:
-            # print(self.job_queue)
-            # print(f"Current exe_mode: {exe_mode}")  # デバッグ用
             scheduled = False
-
             valid_action_cache = {}
-
-
             time_reward_new = 0
-            # self.user_wt = [[i,-100] for i in range(100)]
-            # 時刻
             time = self.time
             allocated_job = self.job_queue[0]
             action = self.get_converted_action(action_raw)   
             wt_step = 0
-            is_valid = False  # actionが有効かどうか
-
-            # print(self.on_premise_window)
-
-            # self.rearrange_window()
-            # print(self.on_premise_window)
-
+            is_valid = False
+            # print("check_is_valid_action start")
             is_valid, wt_real, position = self.check_is_valid_action(action)
-            # print("job_queue head: ",self.job_queue[0])
-            # print("is_valid: ",is_valid)
-
-            if is_valid == False:  # すきまがない場合or job_queueが空の場合
-                # print("allocated_job: ",allocated_job)
-                if np.all(allocated_job == 0):  # ジョブキューが空の場合
+            # print("check_is_valid_action end")
+            if is_valid == False:
+                if np.all(allocated_job == 0):
                     job_none = True
-                    # 全体的に時間を進める必要がある場合は両方スライド
                     self.time_transition(True, True)
-                else:  # ジョブキューが空でない場合
+                else:
                     job_none = False
-                    # どちらのリソースへの割当てが失敗したかを判断
-                    if action[1] == 0:  # オンプレミスへの割当てが失敗した場合
-                        self.time_transition(True, False)  # オンプレミスのみスライド
-                    else:  # クラウドへの割当てが失敗した場合
-                        self.time_transition(False, True)  # クラウドのみスライド
-                # print('is_valid: ' + str(is_valid))
-                # print("time_transition")
+                    if action[1] == 0:
+                        self.time_transition(True, False)
+                    else:
+                        self.time_transition(False, True)
 
                 var_reward = 0
                 var_after = 0
@@ -253,8 +285,6 @@ class SchedulingEnv(gym.core.Env):
                 job_none = False
                 job = self.job_queue[0]
                 is_valid = True
-                # print('valid action')
-
 
                 if action[1] == 0:
                     if (0,1) in valid_action_cache:
@@ -269,49 +299,34 @@ class SchedulingEnv(gym.core.Env):
                         is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,0])
                         valid_action_cache[(0,0)] = (is_valid_parallel,wt_parallel,piyo)
 
-                # 並列実行時の待ち時間と実際の待ち時間を比較して報酬を決定
-                time_reward_new = (
-                    1 if wt_real < wt_parallel else  # 実際の方が短い
-                    0 if wt_real == wt_parallel else # 同じ待ち時間
-                    -1                               # 実際の方が長い
-                )
-                # print("time_reward_new: ",time_reward_new)
+                # time_reward_new = (
+                #     1 if wt_real < wt_parallel else
+                #     1 if wt_real == wt_parallel else
+                #     -1
+                # )
+                time_reward_new = wt_real
 
-                if action[0] == 0:  # FIFO
-                    # print('job_queue before fio\n',self.job_queue)
+                if action[0] == 0:
+                    # print("do_schedule start")
                     wt_step = self.do_schedule(action,job,position)
+                    # print("do_schedule end")
                     scheduled = True
-                    # print("wt_step: ",wt_step)
-                    # print('schedule fifo')
-                    #ジョブキューをスライド
                     self.job_queue = np.roll(self.job_queue, -1, axis=0)
                     self.job_queue[-1] = 0
                     self.rear_job_queue -= 1
 
-                    # 観測データ(状態)を取得
                     observation = self.get_observation()
-                    # 報酬を取得
-                    # reward = self.get_reward(action, allocated_job, time, is_valid, job_none)
-                    # コストを取得
                     cost = self.compute_cost(action, allocated_job, is_valid)
-
-                    # エピソードの終了時刻を満たしているかの判定
                     done = self.check_is_done()
-                    # done = False
-                    # print("done: ",done)
 
-                    # print("self.job_queue: \n",self.job_queue)
-                    
-                    # self.show_final_window_history()
+                    # メモリ最適化: 100ステップごとにウィンドウ履歴を最適化
+                    # if self.step_count % 100 == 0:
+                        # self.optimize_window_history()
 
-                    # input()
 
-                    # print("time: ",time)
-                    # print('================================================')
-                    # print('self.user_wt: ',self.user_wt)
-
-                    rewards = np.array([time_reward_new,-cost])
-
+                    rewards = np.array([-time_reward_new,-cost], dtype=np.float64)
+                    # print("rewards: ",rewards)
+                    self.step_count += 1
                     return observation, rewards, scheduled, wt_step, done
 
     def get_next_init_windows(self):
@@ -382,6 +397,13 @@ class SchedulingEnv(gym.core.Env):
         self.init_window()
             # print("windows: ",self.on_premise_window, self.cloud_window)
 
+        # メモリ最適化: 古い履歴配列を明示的に解放
+        if hasattr(self, 'on_premise_window_history_full'):
+            del self.on_premise_window_history_full
+        if hasattr(self, 'cloud_window_history_full'):
+            del self.cloud_window_history_full
+        
+        # 新しい履歴配列を初期化
         self.on_premise_window_history_full = np.full((self.n_on_premise_node,1),-1)
         self.cloud_window_history_full = np.full((self.n_cloud_node,1),-1)
 
@@ -395,6 +417,9 @@ class SchedulingEnv(gym.core.Env):
         self.total_waiting_time = 0
         self.total_cost = 0
         self.completed_jobs = 0
+        
+        # 待ち時間リストを初期化
+        self.waiting_times = []
 
         # ジョブキューに新しいジョブを追加
         # print("self.job_queue: ",self.job_queue)
@@ -430,11 +455,19 @@ class SchedulingEnv(gym.core.Env):
     def update_window_history(self):
         # オンプレミスの履歴を更新
         left_column_on_premise = self.on_premise_window['job_id'][:, 0:1]  # 左端の1列を取得
-        self.on_premise_window_history_full = np.hstack((self.on_premise_window_history_full, left_column_on_premise.copy()))  # 左端の1列を履歴に追加
+        
+        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
+        old_on_premise = self.on_premise_window_history_full
+        self.on_premise_window_history_full = np.hstack((old_on_premise, left_column_on_premise.copy()))
+        del old_on_premise  # 古い配列を明示的に解放
         
         # クラウドの履歴を更新
         left_column_cloud = self.cloud_window['job_id'][:, 0:1]  # 左端の1列を取得
-        self.cloud_window_history_full = np.hstack((self.cloud_window_history_full, left_column_cloud.copy()))  # 左端の1列を履歴に追加
+        
+        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
+        old_cloud = self.cloud_window_history_full
+        self.cloud_window_history_full = np.hstack((old_cloud, left_column_cloud.copy()))
+        del old_cloud  # 古い配列を明示的に解放
 
         # print("self.on_premise_window_history_full:\n",self.on_premise_window_history_full)
         # print("self.cloud_window_history_full:\n",self.cloud_window_history_full)
@@ -442,8 +475,16 @@ class SchedulingEnv(gym.core.Env):
     def finalize_window_history(self):
         """ウィンドウ全体を履歴に追加"""
         # print("finalize_window_history")
-        self.on_premise_window_history_full = np.hstack((self.on_premise_window_history_full, self.on_premise_window['job_id'].copy()))
-        self.cloud_window_history_full = np.hstack((self.cloud_window_history_full, self.cloud_window['job_id'].copy()))
+        
+        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
+        old_on_premise = self.on_premise_window_history_full
+        self.on_premise_window_history_full = np.hstack((old_on_premise, self.on_premise_window['job_id'].copy()))
+        del old_on_premise  # 古い配列を明示的に解放
+        
+        old_cloud = self.cloud_window_history_full
+        self.cloud_window_history_full = np.hstack((old_cloud, self.cloud_window['job_id'].copy()))
+        del old_cloud  # 古い配列を明示的に解放
+        
         #一番左の列を削除
         self.on_premise_window_history_full = np.delete(self.on_premise_window_history_full, 0, axis=1)
         self.cloud_window_history_full = np.delete(self.cloud_window_history_full, 0, axis=1)
@@ -519,8 +560,11 @@ class SchedulingEnv(gym.core.Env):
         
         mkspan_onpre = calculate_makespan(self.on_premise_window_history_full)
         mkspan_cloud = calculate_makespan(self.cloud_window_history_full)
+        
+        # 平均待ち時間を計算
+        avg_waiting_time = np.mean(self.waiting_times) if self.waiting_times else 0.0
 
-        return self.cost, max(mkspan_onpre, mkspan_cloud)
+        return self.cost, max(mkspan_onpre, mkspan_cloud), avg_waiting_time
 
     def show_final_window_history(self):
         #show simply
@@ -609,14 +653,21 @@ class SchedulingEnv(gym.core.Env):
                     window['status'][node, col] = 1
                     window['job_id'][node, col] = job_id
         
+        waiting_time = self.time - when_submitted
         
-        return self.time - when_submitted
+        # 待ち時間を記録
+        self.waiting_times.append(waiting_time)
+        
+        return waiting_time
 
     # 観測データ(状態)を取得
     def get_observation(self):
-        # オンプレミスとクラウドのウィンドウ情報をフラット化
-        obs_on_premise_window_status = self.on_premise_window['status'].flatten()
-        obs_cloud_window_status = self.cloud_window['status'].flatten()
+        # マップの右端から固定長Nの部分を取得
+        # オンプレミスウィンドウの右端から固定長分を取得
+        obs_on_premise_window_status = self.on_premise_window['status'][:, -self.obs_window_size:].flatten()
+        
+        # クラウドウィンドウの右端から固定長分を取得
+        obs_cloud_window_status = self.cloud_window['status'][:, -self.obs_window_size:].flatten()
         
         # ジョブキューを全属性含めてフラット化
         obs_job_queue_obs = self.job_queue[:5].flatten()
@@ -629,42 +680,6 @@ class SchedulingEnv(gym.core.Env):
         ]).astype(np.float32)
         
         return observation
-
-    # 報酬を取得
-    def get_reward(self, action, allocated_job, time, is_valid, job_none):
-        reward_liner = 0
-        reward_wt = 0
-        reward_cost = 0
-        reward = [0,0]
-        use_cloud = action[1] 
-        if job_none == False:  # ジョブキューが空でない場合            
-            if is_valid:  # actionが有効だった場合
-                submitted_time = allocated_job[-1]
-
-                # 割り当てたジョブの待ち時間
-                # print(self.time)
-                waiting_time = self.time
-                reward_wt = 100 - waiting_time
-
-                # penalty = min(waiting_time/self.n_window, 2) + use_cloud
-                # reward_liner = weight_cost * (1 - use_cloud * 2) + weight_wt * (1 - waiting_time / self.n_window)
-                # reward_wt = 1 - waiting_time / self.n_window
-                # reward_wt = - waiting_time
-                # reward_cost = 1 - use_cloud
-
-
-
-        # #cost or waitingtimeがゼロになるときはrewardを0にする
-        # if reward_cost == 0 or reward_wt == 0:
-        #     reward = [0,0]
-        # else:
-        #     reward = [1/(reward_cost), 1/(reward_wt)]
-            
-        #cost or waitingtimeがゼロになるときはrewardを0にする
-        reward =[0, reward_wt] 
-        # reward = [reward_liner, reward_liner]
-
-        return reward
 
     # コストを計算
     def compute_cost(self, action, allocated_job, is_valid):
@@ -708,6 +723,7 @@ class SchedulingEnv(gym.core.Env):
 
         # ジョブサイズが大きすぎる場合は早期リターン
         if job_width > max_w or job_height > max_h:
+            print("ジョブサイズが大きすぎる")
             return False, -1, None
     
         # 列ごとに利用可能なリソースを確認する方法
@@ -812,11 +828,14 @@ class SchedulingEnv(gym.core.Env):
             return
         
         # ディレクトリ作成
+        import os
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+        import datetime
+        import random
         os.makedirs(save_dir, exist_ok=True)
         
         # 一意のIDを生成
-        import datetime
-        import random
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = f"{timestamp}_{random.randint(1000, 9999)}"
         
