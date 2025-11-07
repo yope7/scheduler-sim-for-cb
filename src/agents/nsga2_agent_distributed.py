@@ -428,11 +428,16 @@ class DistributedNSGA2Agent:
         
         # 世代を進める
         for generation in range(self.num_generations):
-            # 各ワーカーで評価と進化を実行
-            populations = ray.get([
+            # 各ワーカーで評価と進化を実行（並列化されたタスクを一度に待つ）
+            # まず全ワーカーにタスクを投入
+            generation_futures = [
                 worker.run_generation.remote(env_params)
                 for worker in self.workers
-            ])
+            ]
+            
+            # 全ての完了を待つ（最適化：複数の完了を一度に取得）
+            # 通常は全ワーカーが同じ時間で完了するため、全取得が効率的
+            populations = ray.get(generation_futures)
             
             # 解の交換（マイグレーション）- 早期は頻度を下げる
             migration_freq = self.migration_interval

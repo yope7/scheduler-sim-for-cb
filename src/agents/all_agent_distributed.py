@@ -383,60 +383,88 @@ class ExhaustiveSearchAgentDistributed:
             future = evaluate_action_set_pure_step_time.remote(batch_action_sets, env_config)
             futures.append(future)
             
-            # 一定数のバッチが溜まったら結果を取得
+            # 一定数のバッチが溜まったら結果を取得（最適化版：複数の完了タスクを一度に取得）
             if len(futures) >= num_workers * 2:
-                done_id, futures = ray.wait(futures, num_returns=1)
-                batch_results = ray.get(done_id[0])
+                # 複数の完了タスクを一度に待つ
+                num_returns = min(num_workers * 2, len(futures))
+                done_id, remaining_futures = ray.wait(futures, num_returns=num_returns, timeout=30.0)
                 
-                for result in batch_results:
-                    # メトリクスの更新
-                    self.completed_tasks += 1
-                    self.execution_times.append(result['execution_time'])
+                if done_id:
+                    # 完了した結果を並列に取得
+                    batch_results_list = ray.get(done_id)
                     
-                    # 結果の保存
-                    all_results.append(result['results'])
-                    all_reward_summary.append(result['reward_summary'])
-                    all_epi_summary.append(result['epi_summary'])
-                    all_pure_step_times.append(result['execution_time'])
+                    # 各バッチの結果を処理
+                    for batch_results in batch_results_list:
+                        for result in batch_results:
+                            # メトリクスの更新
+                            self.completed_tasks += 1
+                            self.execution_times.append(result['execution_time'])
+                            
+                            # 結果の保存
+                            all_results.append(result['results'])
+                            all_reward_summary.append(result['reward_summary'])
+                            all_epi_summary.append(result['epi_summary'])
+                            all_pure_step_times.append(result['execution_time'])
+                            
+                            # 進捗表示
+                            completed += 1
+                            if completed % 100 == 0 or completed == total_sets:
+                                elapsed_time = time.time() - start_time
+                                progress = (completed / total_sets) * 100
+                                estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
+                                print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
+                                      f"Elapsed: {elapsed_time:.1f}s "
+                                      f"Remaining: {estimated_remaining:.1f}s "
+                                      f"pure_step_time:{result['execution_time']:.4f}s", end="")
                     
-                    # 進捗表示
-                    completed += 1
-                    if completed % 100 == 0 or completed == total_sets:
-                        elapsed_time = time.time() - start_time
-                        progress = (completed / total_sets) * 100
-                        estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
-                        print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
-                              f"Elapsed: {elapsed_time:.1f}s "
-                              f"Remaining: {estimated_remaining:.1f}s "
-                              f"pure_step_time:{result['execution_time']:.4f}s", end="")
+                    # futuresリストを更新
+                    futures = remaining_futures
         
-        # 残りのバッチを処理
+        # 残りのバッチを処理（最適化版：複数の完了タスクを一度に取得）
         print(f"\nProcessing remaining {len(futures)} batches...")
+        max_concurrent = min(num_workers * 2, len(futures)) if len(futures) > 0 else 1
+        
         while futures:
-            done_id, futures = ray.wait(futures)
-            batch_results = ray.get(done_id[0])
+            # 複数の完了タスクを一度に待つ
+            num_returns = min(max_concurrent, len(futures))
+            done_id, remaining_futures = ray.wait(futures, num_returns=num_returns, timeout=30.0)
             
-            for result in batch_results:
-                # メトリクスの更新
-                self.completed_tasks += 1
-                self.execution_times.append(result['execution_time'])
+            if done_id:
+                # 完了した結果を並列に取得
+                batch_results_list = ray.get(done_id)
                 
-                # 結果の保存
-                all_results.append(result['results'])
-                all_reward_summary.append(result['reward_summary'])
-                all_epi_summary.append(result['epi_summary'])
-                all_pure_step_times.append(result['execution_time'])
+                # 各バッチの結果を処理
+                for batch_results in batch_results_list:
+                    for result in batch_results:
+                        # メトリクスの更新
+                        self.completed_tasks += 1
+                        self.execution_times.append(result['execution_time'])
+                        
+                        # 結果の保存
+                        all_results.append(result['results'])
+                        all_reward_summary.append(result['reward_summary'])
+                        all_epi_summary.append(result['epi_summary'])
+                        all_pure_step_times.append(result['execution_time'])
+                        
+                        # 進捗表示
+                        completed += 1
+                        if completed % 100 == 0 or completed == total_sets:
+                            elapsed_time = time.time() - start_time
+                            progress = (completed / total_sets) * 100
+                            estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
+                            print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
+                                  f"Elapsed: {elapsed_time:.1f}s "
+                                  f"Remaining: {estimated_remaining:.1f}s "
+                                  f"pure_step_time:{result['execution_time']:.4f}s", end="")
                 
-                # 進捗表示
-                completed += 1
-                if completed % 100 == 0 or completed == total_sets:
-                    elapsed_time = time.time() - start_time
-                    progress = (completed / total_sets) * 100
-                    estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
-                    print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
-                          f"Elapsed: {elapsed_time:.1f}s "
-                          f"Remaining: {estimated_remaining:.1f}s "
-                          f"pure_step_time:{result['execution_time']:.4f}s", end="")
+                # futuresリストを更新
+                futures = remaining_futures
+            else:
+                # タイムアウト時はより小さいバッチで再試行
+                if len(futures) > 0:
+                    max_concurrent = max(1, max_concurrent // 2)
+                else:
+                    break
         
         print(f"\nAll tasks completed! Total processed: {completed}")
 
@@ -560,60 +588,88 @@ class ExhaustiveSearchAgentDistributed:
             future = evaluate_action_set_batch.remote(batch_action_sets, env_config)
             futures.append(future)
             
-            # 一定数のバッチが溜まったら結果を取得
+            # 一定数のバッチが溜まったら結果を取得（最適化版：複数の完了タスクを一度に取得）
             if len(futures) >= num_workers * 2:
-                done_id, futures = ray.wait(futures, num_returns=1)
-                batch_results = ray.get(done_id[0])
+                # 複数の完了タスクを一度に待つ
+                num_returns = min(num_workers * 2, len(futures))
+                done_id, remaining_futures = ray.wait(futures, num_returns=num_returns, timeout=30.0)
                 
-                for result in batch_results:
-                    # メトリクスの更新
-                    self.completed_tasks += 1
-                    self.execution_times.append(result['execution_time'])
+                if done_id:
+                    # 完了した結果を並列に取得
+                    batch_results_list = ray.get(done_id)
                     
-                    # 結果の保存
-                    all_results.append(result['results'])
-                    all_reward_summary.append(result['reward_summary'])
-                    all_epi_summary.append(result['epi_summary'])
+                    # 各バッチの結果を処理
+                    for batch_results in batch_results_list:
+                        for result in batch_results:
+                            # メトリクスの更新
+                            self.completed_tasks += 1
+                            self.execution_times.append(result['execution_time'])
+                            
+                            # 結果の保存
+                            all_results.append(result['results'])
+                            all_reward_summary.append(result['reward_summary'])
+                            all_epi_summary.append(result['epi_summary'])
+                            
+                            # 進捗表示
+                            completed += 1
+                            if completed % 100 == 0 or completed == total_sets:
+                                elapsed_time = time.time() - start_time
+                                progress = (completed / total_sets) * 100
+                                estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
+                                print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
+                                      f"Elapsed: {elapsed_time:.1f}s "
+                                      f"Remaining: {estimated_remaining:.1f}s "
+                                      f"value_cost:{result['results'][0]:.2f}, "
+                                      f"value_wt:{result['results'][1]:.2f}", end="")
                     
-                    # 進捗表示
-                    completed += 1
-                    if completed % 100 == 0 or completed == total_sets:
-                        elapsed_time = time.time() - start_time
-                        progress = (completed / total_sets) * 100
-                        estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
-                        print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
-                              f"Elapsed: {elapsed_time:.1f}s "
-                              f"Remaining: {estimated_remaining:.1f}s "
-                              f"value_cost:{result['results'][0]:.2f}, "
-                              f"value_wt:{result['results'][1]:.2f}", end="")
+                    # futuresリストを更新
+                    futures = remaining_futures
         
-        # 残りのバッチを処理
+        # 残りのバッチを処理（最適化版：複数の完了タスクを一度に取得）
         print(f"\nProcessing remaining {len(futures)} batches...")
+        max_concurrent = min(num_workers * 2, len(futures)) if len(futures) > 0 else 1
+        
         while futures:
-            done_id, futures = ray.wait(futures)
-            batch_results = ray.get(done_id[0])
+            # 複数の完了タスクを一度に待つ
+            num_returns = min(max_concurrent, len(futures))
+            done_id, remaining_futures = ray.wait(futures, num_returns=num_returns, timeout=30.0)
             
-            for result in batch_results:
-                # メトリクスの更新
-                self.completed_tasks += 1
-                self.execution_times.append(result['execution_time'])
+            if done_id:
+                # 完了した結果を並列に取得
+                batch_results_list = ray.get(done_id)
                 
-                # 結果の保存
-                all_results.append(result['results'])
-                all_reward_summary.append(result['reward_summary'])
-                all_epi_summary.append(result['epi_summary'])
+                # 各バッチの結果を処理
+                for batch_results in batch_results_list:
+                    for result in batch_results:
+                        # メトリクスの更新
+                        self.completed_tasks += 1
+                        self.execution_times.append(result['execution_time'])
+                        
+                        # 結果の保存
+                        all_results.append(result['results'])
+                        all_reward_summary.append(result['reward_summary'])
+                        all_epi_summary.append(result['epi_summary'])
+                        
+                        # 進捗表示
+                        completed += 1
+                        if completed % 100 == 0 or completed == total_sets:
+                            elapsed_time = time.time() - start_time
+                            progress = (completed / total_sets) * 100
+                            estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
+                            print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
+                                  f"Elapsed: {elapsed_time:.1f}s "
+                                  f"Remaining: {estimated_remaining:.1f}s "
+                                  f"value_cost:{result['results'][0]:.2f}, "
+                                  f"value_wt:{result['results'][1]:.2f}", end="")
                 
-                # 進捗表示
-                completed += 1
-                if completed % 100 == 0 or completed == total_sets:
-                    elapsed_time = time.time() - start_time
-                    progress = (completed / total_sets) * 100
-                    estimated_remaining = (elapsed_time / completed) * (total_sets - completed) if completed > 0 else 0
-                    print(f"\rProgress: {progress:.1f}% ({completed}/{total_sets}) "
-                          f"Elapsed: {elapsed_time:.1f}s "
-                          f"Remaining: {estimated_remaining:.1f}s "
-                          f"value_cost:{result['results'][0]:.2f}, "
-                          f"value_wt:{result['results'][1]:.2f}", end="")
+                # futuresリストを更新
+                futures = remaining_futures
+            else:
+                # タイムアウト時はより小さいバッチで再試行
+                if len(futures) > 0:
+                    max_concurrent = max(1, max_concurrent // 2)
+                else:
+                    break
         
         print(f"\nAll tasks completed! Total processed: {completed}")
 

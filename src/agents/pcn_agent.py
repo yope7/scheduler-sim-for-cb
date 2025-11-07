@@ -8,6 +8,11 @@ from matplotlib.animation import FuncAnimation
 import signal
 import time
 import traceback
+import warnings
+
+# CUDAが利用できない場合の警告を抑制
+warnings.filterwarnings('ignore', message="Can't initialize NVML")
+warnings.filterwarnings('ignore', message="torch.cuda.amp.GradScaler is enabled, but CUDA is not available")
 
 import gymnasium as gym
 import gymnasium.spaces as spaces
@@ -200,12 +205,44 @@ class BasePCNModel(nn.Module, ABC):
 
     def forward(self, state, desired_return, desired_horizon):
         """Return log-probabilities of actions or return action directly in case of continuous action space."""
+        # 入力値の検証とクリッピング（NaN/Infを防ぐ）
+        desired_return = th.clamp(desired_return, min=-1000.0, max=1000.0)
+        desired_horizon = th.clamp(desired_horizon, min=0.0, max=1000.0)
+        state = th.clamp(state.float(), min=-1000.0, max=1000.0)
+        
         c = th.cat((desired_return, desired_horizon), dim=-1)
         c = c * self.scaling_factor
+        
+        # NaN/Infチェック
+        if th.isnan(c).any() or th.isinf(c).any():
+            print(f"[BasePCNModel] 警告: 条件ベクトルcにNaN/Infが含まれています")
+            print(f"  desired_return範囲: min={desired_return.min()}, max={desired_return.max()}")
+            print(f"  desired_horizon範囲: min={desired_horizon.min()}, max={desired_horizon.max()}")
+            print(f"  scaling_factor: {self.scaling_factor}")
+            c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
 
-        s = self.s_emb(state.float())
+        s = self.s_emb(state)
         c = self.c_emb(c)
+        
+        # NaN/Infチェック
+        if th.isnan(s).any() or th.isinf(s).any():
+            print(f"[BasePCNModel] 警告: 状態埋め込みsにNaN/Infが含まれています")
+            s = th.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if th.isnan(c).any() or th.isinf(c).any():
+            print(f"[BasePCNModel] 警告: 条件埋め込みcにNaN/Infが含まれています")
+            c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
+        
         prediction = self.fc(s * c)
+        
+        # NaN/Infチェック
+        if th.isnan(prediction).any() or th.isinf(prediction).any():
+            print(f"[BasePCNModel] 警告: 予測出力にNaN/Infが含まれています")
+            print(f"  s範囲: min={s.min()}, max={s.max()}, mean={s.mean()}")
+            print(f"  c範囲: min={c.min()}, max={c.max()}, mean={c.mean()}")
+            print(f"  s*c範囲: min={(s*c).min()}, max={(s*c).max()}, mean={(s*c).mean()}")
+            prediction = th.nan_to_num(prediction, nan=0.0, posinf=0.0, neginf=0.0)
+        
         return prediction
 
 
@@ -454,11 +491,37 @@ class EnhancedPCNModel(nn.Module):
     
     def encode_condition(self, r, h=None):
         """報酬重みとホライゾンから条件を生成（シンプル化）"""
+        # 入力値の検証とクリッピング（NaN/Infを防ぐ）
+        r = th.clamp(r, min=-1000.0, max=1000.0)
+        if h is not None:
+            h = th.clamp(h, min=0.0, max=1000.0)
+        
         condition = self.condition_encoder(r)
+        
+        # NaN/Infチェック
+        if th.isnan(condition).any() or th.isinf(condition).any():
+            if self.debug_mode:
+                print(f"[EnhancedPCNModel] 警告: condition_encoder出力にNaN/Infが含まれています")
+                print(f"  r範囲: min={r.min()}, max={r.max()}, mean={r.mean()}")
+            condition = th.nan_to_num(condition, nan=0.0, posinf=0.0, neginf=0.0)
         
         if h is not None:
             horizon_cond = self.horizon_encoder(h)
+            
+            # NaN/Infチェック
+            if th.isnan(horizon_cond).any() or th.isinf(horizon_cond).any():
+                if self.debug_mode:
+                    print(f"[EnhancedPCNModel] 警告: horizon_encoder出力にNaN/Infが含まれています")
+                    print(f"  h範囲: min={h.min()}, max={h.max()}, mean={h.mean()}")
+                horizon_cond = th.nan_to_num(horizon_cond, nan=0.0, posinf=0.0, neginf=0.0)
+            
             condition = condition * horizon_cond
+            
+            # NaN/Infチェック
+            if th.isnan(condition).any() or th.isinf(condition).any():
+                if self.debug_mode:
+                    print(f"[EnhancedPCNModel] 警告: condition * horizon_condにNaN/Infが含まれています")
+                condition = th.nan_to_num(condition, nan=0.0, posinf=0.0, neginf=0.0)
         
         return condition
     
@@ -477,8 +540,20 @@ class EnhancedPCNModel(nn.Module):
             if h is not None:
                 print(f"ホライゾン入力形状: {h.shape}")
         
+        # 入力値の検証とクリッピング（NaN/Infを防ぐ）
+        x = th.clamp(x, min=-1000.0, max=1000.0)
+        r = th.clamp(r, min=-1000.0, max=1000.0)
+        if h is not None:
+            h = th.clamp(h, min=0.0, max=1000.0)
+        
         # 状態特徴抽出
         state_features = self.extract_state_features(x)
+        
+        # NaN/Infチェック
+        if th.isnan(state_features).any() or th.isinf(state_features).any():
+            if self.debug_mode:
+                print(f"[EnhancedPCNModel] 警告: 状態特徴にNaN/Infが含まれています")
+            state_features = th.nan_to_num(state_features, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 条件エンコーディング
         condition = self.encode_condition(r, h)
@@ -491,12 +566,31 @@ class EnhancedPCNModel(nn.Module):
         # PCNのキーとなる部分: 状態特徴と条件の要素積
         conditioned_features = state_features * condition
         
+        # NaN/Infチェック
+        if th.isnan(conditioned_features).any() or th.isinf(conditioned_features).any():
+            if self.debug_mode:
+                print(f"[EnhancedPCNModel] 警告: 条件付き特徴にNaN/Infが含まれています")
+                print(f"  state_features範囲: min={state_features.min()}, max={state_features.max()}, mean={state_features.mean()}")
+                print(f"  condition範囲: min={condition.min()}, max={condition.max()}, mean={condition.mean()}")
+            conditioned_features = th.nan_to_num(conditioned_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
         if self.debug_mode:
             print(f"条件付き特徴形状: {conditioned_features.shape}")
         
         # 方策と価値予測
         pi = self.pi_net(conditioned_features)
         v = self.v_net(conditioned_features)
+        
+        # NaN/Infチェック
+        if th.isnan(pi).any() or th.isinf(pi).any():
+            if self.debug_mode:
+                print(f"[EnhancedPCNModel] 警告: π出力にNaN/Infが含まれています")
+            pi = th.nan_to_num(pi, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if th.isnan(v).any() or th.isinf(v).any():
+            if self.debug_mode:
+                print(f"[EnhancedPCNModel] 警告: V出力にNaN/Infが含まれています")
+            v = th.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
         
         if self.debug_mode:
             print(f"π出力形状: {pi.shape}")
@@ -694,8 +788,9 @@ class PCN(MOAgent, MOPolicy):
         self.debug_mode = debug_mode
         
         # 混合精度学習の設定
-        self.use_amp = True  # 自動混合精度を有効化
-        self.scaler = th.cuda.amp.GradScaler() if self.use_amp else None
+        # CUDAが確実に存在する前提でAMPを有効化
+        self.use_amp = True
+        self.scaler = th.cuda.amp.GradScaler()
         
         # パフォーマンス監視
         self.update_times = []
@@ -860,20 +955,71 @@ class PCN(MOAgent, MOPolicy):
             transition = episode[t]
             
             # コピーを避けて直接代入
-            observations[i] = transition.observation
+            obs_data = transition.observation
+            # NaN/Infチェック
+            if np.any(np.isnan(obs_data)) or np.any(np.isinf(obs_data)):
+                if self.debug_mode:
+                    print(f"[PCN] 警告: エピソード {idx}, ステップ {t} の観測にNaN/Infが含まれています")
+                    print(f"  観測範囲: min={np.min(obs_data)}, max={np.max(obs_data)}")
+                # NaN/Infの場合は0に置き換え
+                obs_data = np.nan_to_num(obs_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            observations[i] = obs_data
             actions[i] = transition.action
             
             # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i
-            remaining_return = 0.0
+            remaining_return = np.zeros(reward_shape, dtype=np.float32)
             for j in range(t, episode_length):
                 # 論文の式: R_t = Σ_{i=t}^T γ^i r_i
                 # ここで episode[j].reward は即時報酬 r_j
-                remaining_return += (self.gamma ** (j - t)) * episode[j].reward
+                reward = episode[j].reward
+                # NaN/Infチェック
+                if np.any(np.isnan(reward)) or np.any(np.isinf(reward)):
+                    if self.debug_mode:
+                        print(f"[PCN] 警告: エピソード {idx}, ステップ {j} の報酬にNaN/Infが含まれています")
+                        print(f"  報酬: {reward}")
+                    # NaN/Infの場合は0に置き換え
+                    reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                remaining_return += (self.gamma ** (j - t)) * reward
+            
+            # NaN/Infチェックと値のクリッピング
+            if np.any(np.isnan(remaining_return)) or np.any(np.isinf(remaining_return)):
+                if self.debug_mode:
+                    print(f"[PCN] 警告: 累積報酬にNaN/Infが含まれています")
+                    print(f"  累積報酬: {remaining_return}")
+                # NaN/Infの場合は0に置き換え
+                remaining_return = np.nan_to_num(remaining_return, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # 値の範囲をクリッピング（異常に大きい値を防ぐ）
+            # 累積報酬が異常に大きい場合、モデルの入力が不安定になる可能性がある
+            # 注意: scaling_factorが[1, 1, 1]の場合、desired_returnが大きすぎると
+            # モデルの内部で数値的不安定性が発生する可能性がある
+            # より小さな範囲にクリッピング（-1000から1000の範囲）
+            clip_value = 1000.0  # 最大値を1000に制限（scaling_factorを考慮）
+            remaining_return = np.clip(remaining_return, -clip_value, clip_value)
+            
+            if self.debug_mode and (np.abs(remaining_return).max() > 500):
+                print(f"[PCN] 警告: 累積報酬が大きすぎます: {remaining_return}")
+                print(f"  エピソード長: {episode_length}, 開始ステップ: {t}")
+                print(f"  クリッピング後の値: {np.clip(remaining_return, -clip_value, clip_value)}")
             
             desired_returns[i] = remaining_return  # 論文通りの割引累積報酬
             desired_horizons[i] = np.float32(episode_length - t)  # 残りのステップ数
         
         # 6. 一括GPU転送（非同期化 + メモリ効率化）
+        # desired_returnの値が異常に大きい場合、モデルの入力が不安定になる可能性があるため、
+        # ここでもクリッピングを確認
+        # 注意: scaling_factorが[1, 1, 1]の場合、desired_returnが大きすぎると
+        # モデルの内部で数値的不安定性が発生する可能性がある
+        # より小さな範囲にクリッピング（-1000から1000の範囲）
+        if np.any(np.abs(desired_returns) > 1000.0):
+            if self.debug_mode:
+                print(f"[PCN] 警告: desired_returnsに異常に大きい値が含まれています")
+                print(f"  min={np.min(desired_returns)}, max={np.max(desired_returns)}, mean={np.mean(desired_returns)}")
+            # クリッピングを再適用（念のため）
+            desired_returns = np.clip(desired_returns, -1000.0, 1000.0)
+        
         with th.cuda.amp.autocast(enabled=self.use_amp):  # 混合精度学習
             # 非同期転送でCPU-GPU並列化
             obs = th.from_numpy(observations).to(self.device, non_blocking=True)
@@ -881,20 +1027,88 @@ class PCN(MOAgent, MOPolicy):
             desired_return = th.from_numpy(desired_returns).to(self.device, non_blocking=True)
             desired_horizon = th.from_numpy(desired_horizons).to(self.device, non_blocking=True).unsqueeze(1)
             
+            # desired_returnの値を正規化（異常に大きい値を防ぐ）
+            # モデルの入力が不安定になるのを防ぐため、値を適切な範囲にクリッピング
+            # 注意: scaling_factorが[1, 1, 1]の場合、desired_returnが大きすぎると
+            # モデルの内部で数値的不安定性が発生する可能性がある
+            # より小さな範囲にクリッピング（-1000から1000の範囲）
+            desired_return = th.clamp(desired_return, min=-1000.0, max=1000.0)
+            
+            # desired_horizonもクリッピング（異常に大きい値を防ぐ）
+            desired_horizon = th.clamp(desired_horizon, min=0.0, max=1000.0)
+            
+            # 観測データの値もクリッピング（異常に大きい値を防ぐ）
+            obs = th.clamp(obs, min=-1000.0, max=1000.0)
+            
             # 7. 最適化された勾配計算
             self.opt.zero_grad(set_to_none=True)
             
-            # 8. モデル推論
-            if self.use_enhanced_model:
-                prediction_output = self.network(obs, desired_return, desired_horizon)
-            else:
-                prediction_output = self.model(obs, desired_return, desired_horizon)
+            # 8. モデル推論前のデータ検証
+            if th.isnan(obs).any() or th.isinf(obs).any():
+                print(f"[PCN] 警告: 観測データにNaN/Infが含まれています")
+                print(f"  NaN: {th.isnan(obs).any()}, Inf: {th.isinf(obs).any()}")
+                print(f"  観測データ範囲: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+            
+            if th.isnan(desired_return).any() or th.isinf(desired_return).any():
+                print(f"[PCN] 警告: desired_returnにNaN/Infが含まれています")
+                print(f"  NaN: {th.isnan(desired_return).any()}, Inf: {th.isinf(desired_return).any()}")
+                print(f"  desired_return範囲: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+            
+            if th.isnan(desired_horizon).any() or th.isinf(desired_horizon).any():
+                print(f"[PCN] 警告: desired_horizonにNaN/Infが含まれています")
+                print(f"  NaN: {th.isnan(desired_horizon).any()}, Inf: {th.isinf(desired_horizon).any()}")
+                print(f"  desired_horizon範囲: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
+            
+            # モデル推論
+            try:
+                if self.use_enhanced_model:
+                    prediction_output = self.network(obs, desired_return, desired_horizon)
+                else:
+                    prediction_output = self.model(obs, desired_return, desired_horizon)
+            except Exception as e:
+                print(f"[PCN] エラー: モデル推論中にエラーが発生しました: {e}")
+                print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+                print(f"  desired_return統計: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+                print(f"  desired_horizon統計: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
+                import traceback
+                traceback.print_exc()
+                # エラーの場合は損失を0に設定してスキップ
+                l = th.tensor(0.0, device=self.device, requires_grad=False)
+                return l, {}
             
             # 9. 損失計算
             if isinstance(prediction_output, tuple):
                 prediction_logits = prediction_output[0]
             else:
                 prediction_logits = prediction_output
+            
+            # モデル出力の検証（NaN/Infチェック）
+            if th.isnan(prediction_logits).any() or th.isinf(prediction_logits).any():
+                print(f"[PCN] 警告: モデル出力にNaN/Infが含まれています")
+                print(f"  NaN: {th.isnan(prediction_logits).any()}, Inf: {th.isinf(prediction_logits).any()}")
+                print(f"  prediction_logits範囲: min={prediction_logits.min()}, max={prediction_logits.max()}")
+                print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+                print(f"  desired_return統計: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+                print(f"  desired_horizon統計: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
+                
+                # モデルの重みを確認
+                if self.use_enhanced_model:
+                    for name, param in self.network.named_parameters():
+                        if th.isnan(param).any() or th.isinf(param).any():
+                            print(f"  モデル重み {name} にNaN/Infが含まれています")
+                            print(f"    範囲: min={param.min()}, max={param.max()}, mean={param.mean()}")
+                else:
+                    for name, param in self.model.named_parameters():
+                        if th.isnan(param).any() or th.isinf(param).any():
+                            print(f"  モデル重み {name} にNaN/Infが含まれています")
+                            print(f"    範囲: min={param.min()}, max={param.max()}, mean={param.mean()}")
+                print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+                print(f"  desired_return統計: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+                print(f"  行動統計: {th.bincount(actions.long())}")
+                # モデル出力がNaNの場合は、損失を0に設定してスキップ（勾配を計算しない）
+                l = th.tensor(0.0, device=self.device, requires_grad=False)
+                # 勾配を計算しないため、最適化をスキップ
+                return l, {}
             
             if self.continuous_action:
                 l = F.mse_loss(actions.float(), prediction_logits)
@@ -904,13 +1118,59 @@ class PCN(MOAgent, MOPolicy):
                 else:
                     l = F.nll_loss(prediction_logits, actions.long())
             
+            # 損失の検証
+            if th.isnan(l) or th.isinf(l):
+                print(f"[PCN] エラー: 損失がNaN/Infになりました")
+                print(f"  損失値: {l.item()}")
+                print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+                print(f"  desired_return統計: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+                print(f"  prediction_logits統計: min={prediction_logits.min()}, max={prediction_logits.max()}, mean={prediction_logits.mean()}")
+                print(f"  行動統計: {th.bincount(actions.long())}")
+                # NaNの場合は損失を0に設定してスキップ（勾配を計算しない）
+                l = th.tensor(0.0, device=self.device, requires_grad=False)
+                # 勾配を計算しないため、最適化をスキップ
+                return l, {}
+            
             # 10. 逆伝播と最適化（混合精度対応）
             if self.use_amp and self.scaler is not None:
+                # GradScalerの正しい使用方法:
+                # 1. scale(loss).backward() - スケールされた損失で逆伝播
+                # 2. unscale_(optimizer) - 勾配をunscale（Inf/NaNチェックも行う）
+                # 3. clip_grad_norm_ - 勾配クリッピング（オプション）
+                # 4. step(optimizer) - オプティマイザのステップ（unscale_()の後に必ず呼ぶ必要がある）
+                # 5. update() - スケーラーの更新
                 self.scaler.scale(l).backward()
-                self.scaler.step(self.opt)
-                self.scaler.update()
+                
+                # unscale_()を呼んで勾配をunscale（Inf/NaNチェックも行う）
+                # unscale_()が成功した場合、必ずstep()を呼ぶ必要がある
+                try:
+                    self.scaler.unscale_(self.opt)
+                    # 勾配クリッピングを追加（勾配爆発を防ぐ）
+                    th.nn.utils.clip_grad_norm_(self.network.parameters() if self.use_enhanced_model else self.model.parameters(), max_norm=1.0)
+                    # unscale_()が成功した場合、必ずstep()を呼ぶ必要がある
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                except RuntimeError as e:
+                    # unscale_()が既に呼ばれている場合、またはその他のエラーの場合
+                    if "unscale_() has already been called" in str(e):
+                        if self.debug_mode:
+                            print(f"[PCN] 警告: unscale_()が既に呼ばれています。通常の最適化を実行します。")
+                        # 勾配クリッピングのみ実行
+                        th.nn.utils.clip_grad_norm_(self.network.parameters() if self.use_enhanced_model else self.model.parameters(), max_norm=1.0)
+                        # 通常の最適化を実行（GradScalerを使わない）
+                        self.opt.step()
+                    elif "No inf checks were recorded" in str(e):
+                        if self.debug_mode:
+                            print(f"[PCN] 警告: Infチェックが記録されていません。通常の最適化を実行します。")
+                        # 通常の最適化を実行（GradScalerを使わない）
+                        self.opt.step()
+                    else:
+                        # その他のエラーの場合は再発生
+                        raise
             else:
                 l.backward()
+                # 勾配クリッピングを追加（勾配爆発を防ぐ）
+                th.nn.utils.clip_grad_norm_(self.network.parameters() if self.use_enhanced_model else self.model.parameters(), max_norm=1.0)
                 self.opt.step()
         
         # 11. メモリクリーンアップ

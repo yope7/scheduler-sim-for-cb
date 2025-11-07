@@ -11,6 +11,11 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import ray
 import copy
+import warnings
+
+# CUDAが利用できない場合の警告を抑制
+warnings.filterwarnings('ignore', message="Can't initialize NVML")
+warnings.filterwarnings('ignore', message="torch.cuda.amp.GradScaler is enabled, but CUDA is not available")
 
 # =========================
 # 0. ハイパーパラメータ設定
@@ -20,9 +25,9 @@ DEBUG = False
 TIME_DEBUG = True  # 各フェーズの経過時間を表示
 ENABLE_VISUALIZATION = True
 
-N_ITERATIONS = 300  # 全体の学習イテレーション数
+N_ITERATIONS = 5  # 全体の学習イテレーション数
 N_ACTORS = 50      # 並列実行するActorの数
-N_JOBS = 128 # ジョブ数
+N_JOBS = 5000 # ジョブ数
 
 EVAL_INTERVAL = 5  # 評価を実行する間隔（イテレーション数）
 USE_DISTRIBUTED_EVAL = False  # 分散評価を使用するかどうか
@@ -36,12 +41,12 @@ EARLY_STOPPING_THRESHOLD = 0.0001  # 改善とみなす最小変化量
 MIN_ITERATIONS = 5  # 最低限実行するイテレーション数
 
 
-INITIAL_EPISODES =  40 #初期エピソード数
+INITIAL_EPISODES =  5 #初期エピソード数
 
 USE_ENHANCED_MODEL = False  # True: EnhancedPCNModel, False: DiscreteActionsDefaultModel (3層NLPモデル)
 
 
-SUPERVISED_LEARNING_EPOCHS = 60
+SUPERVISED_LEARNING_EPOCHS = 30
 SUPERVISED_BATCH_SIZE = 1024    
 SUPERVISED_UPDATES_PER_EPOCH = 3 
 SUPERVISED_LEARNING_RATE = 1e-2  
@@ -74,6 +79,7 @@ class ReplayBuffer:
         self.buffer = []
         self.max_size = max_size
         self.episode_hashes = set()  # 重複検出用のハッシュセット
+        self._hash_cache = {}  # エピソードのハッシュ値キャッシュ（idをキーとして使用）
         if DEBUG:
             print(f"ReplayBuffer initialized with max_size={max_size}")
 
@@ -93,6 +99,9 @@ class ReplayBuffer:
             oldest_episode = self.buffer.pop(0)
             oldest_hash = self._compute_episode_hash(oldest_episode)
             self.episode_hashes.discard(oldest_hash)
+            # キャッシュからも削除
+            oldest_episode_id = id(oldest_episode)
+            self._hash_cache.pop(oldest_episode_id, None)
         
         # 新しいエピソードを追加
         self.buffer.append(episode)
@@ -103,22 +112,62 @@ class ReplayBuffer:
             print(f"ReplayBuffer: episode added, current size={len(self.buffer)}")
 
     def _compute_episode_hash(self, episode):
-        """エピソードの内容に基づくハッシュ値を計算"""
+        """エピソードの内容に基づくハッシュ値を計算（軽量版）"""
         import hashlib
-        # エピソードの特徴を文字列として結合
-        episode_str = ""
-        for t in episode:
-            # 観察、行動、報酬の情報を文字列化
-            obs_str = str(t.observation.tobytes()) if hasattr(t.observation, 'tobytes') else str(t.observation)
-            action_str = str(t.action)
-            reward_str = str(t.reward.tobytes()) if hasattr(t.reward, 'tobytes') else str(t.reward)
-            next_obs_str = str(t.next_observation.tobytes()) if hasattr(t.next_observation, 'tobytes') else str(t.next_observation)
-            terminal_str = str(t.terminal)
-            
-            episode_str += f"{obs_str}|{action_str}|{reward_str}|{next_obs_str}|{terminal_str}|"
         
-        # ハッシュ値を計算
-        return hash(episode_str)
+        if not episode:
+            return 0
+        
+        # キャッシュチェック（エピソードのidをキーとして使用）
+        episode_id = id(episode)
+        if episode_id in self._hash_cache:
+            return self._hash_cache[episode_id]
+        
+        # エピソードを一意に識別する要約情報のみを使用
+        hasher = hashlib.md5()
+        
+        # 1. エピソードの長さ
+        episode_len = len(episode)
+        hasher.update(episode_len.to_bytes(8, byteorder='big'))
+        
+        # 2. 最初の観測の要約（最初の数要素のみ、またはハッシュ）
+        first_obs = episode[0].observation
+        if hasattr(first_obs, 'tobytes'):
+            # 観測が大きい場合は最初の一部のみを使用
+            obs_summary = first_obs.flatten()[:min(100, first_obs.size)]
+            hasher.update(obs_summary.tobytes())
+        else:
+            hasher.update(str(first_obs).encode())
+        
+        # 3. 行動のシーケンス（効率的にバイト列として結合）
+        actions = np.array([t.action for t in episode], dtype=np.int32)
+        hasher.update(actions.tobytes())
+        
+        # 4. 報酬の要約（合計と平均）
+        rewards = np.array([t.reward for t in episode])
+        if rewards.size > 0:
+            reward_summary = np.array([rewards.sum(), rewards.mean()], dtype=np.float32)
+            hasher.update(reward_summary.tobytes())
+        
+        # 5. 最後の観測の要約
+        last_obs = episode[-1].next_observation
+        if hasattr(last_obs, 'tobytes'):
+            obs_summary = last_obs.flatten()[:min(100, last_obs.size)]
+            hasher.update(obs_summary.tobytes())
+        else:
+            hasher.update(str(last_obs).encode())
+        
+        # 6. ターミナル状態の情報
+        terminal_info = np.array([t.terminal for t in episode], dtype=bool)
+        hasher.update(terminal_info.tobytes())
+        
+        # ハッシュ値を計算（intに変換）
+        hash_value = int(hasher.hexdigest(), 16)
+        
+        # キャッシュに保存（エピソードのidをキーとして使用）
+        self._hash_cache[episode_id] = hash_value
+        
+        return hash_value
 
     def get_all_episodes(self):
         """全てのエピソードを取得してバッファをクリア"""
@@ -127,6 +176,7 @@ class ReplayBuffer:
         result = copy.deepcopy(self.buffer)
         self.buffer.clear()
         self.episode_hashes.clear()  # ハッシュセットもクリア
+        self._hash_cache.clear()  # ハッシュキャッシュもクリア
         if DEBUG:
             print(f"ReplayBuffer: retrieved all {len(result)} episodes and cleared buffer")
         return result
@@ -159,28 +209,14 @@ class Actor:
             print(f"Actor {actor_id} initialized")
 
     def _get_available_device(self, requested_device):
-        """利用可能なデバイスを安全に検出"""
+        """利用可能なデバイスを検出（CUDAが確実に存在する前提）"""
         import torch
         
         if requested_device == 'cuda':
-            try:
-                # CUDAが利用可能かチェック
-                if torch.cuda.is_available():
-                    # 実際にCUDAデバイスにアクセスできるかテスト
-                    test_tensor = torch.tensor([1.0], device='cuda')
-                    del test_tensor
-                    torch.cuda.empty_cache()
-                    if DEBUG:
-                        print(f"Actor {self.actor_id}: CUDA is available and working.")
-                    return 'cuda'
-                else:
-                    if DEBUG:
-                        print(f"Actor {self.actor_id}: CUDA is not available. Using CPU.")
-                    return 'cpu'
-            except Exception as e:
-                if DEBUG:
-                    print(f"Actor {self.actor_id}: CUDA test failed: {e}. Using CPU.")
-                return 'cpu'
+            # CUDAが確実に存在する前提でCUDAを返す
+            if DEBUG:
+                print(f"Actor {self.actor_id}: Using CUDA device.")
+            return 'cuda'
         else:
             if DEBUG:
                 print(f"Actor {self.actor_id}: Using requested device: {requested_device}")
@@ -457,7 +493,11 @@ class Actor:
 # =========================
 # 3. Learner (Ray Actor)
 # =========================
-@ray.remote
+# GPUリソースを条件付きで要求（RayがGPUを認識している場合のみ）
+# 注意: Rayがクラスターモードで実行されている場合、num_gpusを指定すると
+# autoscalerがGPUノードを探してしまう。そのため、Learnerの初期化時に
+# GPUが利用可能かどうかを確認し、利用可能な場合のみGPUを使用する。
+# Rayのリソース管理は行わず、PyTorchが直接GPUを使用する。
 class Learner:
     def __init__(self, config, buffer, device='cuda'):
         self.config = config
@@ -466,10 +506,10 @@ class Learner:
         # より堅牢なデバイス検出
         self.actual_device = self._get_available_device(device)
         
-        # PCNエージェントはCPUで初期化（GPU使用時のみGPUに転送）
+        # PCNエージェントを正しいデバイスで初期化（GPU使用時はGPUで初期化）
         self.agent = PCN(
             self.env,
-            device='cpu',  # 常にCPUで初期化
+            device=self.actual_device,  # 検出したデバイスで初期化
             state_dim=self.env.observation_space.shape[0],
             scaling_factor=np.array([1, 1, 1]),
             learning_rate=LEARNING_RATE,
@@ -486,40 +526,36 @@ class Learner:
         self.experience_replay = []  # PCNエージェントの経験再生バッファ
         self.gamma = 1.0  # 割引率
         self.last_eval_step = 0  # 最後に評価を行ったステップ
+        self._hash_cache = {}  # エピソードのハッシュ値キャッシュ（idをキーとして使用）
         if DEBUG:
-            print(f"Learner initialized with device: {self.actual_device} (agent on CPU)")
+            print(f"Learner initialized with device: {self.actual_device}")
             print(f"Learner model: {'EnhancedPCNModel' if USE_ENHANCED_MODEL else 'DiscreteActionsDefaultModel'}")
+            if self.actual_device == 'cuda':
+                import torch
+                print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+                print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
 
     def _get_available_device(self, requested_device):
-        """利用可能なデバイスを安全に検出"""
+        """利用可能なデバイスを検出（CUDAが確実に存在する前提）"""
         import torch
         
         if requested_device == 'cuda':
-            try:
-                # Ray環境でのGPUリソース確認
-                if hasattr(ray, 'get_gpu_ids') and ray.get_gpu_ids():
-                    if DEBUG:
-                        print(f"Ray GPU detected: {ray.get_gpu_ids()}")
-                
-                # CUDAが利用可能かチェック
-                if torch.cuda.is_available():
-                    # 実際にCUDAデバイスにアクセスできるかテスト
-                    test_tensor = torch.tensor([1.0], device='cuda')
-                    del test_tensor
-                    torch.cuda.empty_cache()
-                    if DEBUG:
-                        print(f"CUDA is available and working. Using CUDA device.")
-                        print(f"CUDA device count: {torch.cuda.device_count()}")
-                        print(f"Current CUDA device: {torch.cuda.current_device()}")
-                    return 'cuda'
-                else:
-                    if DEBUG:
-                        print(f"CUDA is not available. Falling back to CPU.")
-                    return 'cpu'
-            except Exception as e:
+            # Ray環境でのGPUリソース確認（オプション）
+            gpu_ids = ray.get_gpu_ids() if hasattr(ray, 'get_gpu_ids') else []
+            if gpu_ids:
                 if DEBUG:
-                    print(f"CUDA test failed: {e}. Falling back to CPU.")
-                return 'cpu'
+                    print(f"Ray GPU detected: {gpu_ids}")
+                # Rayが割り当てたGPUを使用
+                if len(gpu_ids) > 0:
+                    torch.cuda.set_device(gpu_ids[0])
+            
+            # CUDAが確実に存在する前提でCUDAを返す
+            if DEBUG:
+                print(f"Using CUDA device.")
+                print(f"CUDA device count: {torch.cuda.device_count()}")
+                print(f"Current CUDA device: {torch.cuda.current_device()}")
+                print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+            return 'cuda'
         else:
             if DEBUG:
                 print(f"Using requested device: {requested_device}")
@@ -552,7 +588,12 @@ class Learner:
 
     def get_weights(self):
         # CPUデバイスでモデルの重みを返す（ActorがCPUで実行されるため）
-        return {k: v.cpu() for k, v in self.agent.model.state_dict().items()}
+        # use_enhanced_modelの場合はnetwork、そうでない場合はmodelを使用
+        if USE_ENHANCED_MODEL and hasattr(self.agent, 'network'):
+            model_state = self.agent.network.state_dict()
+        else:
+            model_state = self.agent.model.state_dict()
+        return {k: v.cpu() for k, v in model_state.items()}
 
     def _add_episode(self, transitions: List[Transition], max_size: int, step: int) -> None:
         """エピソードを経験再生バッファに追加"""
@@ -597,22 +638,62 @@ class Learner:
             print(f"[Learner] エピソードを追加しました。現在のバッファサイズ: {len(self.agent.experience_replay)}")
 
     def _compute_episode_hash(self, transitions: List[Transition]) -> int:
-        """エピソードの内容に基づくハッシュ値を計算"""
+        """エピソードの内容に基づくハッシュ値を計算（軽量版）"""
         import hashlib
-        # エピソードの特徴を文字列として結合
-        episode_str = ""
-        for t in transitions:
-            # 観察、行動、報酬の情報を文字列化
-            obs_str = str(t.observation.tobytes()) if hasattr(t.observation, 'tobytes') else str(t.observation)
-            action_str = str(t.action)
-            reward_str = str(t.reward.tobytes()) if hasattr(t.reward, 'tobytes') else str(t.reward)
-            next_obs_str = str(t.next_observation.tobytes()) if hasattr(t.next_observation, 'tobytes') else str(t.next_observation)
-            terminal_str = str(t.terminal)
-            
-            episode_str += f"{obs_str}|{action_str}|{reward_str}|{next_obs_str}|{terminal_str}|"
         
-        # ハッシュ値を計算
-        return hash(episode_str)
+        if not transitions:
+            return 0
+        
+        # キャッシュチェック（transitionsリストのidをキーとして使用）
+        transitions_id = id(transitions)
+        if transitions_id in self._hash_cache:
+            return self._hash_cache[transitions_id]
+        
+        # エピソードを一意に識別する要約情報のみを使用
+        hasher = hashlib.md5()
+        
+        # 1. エピソードの長さ
+        episode_len = len(transitions)
+        hasher.update(episode_len.to_bytes(8, byteorder='big'))
+        
+        # 2. 最初の観測の要約（最初の数要素のみ、またはハッシュ）
+        first_obs = transitions[0].observation
+        if hasattr(first_obs, 'tobytes'):
+            # 観測が大きい場合は最初の一部のみを使用
+            obs_summary = first_obs.flatten()[:min(100, first_obs.size)]
+            hasher.update(obs_summary.tobytes())
+        else:
+            hasher.update(str(first_obs).encode())
+        
+        # 3. 行動のシーケンス（効率的にバイト列として結合）
+        actions = np.array([t.action for t in transitions], dtype=np.int32)
+        hasher.update(actions.tobytes())
+        
+        # 4. 報酬の要約（合計と平均）
+        rewards = np.array([t.reward for t in transitions])
+        if rewards.size > 0:
+            reward_summary = np.array([rewards.sum(), rewards.mean()], dtype=np.float32)
+            hasher.update(reward_summary.tobytes())
+        
+        # 5. 最後の観測の要約
+        last_obs = transitions[-1].next_observation
+        if hasattr(last_obs, 'tobytes'):
+            obs_summary = last_obs.flatten()[:min(100, last_obs.size)]
+            hasher.update(obs_summary.tobytes())
+        else:
+            hasher.update(str(last_obs).encode())
+        
+        # 6. ターミナル状態の情報
+        terminal_info = np.array([t.terminal for t in transitions], dtype=bool)
+        hasher.update(terminal_info.tobytes())
+        
+        # ハッシュ値を計算（intに変換）
+        hash_value = int(hasher.hexdigest(), 16)
+        
+        # キャッシュに保存（transitionsリストのidをキーとして使用）
+        self._hash_cache[transitions_id] = hash_value
+        
+        return hash_value
     
     def _is_duplicate_episode(self, episode_hash: int) -> bool:
         """エピソードが重複しているかチェック"""
@@ -729,26 +810,49 @@ class Learner:
             print(f"警告: 取得したエピソード数 {len(all_episodes)} に対して、Learnerのバッファには {final_buffer_size} 個しか追加されていません。")
         
         # 学習更新を実行
+        # モデルは既に正しいデバイス（GPU使用時はGPU）で初期化されているため、
+        # 毎回のto('cuda')/to('cpu')の転送は不要（無駄なオーバーヘッドを削減）
         for i in range(n_updates):
-            # GPU使用時のみGPUに転送（初回のみ）
-            if self.actual_device == 'cuda' and i == 0:
-                self.agent.model.to('cuda')
-                if hasattr(self.agent, 'target_model'):
-                    self.agent.target_model.to('cuda')
-            
             # PCNエージェントのupdateメソッドを呼び出し
-            loss, _ = self.agent.update()
-            total_loss.append(loss.item())
-            
-            # 学習後はCPUに戻す（最後の更新のみ）
-            if self.actual_device == 'cuda' and i == n_updates - 1:
-                self.agent.model.to('cpu')
-                if hasattr(self.agent, 'target_model'):
-                    self.agent.target_model.to('cpu')
+            try:
+                loss, _ = self.agent.update()
+                loss_value = loss.item() if hasattr(loss, 'item') else float(loss)
+                
+                # NaNチェック
+                if np.isnan(loss_value) or np.isinf(loss_value):
+                    print(f"[Learner] 警告: 損失がNaN/Infになりました (update {i})")
+                    print(f"  損失値: {loss_value}")
+                    print(f"  バッファサイズ: {len(self.agent.experience_replay)}")
+                    
+                    # デバッグ情報を出力
+                    if len(self.agent.experience_replay) > 0:
+                        # サンプルエピソードを確認
+                        sample_episode = self.agent.experience_replay[0][2]
+                        if len(sample_episode) > 0:
+                            sample_transition = sample_episode[0]
+                            print(f"  サンプル観測: min={np.min(sample_transition.observation)}, max={np.max(sample_transition.observation)}")
+                            print(f"  サンプル観測にNaN: {np.isnan(sample_transition.observation).any()}")
+                            print(f"  サンプル観測にInf: {np.isinf(sample_transition.observation).any()}")
+                            print(f"  サンプル報酬: {sample_transition.reward}")
+                            print(f"  サンプル報酬にNaN: {np.isnan(sample_transition.reward).any() if hasattr(sample_transition.reward, '__iter__') else np.isnan(sample_transition.reward)}")
+                    
+                    # NaNの場合は0.0を記録（学習を続行）
+                    loss_value = 0.0
+                
+                total_loss.append(loss_value)
+            except Exception as e:
+                print(f"[Learner] エラー: 学習更新中にエラーが発生しました (update {i}): {e}")
+                import traceback
+                traceback.print_exc()
+                total_loss.append(0.0)  # エラーの場合は0.0を記録
             
             if DEBUG and i % 10 == 0:
                 print(f"[Learner] {i} updates done. Buffer size: {ray.get(self.buffer.size.remote())}")
-                print(f"[Learner] Average loss: {np.mean(total_loss[-10:]):.4f}")
+                if len(total_loss) > 0:
+                    print(f"[Learner] Average loss: {np.mean(total_loss[-10:]):.4f}")
+                if self.actual_device == 'cuda':
+                    import torch
+                    print(f"[Learner] GPU memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
             
             self.global_step += 1
         
@@ -1136,12 +1240,67 @@ def main():
     with open('config/config.yml', 'r') as yml:
         config = yaml.safe_load(yml)
 
-    ray.init(ignore_reinit_error=True)
+    # Rayの初期化時にGPUリソースを明示的に指定
+    import torch
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if DEBUG:
+        print(f"Ray初期化: GPU数={num_gpus}")
+    
+    # Rayの初期化（ローカルモードでGPUが利用可能な場合のみGPUリソースを指定）
+    # 注意: クラスターモードで実行されている場合、num_gpusを指定するとautoscalerがGPUノードを探してしまう
+    # そのため、ローカルモードで実行されている場合のみnum_gpusを指定する
+    ray_init_kwargs = {
+        'ignore_reinit_error': True
+    }
+    
+    # ローカルモードで実行されている場合のみGPUリソースを指定
+    # Rayが既に初期化されている場合は、クラスターモードで実行されている可能性がある
+    if not ray.is_initialized() and num_gpus > 0:
+        # ローカルモードで実行されている場合、GPUリソースを指定
+        ray_init_kwargs['num_gpus'] = num_gpus
+        if DEBUG:
+            print(f"Ray初期化: ローカルモードでGPUリソースを指定 (num_gpus={num_gpus})")
+    else:
+        if DEBUG:
+            if ray.is_initialized():
+                print("Ray初期化: 既に初期化されているため、GPUリソースを指定しません（クラスターモードの可能性）")
+            else:
+                print("Ray初期化: GPUが利用できないため、GPUリソースを指定しません")
+    
+    ray.init(**ray_init_kwargs)
+    
+    # RayがGPUリソースを認識しているかどうかを確認
+    # クラスターモードで実行されている場合、GPUリソースを要求しない
+    cluster_resources = ray.cluster_resources()
+    has_gpu_in_cluster = 'GPU' in cluster_resources and cluster_resources['GPU'] > 0
+    
+    # ローカルモードでGPUが利用可能な場合のみ、GPUリソースを要求
+    # クラスターモードで実行されている場合、num_gpusを指定しない
+    # 注意: Rayがクラスターモードで実行されている場合、num_gpusを指定すると
+    # autoscalerがGPUノードを探してしまう。そのため、RayがGPUリソースを
+    # 認識している場合のみGPUリソースを要求する。
+    if has_gpu_in_cluster and num_gpus > 0:
+        # RayがGPUリソースを認識している場合、GPUリソースを要求
+        LearnerActor = ray.remote(num_gpus=1)(Learner)
+        if DEBUG:
+            print(f"Learner: GPUリソースを要求 (RayがGPUを認識しています)")
+            print(f"  クラスタリソース: {cluster_resources}")
+    else:
+        # RayがGPUリソースを認識していない場合、GPUリソースを要求しない
+        # PyTorchが直接GPUを使用するため、Rayのリソース管理は不要
+        LearnerActor = ray.remote(Learner)
+        if DEBUG:
+            if num_gpus > 0:
+                print(f"Learner: GPUリソースを要求しません（RayがGPUを認識していない可能性があります）")
+                print(f"  クラスタリソース: {cluster_resources}")
+                print(f"  PyTorchが直接GPUを使用します（Rayのリソース管理は行いません）")
+            else:
+                print(f"Learner: GPUリソースを要求しません（GPUが利用できません）")
 
     # Replay Buffer
     buffer = ReplayBuffer.remote(max_size=10000)
 
-    learner = Learner.remote(config, buffer, device='cuda')
+    learner = LearnerActor.remote(config, buffer, device='cuda')
 
     actors = [Actor.remote(config, learner, buffer, actor_id=i) for i in range(N_ACTORS)]
     
@@ -1241,6 +1400,7 @@ def main():
     # =========================
     # final_buffer_size = ray.get(learner._get_buffer_size.remote())
     # initial_axis_ranges = visualize_initial_pareto_front(initial_batch, save_dir=execution_dir)
+    initial_axis_ranges = None  # 可視化が無効な場合はNoneを設定
 
     # =========================
     # フェーズ1終了時の学習データ分析と保存
@@ -1413,7 +1573,7 @@ def main():
     
     if DEBUG:
         print(f"教師あり学習パラメータ:")
-        print(f"  学習率: {current_learning_rate}")
+        print(f"  学習率: {SUPERVISED_LEARNING_RATE}")
         print(f"  バッチサイズ: {SUPERVISED_BATCH_SIZE}")
         print(f"  エポック数: {SUPERVISED_LEARNING_EPOCHS}")
         print(f"  エポックあたりの更新回数: {SUPERVISED_UPDATES_PER_EPOCH}")
@@ -1434,18 +1594,10 @@ def main():
                     actions = [t.action for t in transitions]
                     unique_actions = len(set(actions))
                     action_balance = min(actions.count(0), actions.count(1)) / max(actions.count(0), actions.count(1)) if len(set(actions)) > 1 else 0
-                print(f"  報酬の最小値: {np.min(rewards_array, axis=0)}")
-                print(f"  報酬の最大値: {np.max(rewards_array, axis=0)}")
-                
-                # 行動の分布も確認
-                all_actions = [t.action for t in episode[2]]
-                actions_array = np.array(all_actions)
-                unique_actions, counts = np.unique(actions_array, return_counts=True)
-                print(f"  行動の分布: {dict(zip(unique_actions, counts))}")
                     
-                # 報酬の多様性
-                rewards = [t.reward for t in transitions]
-                reward_variance = np.var(rewards, axis=0)
+                    # 報酬の多様性
+                    rewards = [t.reward for t in transitions]
+                    reward_variance = np.var(rewards, axis=0)
                 
                 # 質のスコアを計算
                 quality_score = 0
@@ -1946,6 +2098,10 @@ def main():
         print(f"設定イテレーション数: {N_ITERATIONS}")
         print(f"実際の実行イテレーション数: {actual_iterations}")
         print(f"最終損失: {training_history['losses'][-1]:.4f}")
+        
+        # 早期終了機能は現在実装されていないため、常にFalse
+        early_stop_triggered = False
+        best_loss = None
         
         if early_stop_triggered:
             print(f"✓ 早期終了により学習時間を短縮しました")

@@ -2,9 +2,25 @@ import gym
 import numpy as np
 from collections import deque
 import sys
+import os
 from sklearn.preprocessing import MinMaxScaler
 import csv
 from numba import jit, njit
+from numpy.lib.stride_tricks import sliding_window_view
+
+# Numbaデバッグキャッシュを有効化（キャッシュのHIT/MISSをログに出力）
+# より詳細なログを出力する場合は'2'を設定
+# 再コンパイルの原因を調査する場合は以下の行のコメントを外す
+# os.environ.setdefault('NUMBA_DEBUG_CACHE', '1')
+# キャッシュディレクトリのパスも出力（デバッグ用）
+# os.environ.setdefault('NUMBA_CACHE_DIR', os.path.expanduser('~/.cache/numba'))
+
+# SciPyの利用可否を確認
+try:
+    from scipy.ndimage import uniform_filter
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 from gym.envs.registration import EnvSpec
 from gym import spaces
@@ -12,7 +28,83 @@ from src.utils.map_visualizer import visualize_map
 # import cupy as cp
 
 # numbaで高速化するための関数
-@njit
+@njit(cache=True, fastmath=True)
+def get_unique_job_ids_njit(history_matrix, max_job_id):
+    """
+    ヒストリーマトリックスからユニークなjob_idを取得（-1を除く）
+    np.uniqueの代替としてNumbaで高速化
+    
+    Args:
+        history_matrix: (H, W) の配列
+        max_job_id: 最大job_id（メモリ最適化のため）
+    
+    Returns:
+        unique_job_ids: ユニークなjob_idの配列
+    """
+    # -1以外の値を一時的に格納（最大要素数）
+    temp_ids = np.zeros(max_job_id, dtype=np.int32)
+    # Numbaではnp.bool_がサポートされていない場合があるため、int8を使用
+    seen = np.zeros(max_job_id, dtype=np.int8)
+    count = 0
+    
+    for i in range(history_matrix.shape[0]):
+        for j in range(history_matrix.shape[1]):
+            job_id = history_matrix[i, j]
+            if job_id >= 0 and job_id < max_job_id and seen[job_id] == 0:
+                seen[job_id] = 1
+                temp_ids[count] = job_id
+                count += 1
+                if count >= max_job_id:
+                    break
+        if count >= max_job_id:
+            break
+    
+    # 結果を配列に格納
+    unique_job_ids = np.zeros(count, dtype=np.int32)
+    for i in range(count):
+        unique_job_ids[i] = temp_ids[i]
+    
+    return unique_job_ids
+
+@njit(cache=True, fastmath=True)
+def calculate_makespan_batch_njit(onpre_matrix, cloud_matrix):
+    """
+    オンプレとクラウドの両方のmakespanを一括計算（最適化版）
+    
+    Args:
+        onpre_matrix: (H, W) の配列、-1は未使用
+        cloud_matrix: (H, W) の配列、-1は未使用
+    
+    Returns:
+        (onpre_makespan, cloud_makespan): それぞれのmakespan（最大列インデックス）
+    """
+    onpre_makespan = -1
+    cloud_makespan = -1
+    
+    # オンプレミスのmakespan計算: 各行で右端の有効な列を探索
+    if onpre_matrix.shape[0] > 0 and onpre_matrix.shape[1] > 0:
+        n_rows, n_cols = onpre_matrix.shape[0], onpre_matrix.shape[1]
+        for i in range(n_rows):
+            # 右から左へ検索し、最初の有効値（-1でない）を見つけたらその列インデックスを記録
+            for j in range(n_cols - 1, -1, -1):
+                if onpre_matrix[i, j] != -1:
+                    if j > onpre_makespan:
+                        onpre_makespan = j
+                    break  # この行で最大インデックスが見つかったので次の行へ
+    
+    # クラウドのmakespan計算: 同様の処理
+    if cloud_matrix.shape[0] > 0 and cloud_matrix.shape[1] > 0:
+        n_rows, n_cols = cloud_matrix.shape[0], cloud_matrix.shape[1]
+        for i in range(n_rows):
+            for j in range(n_cols - 1, -1, -1):
+                if cloud_matrix[i, j] != -1:
+                    if j > cloud_makespan:
+                        cloud_makespan = j
+                    break  # この行で最大インデックスが見つかったので次の行へ
+    
+    return onpre_makespan, cloud_makespan
+
+@njit(cache=True, fastmath=True)
 def time_transition_njit(on_premise_window_status, on_premise_window_job_id,
                         cloud_window_status, cloud_window_job_id,
                         slide_on_premise, slide_cloud):
@@ -38,40 +130,24 @@ def time_transition_njit(on_premise_window_status, on_premise_window_job_id,
         
     return on_premise_window_status, on_premise_window_job_id, cloud_window_status, cloud_window_job_id
 
-@njit
-def do_schedule_njit(on_premise_window_status, on_premise_window_job_id, 
-                    cloud_window_status, cloud_window_job_id,
-                    job_width, job_height, job_id, when_submitted, use_cloud, 
-                    position, current_time):
-    # 位置情報を解析して注意深く処理
-    if len(position) == 2:
-        # 従来の連続した割り当て
-        i, a = position
-        if not use_cloud:  # オンプレミスに割り当てる場合
-            on_premise_window_status[i:i + job_height, a:a + job_width] = 1
-            on_premise_window_job_id[i:i + job_height, a:a + job_width] = job_id
-        else:  # クラウドに割り当てる場合
-            cloud_window_status[i:i + job_height, a:a + job_width] = 1
-            cloud_window_job_id[i:i + job_height, a:a + job_width] = job_id
-    else:
-        # 分散した割り当て（node_allocationがリストの場合）
-        i, a, node_allocation = position
-        if not use_cloud:
-            for col_offset in range(len(node_allocation)):
-                col = a + col_offset
-                for node_idx in range(len(node_allocation[col_offset])):
-                    node = node_allocation[col_offset][node_idx]
-                    on_premise_window_status[node, col] = 1
-                    on_premise_window_job_id[node, col] = job_id
-        else:
-            for col_offset in range(len(node_allocation)):
-                col = a + col_offset
-                for node_idx in range(len(node_allocation[col_offset])):
-                    node = node_allocation[col_offset][node_idx]
-                    cloud_window_status[node, col] = 1
-                    cloud_window_job_id[node, col] = job_id
-        
-    return current_time - when_submitted
+@njit(cache=True, fastmath=True)
+def first_fit_position_njit(window, max_h, max_w, job_height, job_width):
+    # 連続領域の最初の適合法を探索（上詰め・左詰め）
+    limit_w = max_w - job_width + 1
+    limit_h = max_h - job_height + 1
+    for a in range(limit_w):
+        for i in range(limit_h):
+            ok = True
+            for r in range(job_height):
+                for c in range(job_width):
+                    if window[i + r, a + c] != 0:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                return True, i, a
+    return False, -1, -1
 
 
 
@@ -251,6 +327,11 @@ class SchedulingEnv(gym.core.Env):
 
     # 各ステップで実行される操作
     def step(self, action_raw):
+        # ループ外で一度だけキャッシュを取得（ループ内での重複取得を避ける）
+        cache_onpre = None
+        cache_cloud = None
+        cache_needs_refresh = True  # 初回は必ず取得
+        
         while True:
             scheduled = False
             valid_action_cache = {}
@@ -260,19 +341,30 @@ class SchedulingEnv(gym.core.Env):
             action = self.get_converted_action(action_raw)   
             wt_step = 0
             is_valid = False
-            # print("check_is_valid_action start")
-            is_valid, wt_real, position = self.check_is_valid_action(action)
-            # print("check_is_valid_action end")
-            if is_valid == False:
+            
+            # キャッシュが必要な場合のみ再取得（差分更新済みの場合は再構築不要）
+            if cache_needs_refresh or cache_onpre is None or cache_cloud is None:
+                cache_onpre = self._rebuild_cache_if_needed(use_cloud=False)
+                cache_cloud = self._rebuild_cache_if_needed(use_cloud=True)
+                cache_needs_refresh = False
+            
+            # print("find_allocation_position start")
+            position, wt_real = self.find_allocation_position(action, cache_onpre=cache_onpre, cache_cloud=cache_cloud)
+            # print("find_allocation_position end")
+            if position is None:
                 if np.all(allocated_job == 0):
                     job_none = True
                     self.time_transition(True, True)
+                    # time_transition後は差分更新が試行されるため、キャッシュを再取得
+                    cache_needs_refresh = True
                 else:
                     job_none = False
                     if action[1] == 0:
                         self.time_transition(True, False)
                     else:
                         self.time_transition(False, True)
+                    # time_transition後は差分更新が試行されるため、キャッシュを再取得
+                    cache_needs_refresh = True
 
                 var_reward = 0
                 var_after = 0
@@ -288,16 +380,18 @@ class SchedulingEnv(gym.core.Env):
 
                 if action[1] == 0:
                     if (0,1) in valid_action_cache:
-                        is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,1)]
+                        position_parallel, wt_parallel = valid_action_cache[(0,1)]
                     else:
-                        is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,1])
-                        valid_action_cache[(0,1)] = (is_valid_parallel,wt_parallel,piyo)
+                        # 既に取得したキャッシュを再利用
+                        position_parallel, wt_parallel = self.find_allocation_position([0,1], cache_onpre=cache_onpre, cache_cloud=cache_cloud)
+                        valid_action_cache[(0,1)] = (position_parallel, wt_parallel)
                 if action[1] == 1:
                     if (0,0) in valid_action_cache:
-                        is_valid_parallel,wt_parallel,piyo = valid_action_cache[(0,0)]
+                        position_parallel, wt_parallel = valid_action_cache[(0,0)]
                     else:
-                        is_valid_parallel,wt_parallel,piyo = self.check_is_valid_action([0,0])
-                        valid_action_cache[(0,0)] = (is_valid_parallel,wt_parallel,piyo)
+                        # 既に取得したキャッシュを再利用
+                        position_parallel, wt_parallel = self.find_allocation_position([0,0], cache_onpre=cache_onpre, cache_cloud=cache_cloud)
+                        valid_action_cache[(0,0)] = (position_parallel, wt_parallel)
 
                 # time_reward_new = (
                 #     1 if wt_real < wt_parallel else
@@ -397,15 +491,30 @@ class SchedulingEnv(gym.core.Env):
         self.init_window()
             # print("windows: ",self.on_premise_window, self.cloud_window)
 
+        # キャッシュを初期化（エピソード開始時にリセット）
+        self._ensure_cache_initialized()
+        self._version_onpre = 0
+        self._version_cloud = 0
+        self._cache_onpre = {'version': -1}
+        self._cache_cloud = {'version': -1}
+
         # メモリ最適化: 古い履歴配列を明示的に解放
         if hasattr(self, 'on_premise_window_history_full'):
             del self.on_premise_window_history_full
         if hasattr(self, 'cloud_window_history_full'):
             del self.cloud_window_history_full
         
-        # 新しい履歴配列を初期化
-        self.on_premise_window_history_full = np.full((self.n_on_premise_node,1),-1)
-        self.cloud_window_history_full = np.full((self.n_cloud_node,1),-1)
+        # 新しい履歴配列を初期化（動的伸長バッファ方式）
+        init_cap = max(1024, self.n_window)  # 初期容量（必要に応じて拡張）
+        self._hist_cap_onpre = init_cap
+        self._hist_cap_cloud = init_cap
+        self._hist_len_onpre = 1  # 先頭にダミー列（-1）
+        self._hist_len_cloud = 1
+        self._hist_onpre_buf = np.full((self.n_on_premise_node, init_cap), -1, dtype=int)
+        self._hist_cloud_buf = np.full((self.n_cloud_node, init_cap), -1, dtype=int)
+        # 互換のため公開配列も1列の-1で初期化（最終化時に置き換え）
+        self.on_premise_window_history_full = self._hist_onpre_buf[:, :1]
+        self.cloud_window_history_full = self._hist_cloud_buf[:, :1]
 
         # self.cloud_window_user = np.full((self.n_cloud_node, self.n_window),-1)  # クラウドのスライドウィンドウ
         self.job_queue = np.zeros((len(self.jobs),8)) # ジョブキュー
@@ -437,69 +546,291 @@ class SchedulingEnv(gym.core.Env):
         self.time += 1
         self.update_window_history()
 
-        # 構造化配列からndarrayを取得
-        on_premise_status = self.on_premise_window['status']
-        on_premise_job_id = self.on_premise_window['job_id']
-        cloud_status = self.cloud_window['status']
-        cloud_job_id = self.cloud_window['job_id']
+        # 構造化配列からndarrayを取得（型とメモリレイアウトを固定してキャッシュを有効化）
+        on_premise_status = np.ascontiguousarray(self.on_premise_window['status'], dtype=np.int32)
+        on_premise_job_id = np.ascontiguousarray(self.on_premise_window['job_id'], dtype=np.int32)
+        cloud_status = np.ascontiguousarray(self.cloud_window['status'], dtype=np.int32)
+        cloud_job_id = np.ascontiguousarray(self.cloud_window['job_id'], dtype=np.int32)
     
         # Numbaで高速化された関数を呼び出し
         on_premise_status, on_premise_job_id, cloud_status, cloud_job_id = time_transition_njit(
             on_premise_status, on_premise_job_id, cloud_status, cloud_job_id,
             slide_on_premise, slide_cloud
         )
+        
+        # 結果を元の配列に書き戻し
+        self.on_premise_window['status'] = on_premise_status
+        self.on_premise_window['job_id'] = on_premise_job_id
+        self.cloud_window['status'] = cloud_status
+        self.cloud_window['job_id'] = cloud_job_id
 
         # 新しいジョブをジョブキューに追加
         self.append_new_job2job_queue()
+        
+        # キャッシュを無効化（次回アクション検証時に再構築される）
+        # 差分更新は毎回cumsumを2回実行するため遅いため、無効化のみにする
+        self._invalidate_window_cache(on_premise=slide_on_premise, cloud=slide_cloud)
 
     def update_window_history(self):
-        # オンプレミスの履歴を更新
-        left_column_on_premise = self.on_premise_window['job_id'][:, 0:1]  # 左端の1列を取得
-        
-        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
-        old_on_premise = self.on_premise_window_history_full
-        self.on_premise_window_history_full = np.hstack((old_on_premise, left_column_on_premise.copy()))
-        del old_on_premise  # 古い配列を明示的に解放
-        
-        # クラウドの履歴を更新
-        left_column_cloud = self.cloud_window['job_id'][:, 0:1]  # 左端の1列を取得
-        
-        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
-        old_cloud = self.cloud_window_history_full
-        self.cloud_window_history_full = np.hstack((old_cloud, left_column_cloud.copy()))
-        del old_cloud  # 古い配列を明示的に解放
+        # オンプレミスの履歴を更新（動的バッファへ追記）
+        left_column_on_premise = self.on_premise_window['job_id'][:, 0]
+        if self._hist_len_onpre >= self._hist_cap_onpre:
+            new_cap = self._hist_cap_onpre * 2
+            new_buf = np.empty((self.n_on_premise_node, new_cap), dtype=int)
+            new_buf[:, :self._hist_cap_onpre] = self._hist_onpre_buf
+            new_buf[:, self._hist_cap_onpre:new_cap] = -1
+            self._hist_onpre_buf = new_buf
+            self._hist_cap_onpre = new_cap
+        self._hist_onpre_buf[:, self._hist_len_onpre] = left_column_on_premise
+        self._hist_len_onpre += 1
+
+        # クラウドの履歴を更新（動的バッファへ追記）
+        left_column_cloud = self.cloud_window['job_id'][:, 0]
+        if self._hist_len_cloud >= self._hist_cap_cloud:
+            new_cap = self._hist_cap_cloud * 2
+            new_buf = np.empty((self.n_cloud_node, new_cap), dtype=int)
+            new_buf[:, :self._hist_cap_cloud] = self._hist_cloud_buf
+            new_buf[:, self._hist_cap_cloud:new_cap] = -1
+            self._hist_cloud_buf = new_buf
+            self._hist_cap_cloud = new_cap
+        self._hist_cloud_buf[:, self._hist_len_cloud] = left_column_cloud
+        self._hist_len_cloud += 1
 
         # print("self.on_premise_window_history_full:\n",self.on_premise_window_history_full)
         # print("self.cloud_window_history_full:\n",self.cloud_window_history_full)
 
     def finalize_window_history(self):
         """ウィンドウ全体を履歴に追加"""
-        # print("finalize_window_history")
-        
-        # メモリ最適化: 古い配列を明示的に解放してから新しい配列を作成
-        old_on_premise = self.on_premise_window_history_full
-        self.on_premise_window_history_full = np.hstack((old_on_premise, self.on_premise_window['job_id'].copy()))
-        del old_on_premise  # 古い配列を明示的に解放
-        
-        old_cloud = self.cloud_window_history_full
-        self.cloud_window_history_full = np.hstack((old_cloud, self.cloud_window['job_id'].copy()))
-        del old_cloud  # 古い配列を明示的に解放
-        
-        #一番左の列を削除
+        # バッファに蓄積済みの履歴と、現在のウィンドウ全体を最後に1回だけ連結
+        hist_onpre = self._hist_onpre_buf[:, :self._hist_len_onpre]
+        hist_cloud = self._hist_cloud_buf[:, :self._hist_len_cloud]
+        self.on_premise_window_history_full = np.hstack((hist_onpre, self.on_premise_window['job_id'].copy()))
+        self.cloud_window_history_full = np.hstack((hist_cloud, self.cloud_window['job_id'].copy()))
+        # 一番左の列（初期の-1ダミー列）を削除
         self.on_premise_window_history_full = np.delete(self.on_premise_window_history_full, 0, axis=1)
         self.cloud_window_history_full = np.delete(self.cloud_window_history_full, 0, axis=1)
 
-        # 待ち時間とコストを計算
-        self.cost = self.calc_objective_values()
+        # 待ち時間とコストを計算（makespanは不要なので計算をスキップ）
+        cost, _, _ = self.calc_objective_values(calc_makespan=False, calc_avg_waiting_time=False)
+        self.cost = cost
+
+    # 内部キャッシュ: ウィンドウごとの事前計算を保持
+    def _ensure_cache_initialized(self):
+        # hasattrチェックを1回にまとめて最適化（属性が存在しない場合のみ初期化）
+        if not hasattr(self, '_cache_onpre'):
+            self._cache_onpre = {'version': -1}
+            self._cache_cloud = {'version': -1}
+            self._version_onpre = 0
+            self._version_cloud = 0
+        elif not hasattr(self, '_version_onpre'):
+            # 後方互換性のため（_version_cloudのみがない場合）
+            self._version_onpre = 0
+            self._version_cloud = 0
+
+    def _invalidate_window_cache(self, on_premise=True, cloud=True):
+        self._ensure_cache_initialized()
+        if on_premise:
+            self._version_onpre += 1
+        if cloud:
+            self._version_cloud += 1
+
+    def _update_cache_incremental(self, use_cloud, i_start, i_end, a_start, a_end):
+        """
+        ジョブ割り当て時の差分更新（incremental update）
+        指定領域のみキャッシュを更新し、全再構築を避ける
+        
+        Args:
+            use_cloud: クラウドかどうか
+            i_start, i_end: 行の範囲（i_start <= row < i_end）
+            a_start, a_end: 列の範囲（a_start <= col < a_end）
+        """
+        self._ensure_cache_initialized()
+        cache = self._cache_onpre if not use_cloud else self._cache_cloud
+        version = self._version_onpre if not use_cloud else self._version_cloud
+        
+        # キャッシュが存在しない、または無効な場合は全再構築
+        if cache.get('version', -1) != version:
+            return False  # 差分更新不可、全再構築が必要
+        
+        window = self.on_premise_window if not use_cloud else self.cloud_window
+        status = window['status']
+        occ = cache['occ']
+        ps = cache['prefix_sum']
+        free_per_col = cache['free_per_col']
+        
+        # 指定領域のoccを更新
+        for row in range(i_start, i_end):
+            for col in range(a_start, a_end):
+                old_occ = occ[row, col]
+                new_occ = 1 if status[row, col] != 0 else 0
+                occ[row, col] = new_occ
+                
+                # free_per_colを更新
+                if old_occ != new_occ:
+                    free_per_col[col] += (old_occ - new_occ)
+        
+        # prefix_sumを全再計算（部分更新は複雑で遅いため、全再計算の方が速い）
+        # occは既に更新済みなので、occから直接再計算
+        H, W = occ.shape
+        ps.fill(0)  # リセット
+        # 2次元累積和を再計算（効率的な方法）
+        ps[1:, 1:] = np.cumsum(np.cumsum(occ.astype(np.int32), axis=0, dtype=np.int32), axis=1, dtype=np.int32)
+        
+        # free_nodes_listを更新（影響を受けた列のみ）
+        for col in range(a_start, a_end):
+            status_col = status[:, col]
+            cache['free_nodes_list'][col] = np.flatnonzero(status_col == 0)
+        
+        # バージョンを更新（差分更新成功時はバージョンを進める）
+        if not use_cloud:
+            self._version_onpre += 1
+            cache['version'] = self._version_onpre
+        else:
+            self._version_cloud += 1
+            cache['version'] = self._version_cloud
+        return True  # 差分更新成功
+
+    def _update_cache_after_slide(self, use_cloud):
+        """
+        time_transition後の差分更新（スライド後のキャッシュ更新）
+        prefix_sumを左シフトし、最後の列をクリア
+        
+        Args:
+            use_cloud: クラウドかどうか
+        
+        Returns:
+            True: 差分更新成功、False: 差分更新不可（全再構築が必要）
+        """
+        self._ensure_cache_initialized()
+        cache = self._cache_onpre if not use_cloud else self._cache_cloud
+        # バージョンを更新する前にチェック（現在のバージョンと一致する必要がある）
+        current_version = self._version_onpre if not use_cloud else self._version_cloud
+        
+        # キャッシュが存在しない、または無効な場合は全再構築
+        if cache.get('version', -1) != current_version:
+            return False  # 差分更新不可、全再構築が必要
+        
+        window = self.on_premise_window if not use_cloud else self.cloud_window
+        status = window['status']
+        occ = cache['occ']
+        ps = cache['prefix_sum']
+        free_per_col = cache['free_per_col']
+        H, W = occ.shape
+        
+        # occを左シフト（最後の列をクリア）
+        occ[:, :-1] = occ[:, 1:]
+        occ[:, -1] = 0
+        
+        # statusから最後の列のoccを更新
+        last_col_status = status[:, -1]
+        for row in range(H):
+            old_occ = occ[row, -1]
+            new_occ = 1 if last_col_status[row] != 0 else 0
+            occ[row, -1] = new_occ
+            if old_occ != new_occ:
+                free_per_col[-1] += (old_occ - new_occ)
+        
+        # free_per_colを左シフト
+        free_per_col[:-1] = free_per_col[1:]
+        # 最後の列の空きノード数を再計算
+        free_per_col[-1] = H - np.sum(last_col_status != 0)
+        
+        # prefix_sumを全再計算（左シフト後のoccから直接再計算）
+        # 部分更新は複雑で遅いため、全再計算の方が速い
+        ps.fill(0)  # リセット
+        ps[1:, 1:] = np.cumsum(np.cumsum(occ.astype(np.int32), axis=0, dtype=np.int32), axis=1, dtype=np.int32)
+        
+        # free_nodes_listを更新
+        for col in range(W - 1):
+            cache['free_nodes_list'][col] = cache['free_nodes_list'][col + 1]
+        # 最後の列を再計算
+        cache['free_nodes_list'][-1] = np.flatnonzero(status[:, -1] == 0)
+        
+        # バージョンを更新（差分更新成功時はバージョンを進める）
+        # これにより、次回の呼び出し時にキャッシュが有効として認識される
+        if not use_cloud:
+            self._version_onpre += 1
+            cache['version'] = self._version_onpre
+        else:
+            self._version_cloud += 1
+            cache['version'] = self._version_cloud
+        return True  # 差分更新成功
+
+    def _rebuild_cache_if_needed(self, use_cloud):
+        # キャッシュが初期化されていない場合のみ初期化（初回呼び出し時のみ）
+        self._ensure_cache_initialized()
+        if not use_cloud:
+            # バージョンチェックを最適化（辞書アクセスを1回に）
+            cache_version = self._cache_onpre.get('version', -1)
+            if cache_version != self._version_onpre:
+                status = self.on_premise_window['status']
+                occ = (status != 0).astype(np.int32)
+                free_per_col = status.shape[0] - occ.sum(axis=0)
+                
+                # 2D占有判定の最適化: cumsum(cumsum())の計算を効率化
+                # 注意: 矩形サイズが可変のため、prefix_sum方式を維持
+                # ただし、計算を最適化（型を縮小、メモリ効率を改善）
+                H, W = occ.shape
+                ps = np.zeros((H+1, W+1), dtype=np.int32)
+                # cumsumを2回実行（行方向→列方向）: O(HW)で効率的
+                # この計算は避けられないが、型をint32に固定してメモリ帯域を削減
+                ps[1:,1:] = np.cumsum(np.cumsum(occ.astype(np.int32), axis=0, dtype=np.int32), axis=1, dtype=np.int32)
+                
+                free_nodes_list = [np.flatnonzero(status[:, c] == 0) for c in range(status.shape[1])]
+                self._cache_onpre = {
+                    'version': self._version_onpre,
+                    'free_per_col': free_per_col,
+                    'prefix_sum': ps,
+                    'free_nodes_list': free_nodes_list,
+                    'shape': status.shape,
+                    'occ': occ  # 矩形判定用にoccも保存
+                }
+            return self._cache_onpre
+        else:
+            # バージョンチェックを最適化（辞書アクセスを1回に）
+            cache_version = self._cache_cloud.get('version', -1)
+            if cache_version != self._version_cloud:
+                status = self.cloud_window['status']
+                occ = (status != 0).astype(np.int32)
+                free_per_col = status.shape[0] - occ.sum(axis=0)
+                
+                # 2D占有判定の最適化: cumsum(cumsum())の計算を効率化
+                # 注意: 矩形サイズが可変のため、prefix_sum方式を維持
+                # ただし、計算を最適化（型を縮小、メモリ効率を改善）
+                H, W = occ.shape
+                ps = np.zeros((H+1, W+1), dtype=np.int32)
+                # cumsumを2回実行（行方向→列方向）: O(HW)で効率的
+                # この計算は避けられないが、型をint32に固定してメモリ帯域を削減
+                ps[1:,1:] = np.cumsum(np.cumsum(occ.astype(np.int32), axis=0, dtype=np.int32), axis=1, dtype=np.int32)
+                
+                free_nodes_list = [np.flatnonzero(status[:, c] == 0) for c in range(status.shape[1])]
+                self._cache_cloud = {
+                    'version': self._version_cloud,
+                    'free_per_col': free_per_col,
+                    'prefix_sum': ps,
+                    'free_nodes_list': free_nodes_list,
+                    'shape': status.shape,
+                    'occ': occ  # 矩形判定用にoccも保存
+                }
+            return self._cache_cloud
 
     def get_cost(self):
         return self.cost
 
-    def calc_objective_values(self):
+    def calc_objective_values(self, calc_makespan=True, calc_avg_waiting_time=True):
         # 待ち時間とコストを計算　
 
-        """return:cost,makespan 待ち時間の定義は，ジョブが到着してから，ジョブが開始するまでの時間．
+        """return:cost,makespan,avg_waiting_time 待ち時間の定義は，ジョブが到着してから，ジョブが開始するまでの時間．
         つまり，各ステップにおける遅延時間の総和をとればよい．
+        
+        Args:
+            calc_makespan: makespanを計算するかどうか（デフォルト: True）
+            calc_avg_waiting_time: 平均待ち時間を計算するかどうか（デフォルト: True）
+        
+        Returns:
+            (cost, makespan, avg_waiting_time): 
+            - calc_makespan=Falseの場合、makespanは-1を返す
+            - calc_avg_waiting_time=Falseの場合、avg_waiting_timeは0.0を返す
         """
         
         # クラウドに割り当てられたジョブのコスト計算
@@ -509,23 +840,26 @@ class SchedulingEnv(gym.core.Env):
         # print("=== デバッグ情報 ===")
         # print(f"クラウドウィンドウ履歴: {self.cloud_window_history_full}")
         
-        # クラウドウィンドウに記録されているジョブIDを取得
-        unique_job_ids = np.unique(self.cloud_window_history_full)
-        unique_job_ids = unique_job_ids[unique_job_ids >= 0]  # -1を除外
+        # クラウドウィンドウに記録されているジョブIDを取得（np.uniqueの代わりにNumba関数を使用）
+        # 型とサイズを固定してキャッシュを有効化（contiguous配列として確保）
+        history_matrix = np.ascontiguousarray(self.cloud_window_history_full, dtype=np.int32)
+        # 最大job_idを固定値にする（毎回変わることでシグネチャが変わり再コンパイルされるのを防ぐ）
+        # 十分大きな固定値を使用することで、キャッシュが有効に機能する
+        max_job_id_fixed = 50000  # 固定値（実行ごとに変わらない）
+        unique_job_ids = get_unique_job_ids_njit(history_matrix, max_job_id_fixed)
         # print(f"検出されたジョブID: {unique_job_ids}")
         
-        # 利用できるジョブ情報を確認
-        # print(f"ジョブ数: {len(self.jobs)}")
-        # for job in self.jobs[:5]:  # 最初の5件だけ表示
-        #     print(f"ジョブ情報: {job}")
+        # job_idからjob情報への辞書を作成（検索を高速化）
+        job_dict = {}
+        for job in self.jobs:
+            job_id = int(job[5])
+            if job_id not in job_dict:
+                job_dict[job_id] = job
         
         # 各クラウドジョブに対してコストを計算
         for job_id in unique_job_ids:
-            # 対応するジョブを検索
-            matching_jobs = [job for job in self.jobs if int(job[5]) == job_id]
-            
-            if matching_jobs:
-                job = matching_jobs[0]
+            if job_id in job_dict:
+                job = job_dict[job_id]
                 # ジョブのサイズからコストを計算
                 job_width = int(job[1])  # 処理時間
                 job_height = int(job[2])  # ノード数
@@ -543,28 +877,23 @@ class SchedulingEnv(gym.core.Env):
         # print(f"総コスト: {total_cost}")
         
         # makespanは二次元配列で要素が入っているものの中で一番右側（インデックス）の値をとる
-        def calculate_makespan(matrix):
-            matrix = np.array(matrix)
-            latest_index = -1
-            target_value = -1
-            
-            for row in matrix:
-                unique_values = np.unique(row[row != -1])  # -1を除くユニークな値を取得
-                for value in unique_values:
-                    last_occurrence = np.max(np.where(row == value))  # 値の最後の出現位置
-                    if last_occurrence > latest_index:
-                        latest_index = last_occurrence
-                        target_value = value
-            
-            return latest_index
-        
-        mkspan_onpre = calculate_makespan(self.on_premise_window_history_full)
-        mkspan_cloud = calculate_makespan(self.cloud_window_history_full)
+        # オンプレとクラウドを一括計算（Numba化で高速化）
+        if calc_makespan:
+            # 型とメモリレイアウトを固定してキャッシュを有効化（contiguous配列として確保）
+            onpre_matrix = np.ascontiguousarray(self.on_premise_window_history_full, dtype=np.int32)
+            cloud_matrix = np.ascontiguousarray(self.cloud_window_history_full, dtype=np.int32)
+            mkspan_onpre, mkspan_cloud = calculate_makespan_batch_njit(onpre_matrix, cloud_matrix)
+            makespan = max(mkspan_onpre, mkspan_cloud)
+        else:
+            makespan = -1  # 計算をスキップした場合は-1を返す
         
         # 平均待ち時間を計算
-        avg_waiting_time = np.mean(self.waiting_times) if self.waiting_times else 0.0
+        if calc_avg_waiting_time:
+            avg_waiting_time = np.mean(self.waiting_times) if self.waiting_times else 0.0
+        else:
+            avg_waiting_time = 0.0
 
-        return self.cost, max(mkspan_onpre, mkspan_cloud), avg_waiting_time
+        return self.cost, makespan, avg_waiting_time
 
     def show_final_window_history(self):
         #show simply
@@ -634,24 +963,37 @@ class SchedulingEnv(gym.core.Env):
         
         # 位置情報を解析
         if len(position) == 2:
-            # 従来の連続した割り当て
+            # 従来の連続した割り当て（Numbaで高速化）
             i, a = position
+            i_end = i + job_height
+            a_end = a + job_width
             if not use_cloud:  # オンプレミスに割り当てる場合
-                self.on_premise_window['status'][i:i + job_height, a:a + job_width] = 1
-                self.on_premise_window['job_id'][i:i + job_height, a:a + job_width] = job_id
+                self.on_premise_window['status'][i:i_end, a:a_end] = 1
+                self.on_premise_window['job_id'][i:i_end, a:a_end] = job_id
+                # キャッシュを無効化（次回アクション検証時に再構築される）
+                self._invalidate_window_cache(on_premise=True, cloud=False)
             else:  # クラウドに割り当てる場合
-                self.cloud_window['status'][i:i + job_height, a:a + job_width] = 1
-                self.cloud_window['job_id'][i:i + job_height, a:a + job_width] = job_id
+                self.cloud_window['status'][i:i_end, a:a_end] = 1
+                self.cloud_window['job_id'][i:i_end, a:a_end] = job_id
+                # キャッシュを無効化（次回アクション検証時に再構築される）
+                self._invalidate_window_cache(on_premise=False, cloud=True)
         else:
-            # 分散した割り当て
+            # 分散した割り当て（Python側で処理、Numba非対応）
             i, a, node_allocation = position
             window = self.on_premise_window if not use_cloud else self.cloud_window
             
+            # 分散割り当ての場合
             for col_offset, nodes in enumerate(node_allocation):
                 col = a + col_offset
                 for node in nodes:
                     window['status'][node, col] = 1
                     window['job_id'][node, col] = job_id
+            
+            # キャッシュを無効化（次回アクション検証時に再構築される）
+            if action[1] == 0:
+                self._invalidate_window_cache(on_premise=True, cloud=False)
+            else:
+                self._invalidate_window_cache(on_premise=False, cloud=True)
         
         waiting_time = self.time - when_submitted
         
@@ -696,8 +1038,19 @@ class SchedulingEnv(gym.core.Env):
 
         return cost
 
-    # stateをもとにactionが有効かどうかを判定
-    def check_is_valid_action(self, action):
+    # 割り当て位置を探索（有効性チェックは削除、位置が見つからない場合はNoneを返す）
+    def find_allocation_position(self, action, cache_onpre=None, cache_cloud=None):
+        """
+        割り当て位置を探索
+        
+        Args:
+            action: [method, use_cloud]
+            cache_onpre: オンプレミスのキャッシュ（既に取得済みの場合に渡す）
+            cache_cloud: クラウドのキャッシュ（既に取得済みの場合に渡す）
+        
+        Returns:
+            (position, wt_real): 位置が見つかった場合は(position, 待ち時間)、見つからない場合は(None, np.inf)
+        """
         method = action[0]
         use_cloud = action[1]
         job = self.job_queue[0]
@@ -709,63 +1062,80 @@ class SchedulingEnv(gym.core.Env):
         when_submitted = int(job[-1])
         time = self.time
 
-        # job が 0 なら早期リターン
+        # job が 0 なら早期リターン（キャッシュ取得前に早期リターン）
         if job[0] == 0 and job[1] == 0:
-            return False, -1, None
+            return None, np.inf
 
-        # 使用するウィンドウの選択
+        # 使用するウィンドウの選択とキャッシュ取得
+        # キャッシュが既に渡されている場合はそれを使用、そうでなければ取得
         if not use_cloud:
             window = self.on_premise_window['status']
             max_h, max_w = self.n_on_premise_node, self.n_window
+            if cache_onpre is None:
+                cache = self._rebuild_cache_if_needed(use_cloud=False)
+            else:
+                cache = cache_onpre
         else:
             window = self.cloud_window['status']
             max_h, max_w = self.n_cloud_node, self.n_window
+            if cache_cloud is None:
+                cache = self._rebuild_cache_if_needed(use_cloud=True)
+            else:
+                cache = cache_cloud
 
         # ジョブサイズが大きすぎる場合は早期リターン
         if job_width > max_w or job_height > max_h:
             print("ジョブサイズが大きすぎる")
-            return False, -1, None
+            return None, np.inf
     
-        # 列ごとに利用可能なリソースを確認する方法
-        for a in range(max_w - job_width + 1):  # 横方向（時間軸）の開始位置を探索
-            can_allocate = True
-            
-            # この開始位置から job_width 分の幅で配置できるか確認
-            for col_offset in range(job_width):
+        # 前計算を使った高速探索
+        free_per_col = cache['free_per_col']
+        ps = cache['prefix_sum']
+        free_nodes_list = cache['free_nodes_list']
+
+        W = max_w
+        need = job_height
+        k = job_width
+        if k <= 0:
+            return None, np.inf
+
+        # スライド最小値（各開始位置での列空き数の最小）: dequeループをNumPyに置換
+        if k <= free_per_col.shape[0]:
+            # sliding_window_viewでスライディングウィンドウを作成し、各ウィンドウの最小値を計算
+            mins = sliding_window_view(free_per_col, k).min(axis=1)  # shape (W-k+1,)
+            # minsのインデックスをlimit_aと揃える（mins[0]はa=0に対応）
+        else:
+            # kが大きすぎる場合は早期リターン
+            return None, np.inf
+
+        # a昇順、i昇順でFirst-Fit
+        limit_a = W - k + 1
+        for a in range(limit_a):
+            if mins[a] < need:
+                continue
+            a2 = a + k
+            max_i = max_h - job_height + 1
+            for i in range(max_i):
+                i2 = i + job_height
+                occ_sum = ps[i2, a2] - ps[i, a2] - ps[i2, a] + ps[i, a]
+                if occ_sum == 0:
+                    return (i, a), time + a - when_submitted
+
+            # 分散割り当て
+            node_allocation = []
+            ok = True
+            for col_offset in range(k):
                 col = a + col_offset
-                available_nodes = max_h - np.count_nonzero(window[:, col])
-                
-                # この列に必要なノード数が確保できるか
-                if available_nodes < job_height:
-                    can_allocate = False
+                nodes = free_nodes_list[col]
+                if nodes.size < job_height:
+                    ok = False
                     break
-            
-            if can_allocate:
-                # 利用可能な連続したノード領域を探す（優先的に上から詰める）
-                for i in range(max_h - job_height + 1):
-                    if np.all(window[i:i + job_height, a:a + job_width] == 0):
-                        return True, time + a - when_submitted, (i, a)
-                
-                # 連続した領域がない場合、分散して割り当てる（より複雑な実装が必要）
-                # ここでは簡易的に、各列で上から順に利用可能なノードを見つける
-                node_allocation = []
-                for col_offset in range(job_width):
-                    col = a + col_offset
-                    free_nodes = [i for i in range(max_h) if window[i, col] == 0][:job_height]
-                    if len(free_nodes) >= job_height:
-                        node_allocation.append(free_nodes[:job_height])
-                    else:
-                        # 十分なノードが見つからない場合はスキップ
-                        can_allocate = False
-                        break
-                
-                if can_allocate:
-                    # 最初のノードの位置を返す（簡易実装）
-                    # 実際の割り当ては do_schedule で行う必要がある
-                    return True, time + a - when_submitted, (0, a, node_allocation)
-    
+                node_allocation.append(nodes[:job_height].tolist())
+            if ok:
+                return (0, a, node_allocation), time + a - when_submitted
+
         # 有効な配置位置が見つからなかった
-        return False, np.inf, None
+        return None, np.inf
 
     # エピソード終了条件を判定
     def check_is_done(self):

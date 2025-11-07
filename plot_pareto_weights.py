@@ -17,7 +17,7 @@ total_wait_time = [1780.59, 1752.78, 1730.63, 1780.49, 1781.86, 1705.48, 1786.57
                    1733.45, 1793.22, 1760.42, 1777.06, 1717.79, 1774.55, 1724.15, 1687.87, 
                    1792.56, 1745.22, 1718.95, 1675.28, 1611.39, 1720.38, 1721.02, 1696.45, 
                    1683.72, 1558.29, 1710.69, 1287.48, 1503.80, 1180.25, 1090.34, 879.06]
-
+total_wait_time = [i / 128 for i in total_wait_time]
 
 
 # フィギュアとサブプロットの作成
@@ -25,9 +25,9 @@ fig, ax1 = plt.subplots(figsize=(12, 8))
 
 # 左軸（待ち時間）のプロット
 color1 = 'tab:blue'
-ax1.set_xlabel('Weight', fontsize=24)
-ax1.set_ylabel('Total Job Wait Time', fontsize=24)
-line1 = ax1.plot(weights_wait, total_wait_time, color=color1, marker='o', linewidth=2, markersize=6, label='Total Wait Time')
+ax1.set_xlabel('Weight', fontsize=36)
+ax1.set_ylabel('Average Job Wait Time', fontsize=36)
+line1 = ax1.plot(weights_wait, total_wait_time, color=color1, marker='o', linewidth=2, markersize=6, label='Average Job Wait Time')
 ax1.tick_params(axis='y', labelsize=18)
 
 

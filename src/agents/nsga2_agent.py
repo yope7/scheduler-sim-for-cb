@@ -12,6 +12,18 @@ import traceback
 from morl_baselines.common.performance_indicators import hypervolume
 import time
 import ray
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Numbaが利用できない場合は空のデコレータを定義
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    def prange(x):
+        return range(x)
 
 def evaluate_individual_global(args):
     """並列処理用のグローバル評価関数"""
@@ -99,6 +111,182 @@ def evaluate_individual_pure_step_time(env, chromosome):
     # 修正: 負の値を返さない（最小化が目的）
     return [cost, avg_waiting_time], pure_step_time
 
+# NumPy/Numba化された高速な支配関係判定関数
+@njit(cache=True, fastmath=True)
+def dominates_numba(objectives1, objectives2):
+    """NumPy配列での高速な支配関係判定（最小化問題）"""
+    better_in_any = False
+    worse_in_any = False
+    
+    for i in range(len(objectives1)):
+        if objectives1[i] < objectives2[i]:
+            better_in_any = True
+        elif objectives1[i] > objectives2[i]:
+            worse_in_any = True
+    
+    return better_in_any and not worse_in_any
+
+# NumPy/Numba化された非支配ソート
+@njit(cache=True, fastmath=True)
+def non_dominated_sort_numba(objectives_matrix):
+    """
+    NumPy配列での高速な非支配ソート
+    Args:
+        objectives_matrix: (n_pop, n_obj) のNumPy配列
+    Returns:
+        ranks: (n_pop,) のランク配列
+    """
+    n_pop = objectives_matrix.shape[0]
+    n_obj = objectives_matrix.shape[1]
+    ranks = np.zeros(n_pop, dtype=np.int32)
+    
+    # 支配関係マトリクスを計算（iがjを支配する場合dominates_matrix[i, j] = 1）
+    # 最大サイズで事前割り当て（各要素が支配する最大数を仮定）
+    max_dominated = n_pop  # 最大で全個体を支配する可能性
+    dominated_matrix = np.zeros((n_pop, n_pop), dtype=np.int32)
+    dominated_counts = np.zeros(n_pop, dtype=np.int32)
+    domination_counts = np.zeros(n_pop, dtype=np.int32)
+    
+    # O(N²)で支配関係を計算（並列化はデータ依存のため通常ループ）
+    for i in range(n_pop):
+        for j in range(n_pop):
+            if i == j:
+                continue
+            
+            better_any = False
+            worse_any = False
+            
+            for k in range(n_obj):
+                if objectives_matrix[i, k] < objectives_matrix[j, k]:
+                    better_any = True
+                elif objectives_matrix[i, k] > objectives_matrix[j, k]:
+                    worse_any = True
+            
+            if better_any and not worse_any:
+                # iがjを支配
+                dominated_matrix[i, dominated_counts[i]] = j
+                dominated_counts[i] += 1
+            elif not better_any and worse_any:
+                # jがiを支配
+                domination_counts[i] += 1
+    
+    # 第1フロントを決定
+    current_rank = 1
+    for i in range(n_pop):
+        if domination_counts[i] == 0:
+            ranks[i] = current_rank
+    
+    # 残りのフロントを決定
+    while True:
+        current_members = np.zeros(n_pop, dtype=np.int32)
+        current_members_size = 0
+        
+        for i in range(n_pop):
+            if ranks[i] == current_rank:
+                current_members[current_members_size] = i
+                current_members_size += 1
+        
+        if current_members_size == 0:
+            break
+        
+        next_front_size = 0
+        next_front = np.zeros(n_pop, dtype=np.int32)
+        
+        for i_idx in range(current_members_size):
+            i = current_members[i_idx]
+            for j_idx in range(dominated_counts[i]):
+                j = dominated_matrix[i, j_idx]
+                domination_counts[j] -= 1
+                if domination_counts[j] == 0 and ranks[j] == 0:
+                    ranks[j] = current_rank + 1
+                    next_front[next_front_size] = j
+                    next_front_size += 1
+        
+        if next_front_size == 0:
+            break
+        
+        current_rank += 1
+    
+    return ranks
+
+# NumPy化された混雑度計算
+@njit(nopython=True, cache=True, fastmath=True)
+def calculate_crowding_distance_numba(objectives_matrix):
+    """
+    NumPy配列での高速な混雑度計算
+    Args:
+        objectives_matrix: (n_pop, n_obj) のNumPy配列
+    Returns:
+        crowding_distances: (n_pop,) の混雑度配列
+    """
+    n_pop = objectives_matrix.shape[0]
+    n_obj = objectives_matrix.shape[1]
+    crowding_distances = np.zeros(n_pop, dtype=np.float64)
+    
+    # 各目的関数について計算
+    for obj_idx in range(n_obj):
+        # ソートインデックスを取得
+        sorted_indices = np.argsort(objectives_matrix[:, obj_idx])
+        
+        # 最小値と最大値は無限大の混雑度
+        crowding_distances[sorted_indices[0]] = np.inf
+        crowding_distances[sorted_indices[-1]] = np.inf
+        
+        # 目的関数の範囲を計算
+        obj_range = (objectives_matrix[sorted_indices[-1], obj_idx] - 
+                    objectives_matrix[sorted_indices[0], obj_idx])
+        
+        if obj_range == 0:
+            continue
+        
+        # 中間の個体の混雑度を計算
+        for i in range(1, n_pop - 1):
+            idx = sorted_indices[i]
+            prev_idx = sorted_indices[i - 1]
+            next_idx = sorted_indices[i + 1]
+            
+            distance = (objectives_matrix[next_idx, obj_idx] - 
+                       objectives_matrix[prev_idx, obj_idx]) / obj_range
+            crowding_distances[idx] += distance
+    
+    return crowding_distances
+
+# JITウォームアップ関数（代表的な形状で事前コンパイル）
+def warmup_numba_functions():
+    """
+    Numba関数のウォームアップを実行（初回JITコンパイルを事前に完了）
+    代表的なサイズのダミー入力で1回ずつ実行してコンパイル済みにする
+    """
+    if not NUMBA_AVAILABLE:
+        return
+    
+    try:
+        # 代表的なサイズを想定（実際の使用状況に合わせて調整）
+        typical_pop_size = 200
+        n_obj = 2
+        
+        # ダミーデータ生成
+        dummy_objectives1 = np.array([100.0, 10.0], dtype=np.float64)
+        dummy_objectives2 = np.array([110.0, 8.0], dtype=np.float64)
+        dummy_matrix = np.random.rand(typical_pop_size, n_obj).astype(np.float64) * 1000.0
+        
+        # 各関数を1回ずつ実行してJITコンパイル
+        _ = dominates_numba(dummy_objectives1, dummy_objectives2)
+        _ = non_dominated_sort_numba(dummy_matrix)
+        _ = calculate_crowding_distance_numba(dummy_matrix)
+        
+        if NUMBA_AVAILABLE:
+            # デバッグ: コンパイル状況を確認
+            try:
+                sigs_dom = dominates_numba.nopython_signatures
+                sigs_sort = non_dominated_sort_numba.nopython_signatures
+                sigs_dist = calculate_crowding_distance_numba.nopython_signatures
+                print(f"[Numbaウォームアップ] コンパイル済みシグネチャ数: dominates={len(sigs_dom)}, sort={len(sigs_sort)}, distance={len(sigs_dist)}")
+            except AttributeError:
+                pass  # シグネチャ確認はオプショナル
+    except Exception as e:
+        print(f"[Numbaウォームアップ警告] {e}")
+
 @dataclass
 class Individual:
     """個体クラス"""
@@ -108,11 +296,16 @@ class Individual:
     crowding_distance: float = 0.0
     
     def dominates(self, other: 'Individual') -> bool:
-        """自分が他の個体を支配するかどうか判定"""
+        """自分が他の個体を支配するかどうか判定（NumPy/Numba化版）"""
         # objectivesがNoneの場合は比較できない
         if self.objectives is None or other.objectives is None:
             return False
-            
+        
+        # NumPy配列として処理
+        if isinstance(self.objectives, np.ndarray) and isinstance(other.objectives, np.ndarray):
+            return dominates_numba(self.objectives, other.objectives)
+        
+        # フォールバック（既存の実装）
         better_in_any = False
         worse_in_any = False
         
@@ -156,12 +349,24 @@ class NSGA2Agent:
             'all_solutions': []
         }
         
+        # Actor常駐化のための変数
+        self.eval_actors = None  # 再利用するActor群
+        self.env_params = None  # 環境パラメータ（Actorに直接渡す）
+        self.current_env_params_hash = None  # 現在の環境パラメータのハッシュ
+        
         # 実行ディレクトリの作成
         self.execution_dir = self.create_execution_directory()
         
         # Rayの初期化確認
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
+        
+        # Numba関数のウォームアップ（メインプロセス側で事前コンパイル）
+        if NUMBA_AVAILABLE:
+            try:
+                warmup_numba_functions()
+            except Exception as e:
+                print(f"[警告] Numbaウォームアップ失敗: {e}")
     
     def create_execution_directory(self):
         """実行ごとにディレクトリを作成"""
@@ -228,27 +433,30 @@ class NSGA2Agent:
         return unique_individuals
 
     def initialize_population(self, nb_jobs: int):
-        """多様性を考慮した初期集団の生成"""
+        """多様性を考慮した初期集団の生成（NumPy化版）"""
         self.population = []
         
-        # 1. 基本的なランダム個体（30%）
-        for _ in range(int(self.pop_size * 0.3)):
-            chromosome = [random.randint(0, 1) for _ in range(nb_jobs)]
-            self.population.append(Individual(chromosome))
+        # 1. 基本的なランダム個体（30%）- NumPy化
+        num_random = int(self.pop_size * 0.3)
+        if num_random > 0:
+            random_chromosomes = np.random.randint(0, 2, size=(num_random, nb_jobs), dtype=np.int32)
+            for chrom in random_chromosomes:
+                self.population.append(Individual(chrom.tolist()))
         
         # 2. 重み付き個体（30%）
         weighted_individuals = self.create_weighted_individuals(nb_jobs, int(self.pop_size * 0.3))
         self.population.extend(weighted_individuals)
         
-        # 3. 極端な個体（20%）
-        for _ in range(int(self.pop_size * 0.1)):
+        # 3. 極端な個体（20%）- NumPy化
+        num_extreme = int(self.pop_size * 0.1)
+        for _ in range(num_extreme):
             # すべてオンプレミス
-            all_on_premise = [0] * nb_jobs
-            self.population.append(Individual(all_on_premise))
+            all_on_premise = np.zeros(nb_jobs, dtype=np.int32)
+            self.population.append(Individual(all_on_premise.tolist()))
             
             # すべてクラウド
-            all_cloud = [1] * nb_jobs
-            self.population.append(Individual(all_cloud))
+            all_cloud = np.ones(nb_jobs, dtype=np.int32)
+            self.population.append(Individual(all_cloud.tolist()))
         
         # 4. パターン個体（20%）
         pattern_individuals = self.create_pattern_individuals(nb_jobs, int(self.pop_size * 0.2))
@@ -257,10 +465,10 @@ class NSGA2Agent:
         # 重複排除を実行
         self.population = self.eliminate_duplicate_individuals(self.population)
         
-        # 重複排除後、必要に応じて個体数を調整
+        # 重複排除後、必要に応じて個体数を調整 - NumPy化
         while len(self.population) < self.pop_size:
-            chromosome = [random.randint(0, 1) for _ in range(nb_jobs)]
-            new_individual = Individual(chromosome)
+            chromosome = np.random.randint(0, 2, size=nb_jobs, dtype=np.int32)
+            new_individual = Individual(chromosome.tolist())
             if not any(tuple(new_individual.chromosome) == tuple(ind.chromosome) for ind in self.population):
                 self.population.append(new_individual)
 
@@ -298,7 +506,12 @@ class NSGA2Agent:
     #     # この関数は使用されていないためコメントアウト
 
     def evaluate_population_ray(self, env, n_jobs=-1):
-        """Rayを使用した個体評価（multiprocessing.Poolの代わり）"""
+        """
+        Ray Actor常駐＋ray.put版の個体評価
+        - 大きいデータ（jobs_setなど）はray.putで一度だけObject Storeに置く
+        - Ray Actorを常駐させ、初期化時に環境生成＆Numbaウォームアップ
+        - 環境はreset()で再利用し、再生成コストを削減
+        """
         individuals_to_evaluate = [
             ind for ind in self.population 
             if not hasattr(ind, 'objectives') or ind.objectives is None or any(obj == 0 for obj in ind.objectives)
@@ -307,7 +520,7 @@ class NSGA2Agent:
         if not individuals_to_evaluate:
             return
         
-        # 環境パラメータを準備
+        # 環境パラメータを準備（NumPy配列はC連続・dtype統一を推奨）
         env_params = {
             'max_step': env.max_step,
             'n_window': env.n_window,
@@ -319,91 +532,283 @@ class NSGA2Agent:
             'weight_cost': env.weight_cost,
             'penalty_not_allocate': env.penalty_not_allocate,
             'penalty_invalid_action': env.penalty_invalid_action,
-            'jobs_set': env.jobs_set,
+            'jobs_set': env.jobs_set,  # NumPy配列推奨（Rayはゼロコピーで扱える）
             'flag': 0
         }
         
-        # Rayを使用した並列処理
-        @ray.remote
-        def evaluate_individual_ray(chromosome, env_params):
-            # 環境の作成と評価
-            from src.envs.scheduling_env import SchedulingEnv
-            env_copy = SchedulingEnv(**env_params)
-            return evaluate_individual_pure_step_time(env_copy, chromosome)
+        # 環境パラメータのハッシュを計算（変更検出用）
+        # jobs_setが大きい場合はハッシュの計算コストが高いため、簡易的なチェック
+        import hashlib
+        env_params_str = str(env_params)
+        env_params_hash = hashlib.md5(env_params_str.encode()).hexdigest()
         
-        # 並列実行
-        futures = [
-            evaluate_individual_ray.remote(ind.chromosome, env_params) 
-            for ind in individuals_to_evaluate
-        ]
+        # 環境パラメータが変わった場合はActorを再作成
+        recreate_actors = (
+            self.eval_actors is None or 
+            self.current_env_params_hash != env_params_hash
+        )
         
-        # 結果の収集
+        if recreate_actors:
+            # 環境パラメータを保存（辞書を直接渡す方式）
+            # Actor初期化時に一度だけシリアライズされるが、その後は再利用されるため問題なし
+            self.env_params = env_params
+            self.current_env_params_hash = env_params_hash
+            
+            # Ray Actor定義（常駐化）
+            @ray.remote(num_cpus=1)
+            class EvalActor:
+                """常駐評価Actor：環境生成・Numbaウォームアップを初期化時に実行"""
+                def __init__(self, env_params):
+                    # 環境パラメータを直接受け取る（Actor初期化時に一度だけシリアライズ）
+                    # 環境を1回だけ生成（以後はreset()で再利用）
+                    from src.envs.scheduling_env import SchedulingEnv
+                    self.env = SchedulingEnv(**env_params)
+                    try:
+                        warmup_numba_functions()
+                    except Exception as e:
+                        print(f"[EvalActor] ウォームアップ警告: {e}")
+                
+                def get_pid(self):
+                    import os
+                    return os.getpid()
+                
+                def evaluate_individual(self, chromosome):
+                    """
+                    個体評価（環境は再生成せずreset()で再利用）
+                    戻り値: [cost, makespan] の軽量配列のみ
+                    """
+                    # 環境をリセットして再利用（再生成コスト削減）
+                    self.env.reset()
+                    
+                    # 評価実行
+                    result_tuple = evaluate_individual_pure_step_time(self.env, chromosome)
+                    
+                    # evaluate_individual_pure_step_timeは ([cost, avg_waiting_time], pure_step_time) を返す
+                    # 評価結果のみを返す（軽量化）
+                    if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                        objectives, _ = result_tuple
+                        return np.array(objectives, dtype=np.float64)
+                    else:
+                        # フォールバック
+                        return np.array(result_tuple, dtype=np.float64)
+            
+            # Actor数の決定（CPUコア数に応じて調整）
+            num_workers = max(1, os.cpu_count() // 2)
+            
+            # 既存のActorをクリーンアップ
+            if self.eval_actors is not None:
+                for actor in self.eval_actors:
+                    ray.kill(actor)
+            
+            # Actorを事前に作成（初期化コストは事前に償却）
+            t_actor_start = time.perf_counter()
+            self.eval_actors = [EvalActor.remote(self.env_params) for _ in range(num_workers)]
+            # Actor初期化完了を待つ（__init__の完了を確認）
+            # Actor.__init__は同期的に実行されるため、remote呼び出しの完了で初期化済みを確認
+            # ただし、実際の初期化が完了するまで待つために、各Actorに簡単な確認処理を送る
+            if len(individuals_to_evaluate) > 0:
+                # 最初の個体の染色体長を取得
+                chrom_len = len(individuals_to_evaluate[0].chromosome)
+            else:
+                chrom_len = 32  # デフォルト値
+            # ダミー評価で初期化を確認（実際の評価とは別の軽量な確認）
+            dummy_chromosome = [0] * chrom_len
+            ray.get([actor.evaluate_individual.remote(dummy_chromosome) for actor in self.eval_actors])
+            t_actor_end = time.perf_counter()
+            actor_init_time = t_actor_end - t_actor_start
+        else:
+            # Actorを再利用
+            actor_init_time = 0.0
+        
+        num_workers = len(self.eval_actors)
+        actors = self.eval_actors
+        
+        # メトリクス計測開始
+        t_total_start = time.perf_counter()
+        t_submit_start = time.perf_counter()
+        
+        # タスク送信（round-robinでActorに割り当て）
+        futures = []
+        for i, ind in enumerate(individuals_to_evaluate):
+            actor = actors[i % num_workers]
+            futures.append(actor.evaluate_individual.remote(ind.chromosome))
+        
+        t_submit_end = time.perf_counter()
+        t_submit_time = t_submit_end - t_submit_start
+        
+        # 結果の収集（メトリクス計測）
+        t_wait_start = time.perf_counter()
         results = ray.get(futures)
+        t_wait_end = time.perf_counter()
+        t_wait_time = t_wait_end - t_wait_start
+        
+        t_total_end = time.perf_counter()
+        t_total_time = t_total_end - t_total_start
+        
+        # メトリクス出力（詳細ログ）
+        n_tasks = len(futures)
         
         # 結果を個体に割り当て
         for i, result in enumerate(results):
-            if isinstance(result, tuple) and len(result) == 2:
-                individuals_to_evaluate[i].objectives = np.array(result[0])
+            if isinstance(result, np.ndarray):
+                individuals_to_evaluate[i].objectives = result
+            elif isinstance(result, (list, tuple)):
+                individuals_to_evaluate[i].objectives = np.array(result, dtype=np.float64)
             else:
                 # エラーが発生した場合
-                individuals_to_evaluate[i].objectives = np.array([1e6, 1e6])  # 大きな有限値
+                individuals_to_evaluate[i].objectives = np.array([1e6, 1e6], dtype=np.float64)
         
-        # print(f"Ray並列処理で {len(individuals_to_evaluate)} 個体を評価完了")
+        # Actorは次の評価でも再利用されるように保持（オプション：必要に応じて終了）
+        # ここでは次の評価で再利用されることを想定して、終了しない
 
     def non_dominated_sort(self):
-        """非支配ソーティング"""
-        domination_counts = [0] * len(self.population)
-        dominated_sets = [[] for _ in range(len(self.population))]
+        """非支配ソーティング（NumPy/Numba化版）"""
+        # 評価済み個体のみを対象
+        evaluated_indices = []
+        evaluated_objectives = []
         
-        for individual in self.population:
-            individual.rank = 0
-            
-        current_rank = 1
-        for i in range(len(self.population)):
-            for j in range(len(self.population)):
-                if i != j:
-                    if self.population[i].dominates(self.population[j]):
-                        dominated_sets[i].append(j)
-                    elif self.population[j].dominates(self.population[i]):
-                        domination_counts[i] += 1
-            
-            if domination_counts[i] == 0:
-                self.population[i].rank = current_rank
+        for i, individual in enumerate(self.population):
+            if individual.objectives is not None:
+                evaluated_indices.append(i)
+                evaluated_objectives.append(individual.objectives)
+        
+        if not evaluated_objectives:
+            return
+        
+        # NumPy配列に変換
+        objectives_matrix = np.array(evaluated_objectives, dtype=np.float64)
+        
+        # NumPy/Numba化された非支配ソートを実行
+        if NUMBA_AVAILABLE:
+            ranks_array = non_dominated_sort_numba(objectives_matrix)
+        else:
+            # Numbaが利用できない場合はフォールバック
+            ranks_array = self._non_dominated_sort_fallback(objectives_matrix)
+        
+        # 結果を個体に割り当て
+        for idx, i in enumerate(evaluated_indices):
+            self.population[i].rank = int(ranks_array[idx])
+    
+    def _non_dominated_sort_fallback(self, objectives_matrix):
+        """Numbaが利用できない場合のフォールバック実装"""
+        n_pop = len(objectives_matrix)
+        ranks = np.zeros(n_pop, dtype=np.int32)
+        domination_counts = np.zeros(n_pop, dtype=np.int32)
+        dominated_sets = [[] for _ in range(n_pop)]
+        
+        # 支配関係を計算
+        for i in range(n_pop):
+            for j in range(n_pop):
+                if i == j:
+                    continue
                 
+                better_any = False
+                worse_any = False
+                
+                for k in range(objectives_matrix.shape[1]):
+                    if objectives_matrix[i, k] < objectives_matrix[j, k]:
+                        better_any = True
+                    elif objectives_matrix[i, k] > objectives_matrix[j, k]:
+                        worse_any = True
+                
+                if better_any and not worse_any:
+                    dominated_sets[i].append(j)
+                elif not better_any and worse_any:
+                    domination_counts[i] += 1
+        
+        # 第1フロントを決定
+        current_rank = 1
+        for i in range(n_pop):
+            if domination_counts[i] == 0:
+                ranks[i] = current_rank
+        
+        # 残りのフロントを決定
         while True:
-            current_members = [i for i, ind in enumerate(self.population) if ind.rank == current_rank]
-            next_front = []
+            current_members = [i for i in range(n_pop) if ranks[i] == current_rank]
+            if not current_members:
+                break
             
+            next_front = []
             for i in current_members:
                 for j in dominated_sets[i]:
                     domination_counts[j] -= 1
                     if domination_counts[j] == 0:
-                        self.population[j].rank = current_rank + 1
+                        ranks[j] = current_rank + 1
                         next_front.append(j)
-                        
+            
             if not next_front:
                 break
-                
+            
             current_rank += 1
+        
+        return ranks
             
     def calculate_crowding_distance(self):
-        """混雑度の計算"""
-        for individual in self.population:
-            individual.crowding_distance = 0.0
+        """混雑度の計算（NumPy/Numba化版）"""
+        # 評価済み個体のみを対象
+        evaluated_indices = []
+        evaluated_objectives = []
+        
+        for i, individual in enumerate(self.population):
+            if individual.objectives is not None:
+                evaluated_indices.append(i)
+                evaluated_objectives.append(individual.objectives)
+        
+        if not evaluated_objectives:
+            # 全ての個体の混雑度を0に設定
+            for individual in self.population:
+                individual.crowding_distance = 0.0
+            return
+        
+        # NumPy配列に変換
+        objectives_matrix = np.array(evaluated_objectives, dtype=np.float64)
+        
+        # NumPy/Numba化された混雑度計算を実行
+        if NUMBA_AVAILABLE:
+            crowding_distances = calculate_crowding_distance_numba(objectives_matrix)
+        else:
+            # Numbaが利用できない場合はフォールバック
+            crowding_distances = self._calculate_crowding_distance_fallback(objectives_matrix)
+        
+        # 結果を個体に割り当て
+        for idx, i in enumerate(evaluated_indices):
+            self.population[i].crowding_distance = float(crowding_distances[idx])
+        
+        # 評価されていない個体の混雑度は0のまま
+    
+    def _calculate_crowding_distance_fallback(self, objectives_matrix):
+        """Numbaが利用できない場合のフォールバック実装"""
+        n_pop = objectives_matrix.shape[0]
+        n_obj = objectives_matrix.shape[1]
+        crowding_distances = np.zeros(n_pop, dtype=np.float64)
+        
+        # 各目的関数について計算
+        for obj_idx in range(n_obj):
+            # ソートインデックスを取得
+            sorted_indices = np.argsort(objectives_matrix[:, obj_idx])
             
-        for obj_index in range(2):
-            self.population.sort(key=lambda x: x.objectives[obj_index])
+            # 最小値と最大値は無限大の混雑度
+            crowding_distances[sorted_indices[0]] = np.inf
+            crowding_distances[sorted_indices[-1]] = np.inf
             
-            self.population[0].crowding_distance = float('inf')
-            self.population[-1].crowding_distance = float('inf')
+            # 目的関数の範囲を計算
+            obj_range = (objectives_matrix[sorted_indices[-1], obj_idx] - 
+                        objectives_matrix[sorted_indices[0], obj_idx])
             
-            obj_range = self.population[-1].objectives[obj_index] - self.population[0].objectives[obj_index]
             if obj_range == 0:
                 continue
+            
+            # 中間の個体の混雑度を計算
+            for i in range(1, n_pop - 1):
+                idx = sorted_indices[i]
+                prev_idx = sorted_indices[i - 1]
+                next_idx = sorted_indices[i + 1]
                 
-            for i in range(1, len(self.population) - 1):
-                distance = (self.population[i+1].objectives[obj_index] - self.population[i-1].objectives[obj_index]) / obj_range
-                self.population[i].crowding_distance += distance
+                distance = (objectives_matrix[next_idx, obj_idx] - 
+                           objectives_matrix[prev_idx, obj_idx]) / obj_range
+                crowding_distances[idx] += distance
+        
+        return crowding_distances
                 
     def tournament_selection(self, selection_size):
         """トーナメント選択"""
@@ -428,102 +833,102 @@ class NSGA2Agent:
         return selected
         
     def crossover(self, parent1: Individual, parent2: Individual):
-        """多様な交叉戦略"""
+        """多様な交叉戦略（NumPy化版）"""
         if random.random() > self.crossover_prob:
             return parent1, parent2
+        
+        # NumPy配列に変換
+        p1 = np.array(parent1.chromosome, dtype=np.int32)
+        p2 = np.array(parent2.chromosome, dtype=np.int32)
+        n = len(p1)
         
         crossover_type = random.random()
         
         if crossover_type < 0.4:
             # 一点交叉
-            point = random.randint(1, len(parent1.chromosome) - 1)
-            child1_chromosome = parent1.chromosome[:point] + parent2.chromosome[point:]
-            child2_chromosome = parent2.chromosome[:point] + parent1.chromosome[point:]
+            point = random.randint(1, n - 1)
+            child1 = np.concatenate([p1[:point], p2[point:]])
+            child2 = np.concatenate([p2[:point], p1[point:]])
         
         elif crossover_type < 0.7:
             # 二点交叉
-            points = sorted(random.sample(range(1, len(parent1.chromosome)), 2))
-            child1_chromosome = (parent1.chromosome[:points[0]] + 
-                                parent2.chromosome[points[0]:points[1]] + 
-                                parent1.chromosome[points[1]:])
-            child2_chromosome = (parent2.chromosome[:points[0]] + 
-                                parent1.chromosome[points[0]:points[1]] + 
-                                parent2.chromosome[points[1]:])
+            points = sorted(random.sample(range(1, n), 2))
+            child1 = np.concatenate([p1[:points[0]], p2[points[0]:points[1]], p1[points[1]:]])
+            child2 = np.concatenate([p2[:points[0]], p1[points[0]:points[1]], p2[points[1]:]])
         
         else:
             # 一様交叉
-            mask = [random.randint(0, 1) for _ in range(len(parent1.chromosome))]
-            child1_chromosome = [p1 if m else p2 for p1, p2, m in zip(parent1.chromosome, parent2.chromosome, mask)]
-            child2_chromosome = [p2 if m else p1 for p1, p2, m in zip(parent1.chromosome, parent2.chromosome, mask)]
+            mask = np.random.randint(0, 2, size=n, dtype=np.int32)
+            child1 = np.where(mask, p1, p2)
+            child2 = np.where(mask, p2, p1)
         
-        child1 = Individual(child1_chromosome)
-        child2 = Individual(child2_chromosome)
+        # リストに変換してIndividualオブジェクトを作成
+        child1 = Individual(child1.tolist())
+        child2 = Individual(child2.tolist())
         
         return child1, child2
         
     def mutation(self, individual: Individual):
-        """強化された突然変異戦略"""
+        """強化された突然変異戦略（NumPy化版）"""
+        # NumPy配列に変換
+        chromosome = np.array(individual.chromosome, dtype=np.int32)
+        n = len(chromosome)
+        
         # 基本突然変異
-        for i in range(len(individual.chromosome)):
-            if random.random() < self.mutation_prob:
-                individual.chromosome[i] = 1 - individual.chromosome[i]
+        mutation_mask = np.random.random(n) < self.mutation_prob
+        chromosome[mutation_mask] = 1 - chromosome[mutation_mask]
         
         # 追加の突然変異戦略
         # 1. ビット反転（確率0.1）
         if random.random() < 0.1:
             flip_count = random.randint(1, 3)  # 1-3ビットを反転
-            flip_indices = random.sample(range(len(individual.chromosome)), flip_count)
-            for idx in flip_indices:
-                individual.chromosome[idx] = 1 - individual.chromosome[idx]
+            flip_indices = np.random.choice(n, size=min(flip_count, n), replace=False)
+            chromosome[flip_indices] = 1 - chromosome[flip_indices]
         
         # 2. 部分的な再生成（確率0.05）
         if random.random() < 0.05:
-            start = random.randint(0, len(individual.chromosome) - 8)
-            end = min(start + 8, len(individual.chromosome))
-            for i in range(start, end):
-                individual.chromosome[i] = random.randint(0, 1)
+            start = random.randint(0, max(0, n - 8))
+            end = min(start + 8, n)
+            chromosome[start:end] = np.random.randint(0, 2, size=end-start, dtype=np.int32)
+        
+        # リストに戻す
+        individual.chromosome = chromosome.tolist()
                 
     def create_weighted_individuals(self, nb_jobs: int, num_individuals: int = 20):
-        """重み付き目的関数による多様な個体生成"""
+        """重み付き目的関数による多様な個体生成（NumPy化版）"""
         weighted_individuals = []
+        
+        if num_individuals == 0:
+            return weighted_individuals
+        
+        # コストと待ち時間の重みをランダムに設定（ベクトル化）
+        cost_weights = np.random.uniform(0.1, 0.9, size=num_individuals)
         
         # 異なる重みの組み合わせで個体を生成
         for i in range(num_individuals):
-            # コストと待ち時間の重みをランダムに設定
-            cost_weight = random.uniform(0.1, 0.9)
-            makespan_weight = 1.0 - cost_weight
+            cost_weight = cost_weights[i]
             
-            # 重みに基づいて染色体を生成
-            chromosome = []
-            for j in range(nb_jobs):
-                # 重みに基づいて確率的に0または1を選択
-                if random.random() < cost_weight:
-                    # コスト重視: より多くのジョブをオンプレミスに配置
-                    chromosome.append(0)
-                else:
-                    # 待ち時間重視: より多くのジョブをクラウドに配置
-                    chromosome.append(1)
+            # 重みに基づいて染色体を生成（NumPy化）
+            random_values = np.random.random(nb_jobs)
+            chromosome = np.where(random_values < cost_weight, 0, 1).astype(np.int32)
             
-            weighted_individuals.append(Individual(chromosome))
+            weighted_individuals.append(Individual(chromosome.tolist()))
         
         return weighted_individuals
 
     def create_pattern_individuals(self, nb_jobs: int, num_individuals: int):
-        """パターンに基づく個体生成"""
+        """パターンに基づく個体生成（NumPy化版）"""
         patterns = []
         
         # 交互パターン
-        alternating = [i % 2 for i in range(nb_jobs)]
-        patterns.append(Individual(alternating))
+        alternating = np.arange(nb_jobs, dtype=np.int32) % 2
+        patterns.append(Individual(alternating.tolist()))
         
         # ブロックパターン
         block_size = max(1, nb_jobs // 4)
         for i in range(num_individuals - 1):
-            pattern = []
-            for j in range(nb_jobs):
-                block_idx = j // block_size
-                pattern.append(block_idx % 2)
-            patterns.append(Individual(pattern))
+            pattern = (np.arange(nb_jobs, dtype=np.int32) // block_size) % 2
+            patterns.append(Individual(pattern.tolist()))
         
         return patterns
 
@@ -711,15 +1116,15 @@ class NSGA2Agent:
     #     # この関数はmain.pyで定義されているためコメントアウト
 
     def inject_diversity(self, nb_jobs: int):
-        """多様性維持のためのランダム個体注入"""
+        """多様性維持のためのランダム個体注入（NumPy化版）"""
         # 最下位の10%をランダム個体で置き換え
         replace_count = max(1, self.pop_size // 10)
         
         for i in range(replace_count):
             if len(self.population) > replace_count:
-                # ランダム個体を生成
-                new_chromosome = [random.randint(0, 1) for _ in range(nb_jobs)]
-                new_individual = Individual(new_chromosome)
+                # ランダム個体を生成（NumPy化）
+                new_chromosome = np.random.randint(0, 2, size=nb_jobs, dtype=np.int32)
+                new_individual = Individual(new_chromosome.tolist())
                 
                 # 最下位の個体を置き換え
                 self.population[-(i+1)] = new_individual

@@ -68,7 +68,8 @@ class HeuristicAgent:
         
         # オンプレミスへの配置を試行
         on_premise_action = [0, 0]  # オンプレミス
-        is_valid_on_premise, wait_time_on_premise, position_on_premise = env.check_is_valid_action(on_premise_action)
+        position_on_premise, wait_time_on_premise = env.find_allocation_position(on_premise_action)
+        is_valid_on_premise = position_on_premise is not None
         
         if is_valid_on_premise:
             # ジョブの幅に応じた閾値を計算
@@ -82,7 +83,8 @@ class HeuristicAgent:
         # オンプレミスが溢れている場合はクラウドに配置
         if self.use_cloud_fallback:
             cloud_action = [0, 1]  # クラウド
-            is_valid_cloud, wait_time_cloud, position_cloud = env.check_is_valid_action(cloud_action)
+            position_cloud, wait_time_cloud = env.find_allocation_position(cloud_action)
+            is_valid_cloud = position_cloud is not None
             
             if is_valid_cloud:
                 self.stats['fallback_to_cloud'] += 1
@@ -108,16 +110,16 @@ class HeuristicAgent:
         # 実際の配置を実行
         if action == 0:  # オンプレミス
             action_array = [0, 0]
-            is_valid, wait_time, position = env.check_is_valid_action(action_array)
-            if is_valid:
+            position, wait_time = env.find_allocation_position(action_array)
+            if position is not None:
                 wait_time = env.do_schedule(action_array, env.job_queue[0], position)
                 cost = env.compute_cost(action_array, env.job_queue[0], True)
                 self.stats['on_premise_allocations'] += 1
                 return wait_time, cost, position
         else:  # クラウド
             action_array = [0, 1]
-            is_valid, wait_time, position = env.check_is_valid_action(action_array)
-            if is_valid:
+            position, wait_time = env.find_allocation_position(action_array)
+            if position is not None:
                 wait_time = env.do_schedule(action_array, env.job_queue[0], position)
                 cost = env.compute_cost(action_array, env.job_queue[0], True)
                 self.stats['cloud_allocations'] += 1

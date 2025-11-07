@@ -24,6 +24,9 @@ import os
 import ray
 import json
 import datetime
+import cProfile
+import snakeviz
+
 
 
 with open('config/config.yml', 'r') as yml:
@@ -113,6 +116,10 @@ def parse_args():
     # ヒューリスティック用の引数
     parser.add_argument('--base_threshold', type=int, default=5, help='基本待ち時間閾値')
     parser.add_argument('--width_factor', type=float, default=0.3, help='ジョブ幅の影響度（0.3 = 幅の30%）')
+    
+    # プロファイリング用の引数
+    parser.add_argument('--prof_output', type=str, default=None, 
+                      help='プロファイルoutputファイル名（拡張子なし）')
     
     return parser.parse_args()
 
@@ -691,8 +698,8 @@ def visualize_nsga2_results(result):
             fontsize=8
         )
     
-    plt.title('NSGA-IIによる最適化結果のパレートフロント', fontsize=16)
-    plt.xlabel('待ち時間（Makespan）', fontsize=14)
+    plt.title('NSGA-II_pareto', fontsize=16)
+    plt.xlabel('Makespan）', fontsize=14)
     plt.ylabel('コスト', fontsize=14)
     plt.grid(True)
     plt.legend()
@@ -1026,27 +1033,56 @@ def run_pareto_search_distributed(nb_steps: int, how_many_episodes: int, nb_jobs
     
     print(f"分散学習タスクを開始しました ({len(futures)} タスク)")
     
-    # 結果を収集
+    # 結果を収集（最適化版：複数の完了タスクを一度に取得）
     results = []
     completed = 0
     
+    # 動的に取得数を調整（ワーカー数の2倍まで、ただし残タスク数以下）
+    max_concurrent_fetch = min(num_workers * 2, weight_steps) if weight_steps > 0 else 1
+    
     while futures:
-        # 完了したタスクを取得
-        ready, futures = ray.wait(futures, num_returns=1, timeout=10.0)
+        # 複数の完了タスクを一度に待つ（最適化）
+        num_returns = min(max_concurrent_fetch, len(futures))
+        ready, remaining_futures = ray.wait(
+            futures, 
+            num_returns=num_returns,
+            timeout=30.0  # タイムアウトを適度に延長
+        )
         
-        for future in ready:
+        if ready:
+            # 完了した結果を並列に取得
             try:
-                result = ray.get(future)
-                results.append(result)
-                completed += 1
+                batch_results = ray.get(ready)
                 
-                print(f"完了 ({completed}/{weight_steps}): {result['weight_id']} - "
-                      f"wt={result['weight_wt']:.2f}, cost={result['weight_cost']:.2f}, "
-                      f"値=(cost:{result['cost']:.2f}, wt:{result['waiting_time']:.2f})")
-                
+                # 結果を即座に処理
+                for result in batch_results:
+                    results.append(result)
+                    completed += 1
+                    
+                    print(f"完了 ({completed}/{weight_steps}): {result['weight_id']} - "
+                          f"wt={result['weight_wt']:.2f}, cost={result['weight_cost']:.2f}, "
+                          f"値=(cost:{result['cost']:.2f}, wt:{result['waiting_time']:.2f})")
+            
             except Exception as e:
-                print(f"タスク実行エラー: {e}")
-                completed += 1
+                # バッチ処理中のエラーは個別に処理
+                print(f"バッチ処理エラー: {e} - {len(ready)}タスクを個別に処理")
+                for future in ready:
+                    try:
+                        result = ray.get(future)
+                        results.append(result)
+                        completed += 1
+                    except Exception as e2:
+                        print(f"タスク実行エラー: {e2}")
+                        completed += 1
+            
+            # futuresリストを更新
+            futures = remaining_futures
+        else:
+            # タイムアウト時は残りタスクを確認し、より小さいバッチで再試行
+            if len(futures) > 0:
+                max_concurrent_fetch = max(1, max_concurrent_fetch // 2)
+            else:
+                break
     
     print(f"\n全ての分散学習が完了しました。")
     
@@ -1336,9 +1372,11 @@ def visualize_distributed_pareto_results(all_results, pareto_front):
     
     print(f"visualization saved: {save_dir}/pareto_visualization_distributed_{timestamp}.png")
 
-if __name__ == "__main__":
+def main(args=None):
+    """メイン実行関数"""
     # コマンドライン引数の解析
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     if args.mode == 'pcn':
         # 強化学習モードのパラメータ設定と実行
@@ -1455,6 +1493,28 @@ if __name__ == "__main__":
         )
         print("ヒューリスティックによる実行が完了しました")
 
-
-
-
+if __name__ == "__main__":
+    # コマンドライン引数の解析
+    args = parse_args()
+    
+    # プロファイリングが有効な場合
+    if args.prof_output:
+        prof_filename = f"{args.prof_output}.prof"
+        print(f"プロファイリングを開始します。結果は {prof_filename} に保存されます。")
+        
+        # cProfileでメイン関数を実行
+        prof = cProfile.Profile()
+        prof.enable()
+        
+        try:
+            main(args)
+        finally:
+            prof.disable()
+            # プロファイル結果を保存
+            prof.dump_stats(prof_filename)
+            print(f"プロファイル結果を {prof_filename} に保存しました。")
+            print(f"可視化するには以下のコマンドを実行してください:")
+            print(f"  snakeviz {prof_filename}")
+    else:
+        # プロファイリングなしで実行
+        main(args)
