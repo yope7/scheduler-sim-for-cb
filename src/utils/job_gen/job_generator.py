@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from src.utils.job_gen.poason_job import JobSimulator
@@ -65,9 +67,29 @@ class JobGenerator:
 
         # csvファイルからジョブを読み込む
         elif self.job_type == 2:
-            jobgen = JobSimulator(self.seed, n_jobs=self.n_jobs, n_users=self.n_jobs, lam=self.lam)
+            trace_path_raw = self.config["param_job"].get("job_trace_path")
+            if trace_path_raw is None or trace_path_raw == "":
+                raise ValueError("param_job.job_trace_path が設定されていません")
+
+            repo_root = Path(__file__).resolve().parents[3]
+            trace_path = Path(trace_path_raw).expanduser()
+            if not trace_path.is_absolute():
+                trace_path = repo_root / trace_path
+            if not trace_path.exists():
+                raise FileNotFoundError(f"指定されたジョブトレースが見つかりません: {trace_path}")
+
+            n_rows = self.config["param_job"].get("job_trace_n_jobs", -1)
+            n_rows = int(n_rows) if n_rows is not None else -1
+            read_n = None if n_rows <= 0 else n_rows
+
+            jobs_df = pd.read_csv(trace_path, nrows=read_n)
+            jobs = jobs_df.values.tolist()
+
+            print(f"[JobGenerator] job trace読み込み: {trace_path} (取得件数={len(jobs)} / nrows={read_n})")
+            print("[JobGenerator] 先頭5件サンプル:", jobs[:5])
+
             for episode in range(self.nb_episodes + 1):
-                self.jobs_set[episode] = jobgen.generate_jobs(np.random.randint(0, 1000000))
+                self.jobs_set[episode] = jobs
 
         # ランダムの場合，必要な変数を指定
         elif self.job_type == 3:

@@ -8,6 +8,15 @@ import matplotlib.pyplot as plt
 from src.agents.pcn_agent import PCN  
 from src.envs.scheduling_env import SchedulingEnv
 from src.utils.job_gen.job_generator import JobGenerator
+
+# C言語実装版の環境をインポート
+try:
+    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+    C_AVAILABLE = True
+except ImportError:
+    C_AVAILABLE = False
+    SchedulingEnvCacheOptimized = None
+    print("警告: C言語実装が利用できません。Python実装を使用します。")
 from src.utils.map_visualizer import visualize_map
 from src.agents.dqn_agent import DQNAgent
 from numba import jit
@@ -20,7 +29,6 @@ from src.agents.nsga2_agent import NSGA2Agent
 from src.agents.nsga2_agent_distributed import DistributedNSGA2Agent
 from multiprocessing import Pool
 import os
-# os.environ[“RAY_DEDUP_LOGS”] = “0”
 import ray
 import json
 import datetime
@@ -585,7 +593,7 @@ def save_pareto_solutions_to_json(self, mode_name: str = "default"):
     return filename
 
 def run_nsga2_mode(nb_jobs: int, pop_size: int = 100, num_generations: int = 100):
-    """NSGA-IIモードの実行"""
+    """NSGA-IIモードの実行（C言語実装版）"""
     # 環境パラメータの設定
     next_init_windows = None
     job_generator = JobGenerator(
@@ -598,7 +606,11 @@ def run_nsga2_mode(nb_jobs: int, pop_size: int = 100, num_generations: int = 100
     jobs_set = job_generator.generate_jobs_set()
 
     print(f"生成されたjobs_set: {jobs_set}")
-    env = SchedulingEnv(
+    # C言語実装版の環境を強制使用
+    if not C_AVAILABLE:
+        raise ImportError("C言語実装版の環境（SchedulingEnvCacheOptimized）が利用できません。C実装版をビルドしてから実行してください。")
+    
+    env = SchedulingEnvCacheOptimized(
         np.inf,
         config['param_env']['n_window'],
         config['param_env']['n_on_premise_node'],
@@ -706,7 +718,7 @@ def visualize_nsga2_results(result):
     
     # 保存
     plt.tight_layout()
-    plt.savefig('nsga2_pareto_front.png')
+    # plt.savefig('nsga2_pareto_front.png')
     plt.close()
     
     # 詳細結果の表示と保存
@@ -879,15 +891,17 @@ class DistributedDQNWorker:
         """指定された重みでDQNエージェントを学習（PCNスタイル）"""
         import numpy as np
         from src.agents.dqn_agent import DQNAgent
-        from src.envs.scheduling_env import SchedulingEnv
         from src.utils.job_gen.job_generator import JobGenerator
         import time
+        
+        if not C_AVAILABLE:
+            raise ImportError("DQN分散学習にはC言語実装版の環境（SchedulingEnvCacheOptimized）が必要です。")
         
         start_time = time.time()
         print(f"Worker {weight_id}: 学習開始 - 重み[WT: {w_wt:.3f}, Cost: {w_cost:.3f}]")
         
         try:
-            # 環境の初期化（PCNスタイル）
+            # 環境の初期化（C実装版優先）
 
             job_generator = JobGenerator(
                 0, 1,
@@ -897,7 +911,7 @@ class DistributedDQNWorker:
                 self.config, nb_jobs, 0.2, 0
             )
             jobs_set = job_generator.generate_jobs_set()
-            self.env = SchedulingEnv(
+            self.env = SchedulingEnvCacheOptimized(
                 np.inf,
                 self.config['param_env']['n_window'],
                 self.config['param_env']['n_on_premise_node'],
@@ -912,11 +926,12 @@ class DistributedDQNWorker:
                 None, flag=0
             )
             
-            # エージェントの初期化
+            # エージェントの初期化（観測空間は環境から取得）
+            state_dim = self.env.observation_space.shape[0]
             agent = DQNAgent(
                 self.env,
                 device="auto",
-                state_dim=38440,
+                state_dim=state_dim,
                 learning_rate=1e-2,
                 gamma=0.95,
                 epsilon_start=1.0,

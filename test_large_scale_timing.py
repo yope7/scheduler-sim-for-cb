@@ -17,6 +17,15 @@ from typing import List, Dict, Any
 # プロジェクトのルートディレクトリをパスに追加
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# C実装環境を優先して使用（main.py準拠）
+try:
+    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+    C_AVAILABLE = True
+except ImportError:
+    SchedulingEnvCacheOptimized = None
+    C_AVAILABLE = False
+    print("警告: C言語実装が利用できません。Python実装を使用します。")
+
 from src.envs.scheduling_env import SchedulingEnv
 from src.utils.job_gen.job_generator import JobGenerator
 
@@ -85,11 +94,13 @@ def run_environment_timing_test(nb_jobs: int,
     penalty_not_allocate = config['param_env']['penalty_not_allocate']
     penalty_invalid_action = config['param_env']['penalty_invalid_action']
     
-    # 環境を初期化
-    print(f"\n環境を初期化中...")
+    # 環境を初期化（C実装があればそちらを優先）
+    env_cls = SchedulingEnvCacheOptimized if C_AVAILABLE else SchedulingEnv
+    env_label = "C実装" if C_AVAILABLE else "Python実装"
+    print(f"\n環境を初期化中...（{env_label}）")
     env_start_time = time.time()
     
-    env = SchedulingEnv(
+    env = env_cls(
         max_step, n_window, n_on_premise_node, n_cloud_node, 
         n_job_queue_obs, n_job_queue_bck,
         weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, 

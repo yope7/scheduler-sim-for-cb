@@ -12,6 +12,8 @@ from datetime import datetime
 import ray
 import copy
 import warnings
+import gc  # ガベージコレクション用
+import psutil  # メモリ情報取得用
 
 # CUDAが利用できない場合の警告を抑制
 warnings.filterwarnings('ignore', message="Can't initialize NVML")
@@ -25,15 +27,15 @@ DEBUG = False
 TIME_DEBUG = True  # 各フェーズの経過時間を表示
 ENABLE_VISUALIZATION = True
 
-N_ITERATIONS = 5  # 全体の学習イテレーション数
-N_ACTORS = 50      # 並列実行するActorの数
-N_JOBS = 5000 # ジョブ数
+N_ITERATIONS = 100  # 全体の学習イテレーション数
+N_ACTORS = 16      # 並列実行するActorの数
+N_JOBS = 32 # ジョブ数
 
 EVAL_INTERVAL = 5  # 評価を実行する間隔（イテレーション数）
 USE_DISTRIBUTED_EVAL = False  # 分散評価を使用するかどうか
 
 BATCH_SIZE = 2048
-N_UPDATES = 3
+N_UPDATES = 5  # 学習更新回数（3に減らすと高速化、精度はやや低下の可能性）
 LEARNING_RATE = 1e-2
 
 EARLY_STOPPING_PATIENCE = 5  # 改善が見られないイテレーション数
@@ -41,7 +43,7 @@ EARLY_STOPPING_THRESHOLD = 0.0001  # 改善とみなす最小変化量
 MIN_ITERATIONS = 5  # 最低限実行するイテレーション数
 
 
-INITIAL_EPISODES =  5 #初期エピソード数
+INITIAL_EPISODES =  50 #初期エピソード数
 
 USE_ENHANCED_MODEL = False  # True: EnhancedPCNModel, False: DiscreteActionsDefaultModel (3層NLPモデル)
 
@@ -51,13 +53,35 @@ SUPERVISED_BATCH_SIZE = 1024
 SUPERVISED_UPDATES_PER_EPOCH = 3 
 SUPERVISED_LEARNING_RATE = 1e-2  
 
-VISUALIZATION_INTERVAL =5  # 可視化を実行する間隔（イテレーション数）
+VISUALIZATION_INTERVAL = 5  # 可視化を実行する間隔（イテレーション数）
 
-EPISODES_PER_ITERATION = 1  # 各イテレーションで各Actorが生成するエピソード数
+EPISODES_PER_ITERATION = 2  # 各イテレーションで各Actorが生成するエピソード数
 
 EVAL_SAMPLES = 100  # 評価時に使用するサンプル数
 EVAL_SAMPLES_DISTRIBUTED = 10  # 分散評価時に使用するサンプル数
-EVAL_SAMPLES_FINAL = 50  # 最終評価時に使用するサンプル数
+EVAL_SAMPLES_FINAL = 100  # 最終評価時に使用するサンプル数
+EVAL_SAMPLES_VISUALIZATION = 20  # 反復可視化用（少なめで高速化、パレートフロントは十分描ける）
+
+# プロファイリング用: 環境変数で短時間実行モードを有効化
+_PROFILE_MODE = os.environ.get('DISTRIBUTED_PCN_PROFILE', '0') == '1'
+_QUICK_MODE = os.environ.get('DISTRIBUTED_PCN_QUICK', '0') == '1'
+# Actor-Learner非同期オーバーラップ（Learner(i)とActor(i+1)を並列実行して待ち時間を隠蔽）
+_ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
+# 高速化モード: N_UPDATESを3に削減（本番でも有効、DISTRIBUTED_PCN_FAST=1）
+_FAST_MODE = os.environ.get('DISTRIBUTED_PCN_FAST', '0') == '1'
+if _QUICK_MODE:
+    N_ITERATIONS = 3
+    N_ACTORS = 4
+    INITIAL_EPISODES = 10
+    EPISODES_PER_ITERATION = 1
+    EVAL_INTERVAL = 1
+    SUPERVISED_LEARNING_EPOCHS = 3
+    # N_UPDATESは変更しない（ハイパラメータ変更は高速化ではない）
+    ENABLE_VISUALIZATION = False
+    print("[PROFILE] クイックモード: N_ITERATIONS=3, N_ACTORS=4, INITIAL_EPISODES=10")
+elif _FAST_MODE:
+    # 削除: N_UPDATES変更はハイパラメータ変更のため高速化に含めない
+    pass
 
 from src.agents.pcn_agent import (
     PCN, 
@@ -68,6 +92,7 @@ from src.agents.pcn_agent import (
     hypervolume
 )
 from src.envs.scheduling_env import SchedulingEnv
+from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
 from src.utils.job_gen.job_generator import JobGenerator
 
 # =========================
@@ -110,6 +135,40 @@ class ReplayBuffer:
         # ログ出力を簡潔にする（100エピソードごとに表示）
         if DEBUG and len(self.buffer) % 100 == 0:
             print(f"ReplayBuffer: episode added, current size={len(self.buffer)}")
+    
+    def add_batch(self, episodes):
+        """複数のエピソードを一度に追加（シリアライゼーション最適化）"""
+        added_count = 0
+        skipped_count = 0
+        
+        for episode in episodes:
+            # エピソードのハッシュ値を計算
+            episode_hash = self._compute_episode_hash(episode)
+            
+            # 重複チェック
+            if episode_hash in self.episode_hashes:
+                skipped_count += 1
+                continue
+            
+            # バッファサイズチェック
+            if len(self.buffer) >= self.max_size:
+                # 最も古いエピソードのハッシュを削除
+                oldest_episode = self.buffer.pop(0)
+                oldest_hash = self._compute_episode_hash(oldest_episode)
+                self.episode_hashes.discard(oldest_hash)
+                # キャッシュからも削除
+                oldest_episode_id = id(oldest_episode)
+                self._hash_cache.pop(oldest_episode_id, None)
+            
+            # 新しいエピソードを追加
+            self.buffer.append(episode)
+            self.episode_hashes.add(episode_hash)
+            added_count += 1
+        
+        if DEBUG:
+            print(f"ReplayBuffer: バッチ追加完了 - 追加: {added_count}, スキップ: {skipped_count}, 現在のサイズ: {len(self.buffer)}")
+        
+        return added_count
 
     def _compute_episode_hash(self, episode):
         """エピソードの内容に基づくハッシュ値を計算（軽量版）"""
@@ -170,10 +229,49 @@ class ReplayBuffer:
         return hash_value
 
     def get_all_episodes(self):
-        """全てのエピソードを取得してバッファをクリア"""
-        import copy
+        """全てのエピソードを取得してバッファをクリア（シリアライゼーション最適化）"""
         # 深いコピーを作成して、元のオブジェクトとの参照を完全に分離
-        result = copy.deepcopy(self.buffer)
+        # ただし、観測データが既にfloat32の場合は変換しない（メモリコピーを避ける）
+        result = []
+        for episode in self.buffer:
+            # エピソードの各Transitionを軽量化
+            optimized_episode = []
+            for t in episode:
+                # 観測データをfloat32に変換（既にfloat32の場合は変換しない）
+                obs = t.observation
+                if hasattr(t.observation, 'dtype') and t.observation.dtype != np.float32:
+                    obs = np.array(t.observation, dtype=np.float32, copy=True)
+                elif hasattr(t.observation, 'copy'):
+                    obs = t.observation.copy()  # 参照を分離するためコピー
+                
+                next_obs = t.next_observation
+                if hasattr(t.next_observation, 'dtype') and t.next_observation.dtype != np.float32:
+                    next_obs = np.array(t.next_observation, dtype=np.float32, copy=True)
+                elif hasattr(t.next_observation, 'copy'):
+                    next_obs = t.next_observation.copy()  # 参照を分離するためコピー
+                
+                reward = t.reward
+                if hasattr(t.reward, 'dtype') and t.reward.dtype != np.float32:
+                    reward = np.array(t.reward, dtype=np.float32, copy=True)
+                elif hasattr(t.reward, 'copy'):
+                    reward = t.reward.copy()  # 参照を分離するためコピー
+                
+                optimized_transition = Transition(
+                    observation=obs,
+                    action=t.action,
+                    reward=reward,
+                    next_observation=next_obs,
+                    terminal=t.terminal
+                )
+                # 追加の属性もコピー
+                if hasattr(t, 'objective_values'):
+                    optimized_transition.objective_values = t.objective_values
+                if hasattr(t, 'solution_execution_time'):
+                    optimized_transition.solution_execution_time = t.solution_execution_time
+                
+                optimized_episode.append(optimized_transition)
+            result.append(optimized_episode)
+        
         self.buffer.clear()
         self.episode_hashes.clear()  # ハッシュセットもクリア
         self._hash_cache.clear()  # ハッシュキャッシュもクリア
@@ -205,6 +303,7 @@ class Actor:
         self.actor_id = actor_id
         self.env = None
         self.agent = None
+        self._weights_ref = None  # 重みのObjectRefを保持
         if DEBUG:
             print(f"Actor {actor_id} initialized")
 
@@ -224,15 +323,16 @@ class Actor:
 
     def _make_env(self):
         if self.env is None:
+            n_jobs = self.config['param_env'].get('n_jobs', N_JOBS)
             job_generator = JobGenerator(
                 0, 1,
                 self.config['param_env']['n_window'],
                 self.config['param_env']['n_on_premise_node'],
                 self.config['param_env']['n_cloud_node'],
-                self.config, N_JOBS, 0.2, 0
+                self.config, n_jobs, 0.2, 0
             )
             jobs_set = job_generator.generate_jobs_set()
-            self.env = SchedulingEnv(
+            self.env = SchedulingEnvCacheOptimized(
                 np.inf,
                 self.config['param_env']['n_window'],
                 self.config['param_env']['n_on_premise_node'],
@@ -246,6 +346,11 @@ class Actor:
                 jobs_set,
                 None, flag=0
             )
+            # C実装が正しく使用されているか確認
+            # if hasattr(self.env, '_cache_onpre_c'):
+            #     print(f"[Actor {self.actor_id}] ✓ C実装環境が正しく初期化されました")
+            # else:
+            #     print(f"[Actor {self.actor_id}] ⚠️ C実装環境の初期化に問題があります")
             
             # Actorは常にCPUで実行（Learnerとの互換性のため）
             actual_device = 'cpu'
@@ -274,25 +379,21 @@ class Actor:
         return self.env
 
     def run(self, n_episodes=10, random_actions=False):
-        # print("init env start")
         if self.env is None:
             self._make_env()
-            # print("act init env")
         
         episodes_generated = 0
         collected_episodes = []  # 収集したエピソードを一時保存
         solution_execution_times = []  # 改良された解の実行時間を記録
         
-        # 進捗表示の間隔を計算（n_episodesの10分の1）
         progress_interval = max(1, n_episodes // 10)
+        
+        if not random_actions:
+            weights = ray.get(self.learner.get_weights.remote())
+            self.agent.model.load_state_dict(weights)
         
         for ep in range(n_episodes):
             try:
-                # 最新重みをLearnerからpull
-                weights = ray.get(self.learner.get_weights.remote())
-                self.agent.model.load_state_dict(weights)
-                # print("1epi")
-                # 1エピソード実行
                 episode = self._run_episode(random_actions)
                 # print("done")
                 
@@ -316,9 +417,10 @@ class Actor:
         if DEBUG:
             print(f"[Actor {self.actor_id}] 経験収集完了。{len(collected_episodes)}エピソードをReplayBufferに追加中...")
         
-        # 全てのエピソードをReplayBufferに追加（完了を待機）
-        for episode in collected_episodes:
-            ray.get(self.buffer.add.remote(episode))  # 完了を待機
+        # 全てのエピソードをReplayBufferにバッチで追加（シリアライゼーション最適化）
+        # Learner開始前にバッファに確実に反映させるため、完了を待機
+        if len(collected_episodes) > 0:
+            ray.get(self.buffer.add_batch.remote(collected_episodes))
         
         # 改良された解の実行時間統計を表示（非ランダムアクションの場合）
         if not random_actions and solution_execution_times:
@@ -341,16 +443,15 @@ class Actor:
         done = False
         transitions = []
         
-        # 改良された解の選択から実行完了までの時間計測を開始
         solution_selection_start_time = None
         solution_execution_time = None
         
         if not random_actions:
-            # 改良された解の選択開始時刻を記録
             solution_selection_start_time = time.time()
-            
-            # Learnerから目標値を取得（改良された解の選択）
+            t_choose_start = time.time()
             desired_return, desired_horizon = ray.get(self.learner._choose_commands.remote(50))
+            if _PROFILE_MODE:
+                print(f"[PROFILE Actor {self.actor_id}] _choose_commands: {time.time()-t_choose_start:.3f}s")
             self.agent.set_desired_return_and_horizon(desired_return, desired_horizon)
             
             # print(f"[Actor {self.actor_id}] 改良された解の選択完了: 目標報酬={desired_return}, ホライズン={desired_horizon}")
@@ -363,6 +464,8 @@ class Actor:
             if DEBUG:
                 print(f"[Actor {self.actor_id}] ランダムアクション用シード設定: {episode_seed}")
         start_time = time.time()
+        step_count = 0
+        t_steps_start = time.time()
         while not done:
             if random_actions:
                 # より多様なランダム行動を生成
@@ -391,12 +494,22 @@ class Actor:
                 action = self.agent.eval(obs)
                 
             n_obs, reward, scheduled, wt_step, done = self.env.step(action)
+            step_count += 1
             
+            # 観測データをfloat32に変換してメモリ使用量を削減（シリアライゼーション最適化）
+            # 既にfloat32の場合は変換しない（メモリコピーを避ける）
+            if hasattr(obs, 'dtype') and obs.dtype != np.float32:
+                obs = np.array(obs, dtype=np.float32, copy=True)
+            if hasattr(n_obs, 'dtype') and n_obs.dtype != np.float32:
+                n_obs = np.array(n_obs, dtype=np.float32, copy=True)
             transitions.append(Transition(obs, action, np.float32(reward).copy(), n_obs, done))
             obs = n_obs
             
         # エピソード完了時に実数値を計算
         if done:
+            t_steps = time.time() - t_steps_start
+            if _PROFILE_MODE and step_count > 0:
+                print(f"[PROFILE Actor {self.actor_id}] env.step loop: {t_steps:.3f}s ({step_count} steps, {t_steps/step_count*1000:.1f}ms/step)")
             self.env.finalize_window_history()
             cost,_,avg_waiting_time = self.env.calc_objective_values()
             
@@ -450,7 +563,8 @@ class Actor:
         if self.env is None:
             self._make_env()
         
-        # 最新重みをLearnerからpull
+        # 重みを取得（共有された重みを使用）
+        # 2回のray.get()を避けるため、get_weights()を直接呼び出す
         weights = ray.get(self.learner.get_weights.remote())
         self.agent.model.load_state_dict(weights)
         
@@ -527,6 +641,7 @@ class Learner:
         self.gamma = 1.0  # 割引率
         self.last_eval_step = 0  # 最後に評価を行ったステップ
         self._hash_cache = {}  # エピソードのハッシュ値キャッシュ（idをキーとして使用）
+        self._weights_ref = None  # 重みのObjectRefを保持（重みの共有用）
         if DEBUG:
             print(f"Learner initialized with device: {self.actual_device}")
             print(f"Learner model: {'EnhancedPCNModel' if USE_ENHANCED_MODEL else 'DiscreteActionsDefaultModel'}")
@@ -536,25 +651,23 @@ class Learner:
                 print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
 
     def _get_available_device(self, requested_device):
-        """利用可能なデバイスを検出（CUDAが確実に存在する前提）"""
+        """利用可能なデバイスを検出"""
         import torch
         
         if requested_device == 'cuda':
+            if not torch.cuda.is_available():
+                if DEBUG:
+                    print("CUDAが利用できないため、CPUを使用します")
+                return 'cpu'
             # Ray環境でのGPUリソース確認（オプション）
             gpu_ids = ray.get_gpu_ids() if hasattr(ray, 'get_gpu_ids') else []
             if gpu_ids:
                 if DEBUG:
                     print(f"Ray GPU detected: {gpu_ids}")
-                # Rayが割り当てたGPUを使用
                 if len(gpu_ids) > 0:
                     torch.cuda.set_device(gpu_ids[0])
-            
-            # CUDAが確実に存在する前提でCUDAを返す
             if DEBUG:
-                print(f"Using CUDA device.")
-                print(f"CUDA device count: {torch.cuda.device_count()}")
-                print(f"Current CUDA device: {torch.cuda.current_device()}")
-                print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+                print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
             return 'cuda'
         else:
             if DEBUG:
@@ -562,15 +675,16 @@ class Learner:
             return requested_device
 
     def _make_env(self):
+        n_jobs = self.config['param_env'].get('n_jobs', N_JOBS)
         job_generator = JobGenerator(
             0, 1,
             self.config['param_env']['n_window'],
             self.config['param_env']['n_on_premise_node'],
             self.config['param_env']['n_cloud_node'],
-            self.config, N_JOBS, 0.2, 0
+            self.config, n_jobs, 0.2, 0
         )
         jobs_set = job_generator.generate_jobs_set()
-        env = SchedulingEnv(
+        env = SchedulingEnvCacheOptimized(
             np.inf,
             self.config['param_env']['n_window'],
             self.config['param_env']['n_on_premise_node'],
@@ -584,6 +698,11 @@ class Learner:
             jobs_set,
             None, flag=0
         )
+        # C実装が正しく使用されているか確認
+        if hasattr(env, '_cache_onpre_c'):
+            print("[Learner] ✓ C実装環境が正しく初期化されました")
+        else:
+            print("[Learner] ⚠️ C実装環境の初期化に問題があります")
         return env
 
     def get_weights(self):
@@ -594,6 +713,22 @@ class Learner:
         else:
             model_state = self.agent.model.state_dict()
         return {k: v.cpu() for k, v in model_state.items()}
+    
+    def get_weights_ref(self):
+        """モデルの重みのObjectRefを取得（重みの共有用）"""
+        # 既存のObjectRefがある場合はそれを返す（重みの共有を最大化）
+        # 重みが更新された場合は、update_weights_ref()が呼ばれるまで古いObjectRefを返す
+        if self._weights_ref is None:
+            # 初回のみ重みを取得してObject Storeに保存
+            weights = self.get_weights()
+            self._weights_ref = ray.put(weights)
+        return self._weights_ref
+    
+    def update_weights_ref(self):
+        """重みを更新してObjectRefを更新（学習後に呼び出す）"""
+        weights = self.get_weights()
+        self._weights_ref = ray.put(weights)
+        return self._weights_ref
 
     def _add_episode(self, transitions: List[Transition], max_size: int, step: int) -> None:
         """エピソードを経験再生バッファに追加"""
@@ -709,16 +844,22 @@ class Learner:
         """次のエピソードの目標報酬とホライズンを選択"""
         return self.agent._choose_commands(num_episodes)
 
+    def _choose_commands_batch(self, num_episodes: int, n_commands: int):
+        """複数の異なる探索方向を一括で取得（Learner呼び出しを1回に削減、各Actorに異なる目標値）"""
+        return self.agent._choose_commands_batch(num_episodes, n_commands)
+
     def learn(self, batch_size: int = 100, n_updates: int = 2) -> float:
         total_loss = []
         
         # ReplayBufferから全てのエピソードを取得（サンプリングせずに全部）
-        buffer_size = ray.get(self.buffer.size.remote())
-        if buffer_size == 0:
-            return 0.0
-        
-        # 全てのエピソードを取得
+        # buffer.size()は不要（get_all_episodes()の戻り値が空かどうかで判定できる）
+        t_get_episodes_start = time.time()
         all_episodes = ray.get(self.buffer.get_all_episodes.remote())
+        t_get_episodes = time.time() - t_get_episodes_start
+        if _PROFILE_MODE and not hasattr(self, '_learn_timings'):
+            self._learn_timings = {'get_episodes': [], 'add_episodes': [], 'update': []}
+        if _PROFILE_MODE and hasattr(self, '_learn_timings'):
+            self._learn_timings['get_episodes'].append(t_get_episodes)
         if not all_episodes:
             return 0.0
 
@@ -773,6 +914,7 @@ class Learner:
         skipped_episodes = 0
         
         # 全てのエピソードを経験再生バッファに追加
+        t_add_start = time.time()
         for episode in all_episodes:
             # 追加前のバッファサイズを記録
             before_size = len(self.agent.experience_replay)
@@ -786,6 +928,9 @@ class Learner:
                 added_episodes += 1
             else:
                 skipped_episodes += 1
+        t_add = time.time() - t_add_start
+        if _PROFILE_MODE and hasattr(self, '_learn_timings'):
+            self._learn_timings['add_episodes'].append(t_add)
         
         # 重複統計を表示
         if DEBUG:
@@ -812,6 +957,7 @@ class Learner:
         # 学習更新を実行
         # モデルは既に正しいデバイス（GPU使用時はGPU）で初期化されているため、
         # 毎回のto('cuda')/to('cpu')の転送は不要（無駄なオーバーヘッドを削減）
+        t_update_start = time.time()
         for i in range(n_updates):
             # PCNエージェントのupdateメソッドを呼び出し
             try:
@@ -855,6 +1001,15 @@ class Learner:
                     print(f"[Learner] GPU memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
             
             self.global_step += 1
+        t_update = time.time() - t_update_start
+        if _PROFILE_MODE and hasattr(self, '_learn_timings'):
+            self._learn_timings['update'].append(t_update)
+            print(f"[PROFILE Learner] get_episodes={t_get_episodes:.3f}s, add_episodes={t_add:.3f}s, update={t_update:.3f}s")
+        
+        # 学習後に重みのObjectRefを更新（全Actorで共有される）
+        # 重みが更新された場合のみObjectRefを更新
+        if total_loss and len(total_loss) > 0:
+            self.update_weights_ref()
         
         return np.mean(total_loss) if total_loss else 0.0
 
@@ -937,7 +1092,12 @@ class Learner:
 
     def update(self, learning_rate=None):
         """PCNエージェントのupdateメソッドを呼び出す"""
-        return self.agent.update(learning_rate=learning_rate)
+        loss, _ = self.agent.update(learning_rate=learning_rate)
+        # 学習後に重みのObjectRefを更新（全Actorで共有される）
+        # 重みが更新された場合のみObjectRefを更新
+        if loss is not None:
+            self.update_weights_ref()
+        return loss, _
 
     def get_global_step(self) -> int:
         """グローバルステップを取得"""
@@ -1239,6 +1399,18 @@ def main():
     # 設定ファイルの読み込み
     with open('config/config.yml', 'r') as yml:
         config = yaml.safe_load(yml)
+    
+    # スケーリングベンチマーク用: 環境変数で上書き
+    if os.environ.get('DISTRIBUTED_PCN_JOBS'):
+        config['param_env']['n_jobs'] = int(os.environ['DISTRIBUTED_PCN_JOBS'])
+    else:
+        config['param_env']['n_jobs'] = N_JOBS
+    if os.environ.get('DISTRIBUTED_PCN_ONPREM'):
+        config['param_env']['n_on_premise_node'] = int(os.environ['DISTRIBUTED_PCN_ONPREM'])
+    if os.environ.get('DISTRIBUTED_PCN_CLOUD'):
+        config['param_env']['n_cloud_node'] = int(os.environ['DISTRIBUTED_PCN_CLOUD'])
+    if _PROFILE_MODE or _QUICK_MODE:
+        print(f"[SCALE] N_JOBS={config['param_env']['n_jobs']}, onprem={config['param_env']['n_on_premise_node']}, cloud={config['param_env']['n_cloud_node']}")
 
     # Rayの初期化時にGPUリソースを明示的に指定
     import torch
@@ -1267,7 +1439,36 @@ def main():
             else:
                 print("Ray初期化: GPUが利用できないため、GPUリソースを指定しません")
     
+    # Rayのシリアライゼーション設定を最適化
+    # object_store_memoryを増やしてシリアライゼーションのオーバーヘッドを削減
+    if 'object_store_memory' not in ray_init_kwargs:
+        # エピソードデータが大きいため、object_store_memoryを増やす
+        # 1エピソードあたり約7MB、32Actor × 5エピソード = 約1120MB
+        # バッファサイズとスピルを考慮して16GBに設定（メモリが利用可能な場合）
+        # システムメモリの30%を上限とする
+        available_memory_gb = psutil.virtual_memory().available / (1024**3)
+        # 最小8GB、最大16GB、利用可能メモリの30%のうち最小値
+        suggested_memory = min(16 * 1024 * 1024 * 1024, int(available_memory_gb * 0.3 * 1024 * 1024 * 1024))
+        suggested_memory = max(8 * 1024 * 1024 * 1024, suggested_memory)  # 最低8GB
+        ray_init_kwargs['object_store_memory'] = suggested_memory
+        if DEBUG:
+            print(f"Ray object_store_memory設定: {suggested_memory / (1024**3):.1f}GB (利用可能メモリ: {available_memory_gb:.1f}GB)")
+    
+    # Rayのcompressionを有効化（シリアライゼーション時のデータサイズを削減）
+    # 環境変数で設定（ray.init()の前に設定する必要がある）
+    import os
+    if 'RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE' not in os.environ:
+        os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
+    # スピルログを抑制（必要に応じて）
+    if 'RAY_verbose_spill_logs' not in os.environ:
+        os.environ['RAY_verbose_spill_logs'] = '0'
+    
     ray.init(**ray_init_kwargs)
+    
+    # Rayのシリアライゼーション設定を最適化（ray.init()後に設定）
+    # 注意: _system_configはray.init()の引数として直接渡すことはできないため、
+    # 環境変数またはrayの設定ファイルで設定する必要があります
+    # ここでは、object_store_memoryの増加のみを実装しています
     
     # RayがGPUリソースを認識しているかどうかを確認
     # クラスターモードで実行されている場合、GPUリソースを要求しない
@@ -1297,8 +1498,12 @@ def main():
             else:
                 print(f"Learner: GPUリソースを要求しません（GPUが利用できません）")
 
-    # Replay Buffer
-    buffer = ReplayBuffer.remote(max_size=10000)
+    # Replay Buffer（メモリ使用量を削減するためサイズを調整）
+    # メモリスピルを防ぐため、max_sizeを5000に削減
+    REPLAY_BUFFER_MAX_SIZE = 5000  # 10000から5000に削減
+    buffer = ReplayBuffer.remote(max_size=REPLAY_BUFFER_MAX_SIZE)
+    if DEBUG:
+        print(f"ReplayBuffer初期化: max_size={REPLAY_BUFFER_MAX_SIZE}")
 
     learner = LearnerActor.remote(config, buffer, device='cuda')
 
@@ -1329,33 +1534,32 @@ def main():
         print(f"進捗表示間隔: {progress_interval}エピソードごと")
     
     # 各Actorで初期エピソードを実行（ランダム行動）
-    initial_futures = []
+    # 全ての初期化を並列で待つ（for文を避けて並列化を最大化）
+    try:
+        ray.get(init_futures)  # 全ての初期化を並列で待つ
+    except Exception as e:
+        print(f"一部のActorの初期化でエラーが発生: {e}")
+    
+    # 全てのエピソード生成を並列で開始（for文を避けて並列化を最大化）
+    simulation_futures = [
+        actor.run.remote(n_episodes=INITIAL_EPISODES, random_actions=True)
+        for actor in actors
+    ]
+    
+    # 全てのエピソード生成を並列で待つ
     total_episodes = 0
     completed_actors = 0
-
-    for i, (actor, init_future) in enumerate(zip(actors, init_futures)):
-        try:
-            ray.get(init_future)
-
-            simulation_future = actor.run.remote(n_episodes=INITIAL_EPISODES, random_actions=True)
-            initial_futures.append((i, simulation_future))
-        
-        except Exception as e:
-            print(f"Actor {i}の初期化でエラーが発生: {e}")
-
-    for i, future in initial_futures:
-        try:
-            episodes_generated = ray.get(future)
+    try:
+        results = ray.get(simulation_futures)  # 全ての結果を並列で取得
+        for i, episodes_generated in enumerate(results):
             total_episodes += episodes_generated
             completed_actors += 1
-            
             # 進捗を表示
             progress_percentage = (completed_actors / N_ACTORS) * 100
             if DEBUG:
                 print(f"Actor {i} の初期エピソード生成完了: {episodes_generated} エピソード (進捗: {progress_percentage:.1f}%)")
-                
-        except Exception as e:
-            print(f"Actor {i} でエラーが発生: {e}")
+    except Exception as e:
+        print(f"一部のActorのエピソード生成でエラーが発生: {e}")
 
     if DEBUG:
         print(f"合計生成エピソード数: {total_episodes}")
@@ -1393,78 +1597,38 @@ def main():
         print(f"利用率: {buffer_stats['utilization']:.2%}")
         print("=" * 30)
 
-    initial_batch = ray.get(learner.get_experience_replay.remote())
+    initial_axis_ranges = None
 
     # =========================
-    # 初期経験収集後のパレートフロント可視化
+    # フェーズ1終了時の学習データ分析（DEBUG時のみ：get_experience_replayは重い）
     # =========================
-    # final_buffer_size = ray.get(learner._get_buffer_size.remote())
-    # initial_axis_ranges = visualize_initial_pareto_front(initial_batch, save_dir=execution_dir)
-    initial_axis_ranges = None  # 可視化が無効な場合はNoneを設定
-
-    # =========================
-    # フェーズ1終了時の学習データ分析と保存
-    # =========================
-    print("\n" + "="*60)
-    print("フェーズ1終了: 学習データの分析と保存")
-    print("="*60)
-    
-    try:
-        # Learnerから学習データを取得
-        experience_replay = ray.get(learner.get_experience_replay.remote())
-        
-        if len(experience_replay) > 0:
-            print(f"✓ 学習データの分析を開始します...")
-            print(f"  エピソード数: {len(experience_replay)}")
-            
-            # 詳細分析ファイルの生成
-            analysis_file = ray.get(learner.save_learning_data_to_file.remote(
-                filename=f"phase1_learning_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                sample_size=500
-            ))
-            
-            
-            print(f"✓ フェーズ1学習データの分析完了!")
-            print(f"  詳細分析ファイル: {analysis_file}")
-            # print(f"  サンプルデータCSV: {csv_file}")
-            
-            # 簡単な統計情報の表示
-            print("\n=== フェーズ1学習データ統計 ===")
-            total_transitions = sum(len(episode[2]) for episode in experience_replay)
-            print(f"総エピソード数: {len(experience_replay)}")
-            print(f"総遷移数: {total_transitions}")
-            print(f"平均エピソード長: {total_transitions / len(experience_replay):.1f}")
-            
-            # 行動分布の確認
-            all_actions = []
-            for episode in experience_replay:
-                for transition in episode[2]:
-                    all_actions.append(transition.action)
-            
-            unique_actions, action_counts = np.unique(all_actions, return_counts=True)
-            print(f"行動分布:")
-            for action, count in zip(unique_actions, action_counts):
-                percentage = (count / len(all_actions)) * 100
-                print(f"  行動{action}: {count}回 ({percentage:.1f}%)")
-            
-            # 不均衡チェック
-            max_action_ratio = np.max(action_counts) / len(all_actions)
-            if max_action_ratio > 0.8:
-                print(f"⚠️  行動不均衡検出: {max_action_ratio:.1%}が同じ行動")
-            else:
-                print(f"✓ 行動分布はバランス良好")
-                
-        else:
-            print("⚠️  学習データが空です。フェーズ1のデータ収集を確認してください。")
-            
-    except Exception as e:
-        print(f"❌ 学習データ分析中にエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    print("\n" + "="*60)
-    print("フェーズ1完了: Enterキーを押してフェーズ2に進む")
-    print("="*60)
+    if DEBUG:
+        print("\n" + "="*60)
+        print("フェーズ1終了: 学習データの分析と保存")
+        print("="*60)
+        # try:
+        #     experience_replay = ray.get(learner.get_experience_replay.remote())
+        #     if len(experience_replay) > 0:
+        #         print(f"✓ 学習データの分析を開始します...")
+        #         analysis_file = ray.get(learner.save_learning_data_to_file.remote(
+        #             filename=f"phase1_learning_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        #             sample_size=500
+        #         ))
+        #         print(f"✓ フェーズ1学習データの分析完了! 詳細: {analysis_file}")
+        #         total_transitions = sum(len(episode[2]) for episode in experience_replay)
+        #         print(f"総エピソード数: {len(experience_replay)}, 総遷移数: {total_transitions}")
+        #         all_actions = []
+        #         for episode in experience_replay:
+        #             for transition in episode[2]:
+        #                 all_actions.append(transition.action)
+        #         unique_actions, action_counts = np.unique(all_actions, return_counts=True)
+        #         print(f"行動分布: {dict(zip(unique_actions, action_counts))}")
+        #     else:
+        #         print("⚠️  学習データが空です。")
+        # except Exception as e:
+        #     print(f"❌ 学習データ分析中にエラー: {e}")
+        #     import traceback
+        #     traceback.print_exc()
 
     # =========================
     # フェーズ2: 教師あり学習（初期エピソードを使用）
@@ -1732,28 +1896,96 @@ def main():
 
     
     # 学習ループ（改良された経験の生成）
+    # 非同期オーバーラップ: Learner(i)とActor(i+1)を並列実行して待ち時間を隠蔽
+    if _ASYNC_OVERLAP and _PROFILE_MODE:
+        print("[PROFILE] Actor-Learner非同期オーバーラップ有効")
+    
+    learner_future = None
+    next_actor_futures = None
+    
     for iteration in range(N_ITERATIONS):
-        # Actorでエピソード生成を並列実行（教師あり学習済みモデルを使用）
-        if DEBUG:
-            print("Actorが改良されたエピソードを生成中...")
-            print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
-        actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
-        
-        # Actorの並列実行完了を待機
-        actor_results = ray.get(actor_futures)
-        # print("Actorのエピソード生成完了")
-        # print(f"  総エピソード数: {sum(actor_results)}")
-        # print("  改良された解の選択〜実行完了時間の統計が各Actorで表示されました")
-        
-            # print(f"新規追加エピソード数: {buffer_size - pre_iteration_buffer_size}")
-        
-        # Learnerで学習を実行（改良された経験を使用）
-        if DEBUG:
-            print("Learnerが改良された経験で学習を実行中")
-            print("※ _nlargestメソッドにより選択された上位エピソードを使用")
-        loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES))
+        if _ASYNC_OVERLAP and N_ITERATIONS > 1:
+            # 非同期オーバーラップモード
+            if iteration == 0:
+                if DEBUG:
+                    print("Actorが改良されたエピソードを生成中...")
+                    print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
+                actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                t_actor_start = time.time()
+                actor_results = ray.get(actor_futures)
+                t_actor = time.time() - t_actor_start
+                if _PROFILE_MODE:
+                    print(f"[PROFILE Iter {iteration+1}] Actor実行: {t_actor:.3f}s (合計{sum(actor_results)}エピソード)")
+                
+                if DEBUG:
+                    print("Learnerが改良された経験で学習を実行中")
+                t_learner_start = time.time()
+                learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
+                next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                t_wait_start = time.time()
+                loss = ray.get(learner_future)
+                ray.get(next_actor_futures)  # Actor(1)完了待機（actor_resultsはActor(0)のまま）
+                t_wait = time.time() - t_wait_start
+                t_learner = time.time() - t_learner_start
+                if _PROFILE_MODE:
+                    print(f"[PROFILE Iter {iteration+1}] Learner+Actor(次)並列待機: {t_wait:.3f}s (Learner: {t_learner:.3f}s)")
+                if N_ITERATIONS > 1:
+                    learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
+                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                else:
+                    learner_future = None
+                    next_actor_futures = None
+            else:
+                t_wait_start = time.time()
+                ray.get(learner_future)  # Learner(i-1)完了
+                actor_results = ray.get(next_actor_futures)  # Actor(i)完了
+                t_wait = time.time() - t_wait_start
+                if _PROFILE_MODE:
+                    print(f"[PROFILE Iter {iteration+1}] Learner+Actor並列待機: {t_wait:.3f}s (合計{sum(actor_results)}エピソード)")
+                
+                if iteration < N_ITERATIONS - 1:
+                    learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
+                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                else:
+                    # 最終イテレーション: Learner(N-1)を実行（Actor(N-1)のデータを使用）
+                    t_learner_start = time.time()
+                    loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES))
+                    t_learner = time.time() - t_learner_start
+                    if _PROFILE_MODE:
+                        print(f"[PROFILE Iter {iteration+1}] Learner実行（最終）: {t_learner:.3f}s")
+                    learner_future = None
+                    next_actor_futures = None
+        else:
+            # 従来の逐次モード（Actor完了→Learner実行）
+            if DEBUG:
+                print("Actorが改良されたエピソードを生成中...")
+                print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
+            actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+            t_actor_start = time.time()
+            actor_results = ray.get(actor_futures)
+            t_actor = time.time() - t_actor_start
+            if _PROFILE_MODE:
+                print(f"[PROFILE Iter {iteration+1}] Actor実行: {t_actor:.3f}s (合計{sum(actor_results)}エピソード)")
+            
+            if DEBUG:
+                print("Learnerが改良された経験で学習を実行中")
+            t_learner_start = time.time()
+            loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES))
+            t_learner = time.time() - t_learner_start
+            if _PROFILE_MODE:
+                print(f"[PROFILE Iter {iteration+1}] Learner実行: {t_learner:.3f}s")
 
         print(f"イテレーション {iteration + 1} 学習完了：平均損失: {loss:.4f}")
+        
+        # メモリ解放: 学習完了後にReplayBufferをクリア（メモリスピルを防ぐため）
+        # get_all_episodes()は既にバッファをクリアするため、明示的なクリアは不要
+        # ただし、メモリ使用量を確認
+        if DEBUG and iteration % 2 == 0:  # 2イテレーションごとに確認
+            buffer_stats = ray.get(buffer.get_stats.remote())
+            print(f"[メモリ管理] ReplayBuffer統計: サイズ={buffer_stats['buffer_size']}, 利用率={buffer_stats['utilization']:.1%}")
+        
+        # ガベージコレクションを実行してメモリを解放
+        gc.collect()
         
         # 学習履歴を記録
         training_history['iterations'].append(iteration + 1)
@@ -1797,7 +2029,9 @@ def main():
             if saved_model_path and DEBUG:
                 print(f"モデルを保存しました: {saved_model_path}")
             
-            training_history['pareto_front_sizes'].append(len(e_returns))
+            # パレートフロントサイズ = 実数値空間の非支配解の数（e_returns の総数ではない）
+            non_dom_values = len(get_non_dominated_inds_minimize(np.array(e_values, dtype=np.float64)))
+            training_history['pareto_front_sizes'].append(non_dom_values)
             training_history['distances'].append(distances if len(distances) > 0 else [])
         else:
             training_history['pareto_front_sizes'].append(None)
@@ -1813,20 +2047,20 @@ def main():
             os.makedirs(save_dir, exist_ok=True)
             
             try:
-                
-                # フォントエラーの対処（グローバルインポートを使用）
                 import matplotlib.pyplot as plt
                 plt.rcParams['font.family'] = 'DejaVu Sans'
                 plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
                 
-                # 現在の状態で評価を実行してパレートフロントを取得（サンプル数を削減）
-                current_e_returns, current_e_values, current_distances, current_map_fin = ray.get(learner.evaluate.remote(n=EVAL_SAMPLES_FINAL))
+                # 評価と同時の場合はevaluate結果を再利用（二重実行を回避）
+                if (iteration + 1) % EVAL_INTERVAL == 0:
+                    current_e_returns, current_e_values = e_returns, e_values
+                else:
+                    current_e_returns, current_e_values, _, _ = ray.get(learner.evaluate.remote(n=EVAL_SAMPLES_VISUALIZATION))
                 
-                # 可視化時にもモデルを保存
-                model_save_path = f"{save_dir}/model_visualization_{iteration + 1:03d}.pth"
-                saved_model_path = ray.get(learner.save_model.remote(model_save_path))
-                if saved_model_path and DEBUG:
-                    print(f"可視化時のモデルを保存しました: {saved_model_path}")
+                # 可視化時にモデルを保存（EVAL_INTERVALと重なる場合は既に保存済みなのでスキップ）
+                if (iteration + 1) % EVAL_INTERVAL != 0:
+                    model_save_path = f"{save_dir}/model_visualization_{iteration + 1:03d}.pth"
+                    ray.get(learner.save_model.remote(model_save_path))
                 
                 if len(current_e_returns) > 0 and len(current_e_values) > 0:
                 #     # タイムスタンプを取得
@@ -1957,7 +2191,7 @@ def main():
                     
                     # タイムスタンプ付きファイル名で保存（新規作成）
                     values_plot_path = f"{save_dir}/pareto_front_values_current_{timestamp}.png"
-                    plt.savefig(values_plot_path, dpi=150, bbox_inches='tight')  # dpiを下げる
+                    plt.savefig(values_plot_path, dpi=100, bbox_inches='tight')
                     plt.close()
                     if DEBUG:
                         print(f"軽量化実数値空間パレートフロント更新: {values_plot_path}")
@@ -2045,6 +2279,7 @@ def main():
                 traceback.print_exc()
         
         # 学習後の重みを取得して確認
+        # 2回のray.get()を避けるため、get_weights()を直接呼び出す
         weights = ray.get(learner.get_weights.remote())
         if DEBUG:
             print("学習が完了し、新しい重みが生成されました")

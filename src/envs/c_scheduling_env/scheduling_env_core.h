@@ -127,6 +127,38 @@ void update_cache_time_transition(
     const int32_t* window_status    // ウィンドウの状態 (H x W)
 );
 
+// キャッシュの再構築（最適化版: バージョンチェックと差分更新を含む）
+// cache: 既存のキャッシュ（NULLの場合は新規作成）
+// window_status: ウィンドウの状態 (H x W)
+// H, W: 高さと幅
+// current_version: 現在のバージョン
+// cache_version: キャッシュのバージョン（入力出力）
+// window_changed: 変更フラグ（入力出力）
+// 戻り値: 更新されたキャッシュ（新規作成または既存）
+WindowCache* rebuild_cache_if_needed(
+    WindowCache* cache,              // 既存のキャッシュ（NULL可）
+    const int32_t* window_status,    // ウィンドウの状態 (H x W)
+    int32_t H,                       // 高さ
+    int32_t W,                       // 幅
+    int32_t current_version,         // 現在のバージョン
+    int32_t* cache_version,          // キャッシュのバージョン（入力出力）
+    bool* window_changed            // 変更フラグ（入力出力）
+);
+
+// 観測データの作成（C側で高速化）
+// output: 事前確保されたfloat32バッファ（サイズ = H_onpre*obs_window_size + H_cloud*obs_window_size + 40）
+// ウィンドウの右端obs_window_size列を抽出し、ジョブキュー5件(8属性)と連結
+void get_observation(
+    const int32_t* onpre_status,     // オンプレミスウィンドウ (H_onpre x W)
+    const int32_t* cloud_status,    // クラウドウィンドウ (H_cloud x W)
+    const double* job_queue,        // ジョブキュー (5 x 8) 行優先
+    int32_t H_onpre,
+    int32_t H_cloud,
+    int32_t W,
+    int32_t obs_window_size,
+    float* output                   // 出力バッファ
+);
+
 #ifdef __cplusplus
 }
 #endif

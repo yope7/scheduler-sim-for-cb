@@ -1,4 +1,10 @@
 """
+【非推奨】このファイルは非推奨です。
+SchedulingEnvCacheOptimizedを使用してください。
+
+このファイルは後方互換性のために残されていますが、
+新しいコードではSchedulingEnvCacheOptimizedを使用してください。
+
 C言語実装に最適化したSchedulingEnv
 データ変換とメモリコピーを最小限に抑え、C実装を最大限活用
 """
@@ -30,6 +36,9 @@ from src.envs.scheduling_env import SchedulingEnv
 
 class SchedulingEnvOptimized(SchedulingEnv):
     """
+    【非推奨】このクラスは非推奨です。
+    SchedulingEnvCacheOptimizedを使用してください。
+    
     C言語実装に最適化したSchedulingEnv
     
     最適化ポイント:
@@ -59,7 +68,7 @@ class SchedulingEnvOptimized(SchedulingEnv):
         # 初期化時にC連続配列を作成
         self._init_c_arrays()
         
-        print("C言語実装に最適化された環境を初期化しました")
+        # print("C言語実装に最適化された環境を初期化しました")
     
     def _init_c_arrays(self):
         """C連続配列を初期化（最適化）"""

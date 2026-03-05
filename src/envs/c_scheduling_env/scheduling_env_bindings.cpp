@@ -11,6 +11,7 @@ namespace py = pybind11;
 class WindowCacheWrapper {
 public:
     WindowCache* cache;
+    bool owns_cache;  // キャッシュの所有権を持つかどうか
     
     WindowCacheWrapper(py::array_t<int32_t> window_status, int32_t H, int32_t W) {
         auto buf = window_status.request();
@@ -19,10 +20,15 @@ public:
         if (!cache) {
             throw std::runtime_error("Failed to build cache");
         }
+        owns_cache = true;
+    }
+    
+    // WindowCache*から直接作成（所有権を移す）
+    WindowCacheWrapper(WindowCache* c, bool own = true) : cache(c), owns_cache(own) {
     }
     
     ~WindowCacheWrapper() {
-        if (cache) {
+        if (cache && owns_cache) {
             free_cache(cache);
         }
     }
@@ -32,8 +38,9 @@ public:
     WindowCacheWrapper& operator=(const WindowCacheWrapper&) = delete;
     
     // ムーブ許可
-    WindowCacheWrapper(WindowCacheWrapper&& other) noexcept : cache(other.cache) {
+    WindowCacheWrapper(WindowCacheWrapper&& other) noexcept : cache(other.cache), owns_cache(other.owns_cache) {
         other.cache = nullptr;
+        other.owns_cache = false;
     }
 };
 
@@ -300,5 +307,95 @@ PYBIND11_MODULE(scheduling_env_core, m) {
           "キャッシュの差分更新（時間遷移時）",
           py::arg("cache"),
           py::arg("window_status"));
+    
+    // get_observation関数
+    m.def("get_observation",
+          [](py::array_t<int32_t> onpre_status,
+             py::array_t<int32_t> cloud_status,
+             py::array_t<double> job_queue,
+             int32_t H_onpre,
+             int32_t H_cloud,
+             int32_t W,
+             int32_t obs_window_size) {
+              auto buf_onpre = onpre_status.request();
+              auto buf_cloud = cloud_status.request();
+              auto buf_job = job_queue.request();
+
+              const int32_t* onpre_ptr = static_cast<const int32_t*>(buf_onpre.ptr);
+              const int32_t* cloud_ptr = static_cast<const int32_t*>(buf_cloud.ptr);
+              const double* job_ptr = static_cast<const double*>(buf_job.ptr);
+
+              size_t out_size = H_onpre * obs_window_size + H_cloud * obs_window_size + 40;
+              py::array_t<float> output(out_size);
+              auto buf_out = output.request();
+              float* out_ptr = static_cast<float*>(buf_out.ptr);
+
+              get_observation(onpre_ptr, cloud_ptr, job_ptr,
+                             H_onpre, H_cloud, W, obs_window_size, out_ptr);
+
+              return output;
+          },
+          "観測データをC側で作成",
+          py::arg("onpre_status"),
+          py::arg("cloud_status"),
+          py::arg("job_queue"),
+          py::arg("H_onpre"),
+          py::arg("H_cloud"),
+          py::arg("W"),
+          py::arg("obs_window_size"));
+
+    // rebuild_cache_if_needed関数
+    m.def("rebuild_cache_if_needed",
+          [](py::object cache_obj,  // WindowCacheまたはNone
+             py::array_t<int32_t> window_status,
+             int32_t H,
+             int32_t W,
+             int32_t current_version,
+             int32_t cache_version,
+             bool window_changed) {
+              auto buf = window_status.request();
+              const int32_t* data = static_cast<const int32_t*>(buf.ptr);
+              
+              WindowCache* cache = nullptr;
+              
+              if (!cache_obj.is_none()) {
+                  // 既存のキャッシュを取得
+                  try {
+                      WindowCacheWrapper& wrapper = cache_obj.cast<WindowCacheWrapper&>();
+                      cache = wrapper.cache;
+                      // 所有権を移す（C関数が管理するため）
+                      wrapper.owns_cache = false;
+                  } catch (const py::cast_error&) {
+                      // キャストに失敗した場合はNoneとして扱う
+                      cache = nullptr;
+                  }
+              }
+              
+              int32_t cache_ver = cache_version;
+              bool changed = window_changed;
+              
+              // C関数を呼び出し
+              cache = rebuild_cache_if_needed(
+                  cache, data, H, W, current_version, &cache_ver, &changed
+              );
+              
+              // 結果を返す（キャッシュ、バージョン、変更フラグ）
+              if (cache) {
+                  // 新しいWindowCacheWrapperを作成（所有権を持つ）
+                  WindowCacheWrapper* wrapper = new WindowCacheWrapper(cache, true);
+                  py::object result_cache = py::cast(wrapper);
+                  return py::make_tuple(result_cache, cache_ver, changed);
+              } else {
+                  return py::make_tuple(py::none(), cache_ver, changed);
+              }
+          },
+          "キャッシュの再構築（最適化版）",
+          py::arg("cache"),
+          py::arg("window_status"),
+          py::arg("H"),
+          py::arg("W"),
+          py::arg("current_version"),
+          py::arg("cache_version"),
+          py::arg("window_changed"));
 }
 

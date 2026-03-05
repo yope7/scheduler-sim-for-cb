@@ -255,7 +255,8 @@ class DiscreteActionsDefaultModel(BasePCNModel):
         # TODO: 入力次元の最適化が必要
         # 現在: 205040次元 → 非常に重い
         # 提案: 特徴量選択や次元削減で1000-5000次元程度に削減
-        self.state_dim = 76840  # ← この値が性能ボトルネック
+        # self.state_dim = 38440  # s← この値が性能ボトルネック
+        self.state_dim = state_dim  # 観測サイズ（76840 for 512+2048 nodes, 38440 for 256+1024）
         self.s_emb = nn.Sequential(nn.Linear(self.state_dim, self.hidden_dim), nn.Sigmoid())
         self.c_emb = nn.Sequential(nn.Linear(self.reward_dim + 1, self.hidden_dim), nn.Sigmoid())
         self.fc = nn.Sequential(
@@ -951,7 +952,7 @@ class PCN(MOAgent, MOPolicy):
             episode_length = len(episode)
             
             # エピソード内のランダムなステップを選択（各ステップで学習）
-            t = np.random.randint(0, episode_length)
+            t = self.np_random.randint(0, episode_length)
             transition = episode[t]
             
             # コピーを避けて直接代入
@@ -1333,8 +1334,10 @@ class PCN(MOAgent, MOPolicy):
         # 距離ベースの優先度を計算
         distances = []
         for i, (priority, step, episode) in enumerate(nd_episodes):
-            # 非支配解からの距離を計算
-            dist = np.min(np.linalg.norm(nd_returns - nd_returns[i], axis=1))
+            # 非支配解からの距離を計算（自分自身との距離0を除外）
+            dists_to_others = np.linalg.norm(nd_returns - nd_returns[i], axis=1).copy()
+            dists_to_others[i] = np.inf  # 自分自身を除外してminが0にならないように
+            dist = np.min(dists_to_others)
             # Crowding Distanceと組み合わせ
             combined_score = crowding_distances[i] / (dist + 1e-8)
             distances.append(combined_score)
@@ -1470,6 +1473,59 @@ class PCN(MOAgent, MOPolicy):
             print("デフォルト目標ホライズン: 40")
             print("="*60)
             return np.zeros(self.reward_dim, dtype=np.float32), np.float32(40)
+
+    def _choose_commands_batch(self, num_episodes: int, n_commands: int):
+        """複数の異なる探索方向を一括で取得（各Actorに異なる目標値を割り当てるため）"""
+        episodes = self._nlargest(num_episodes)
+        
+        default_cmd = (np.zeros(self.reward_dim, dtype=np.float32), np.float32(40))
+        if len(episodes) == 0:
+            print("警告: コマンド選択用のエピソードが見つかりませんでした。デフォルト値を返します。")
+            return [default_cmd] * n_commands
+        
+        returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
+        returns_array = np.array(returns)
+        nd_i = get_non_dominated_inds(returns_array)
+        returns = returns_array[nd_i]
+        horizons = np.array(horizons)[nd_i]
+        
+        unique_returns, unique_indices = np.unique(returns, axis=0, return_index=True)
+        returns = unique_returns
+        horizons = horizons[unique_indices]
+        
+        if len(returns) == 0:
+            return [default_cmd] * n_commands
+        
+        normalized_returns = (returns - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
+        endpoints = []
+        for dim in range(returns.shape[1]):
+            min_idx = np.argmin(returns[:, dim])
+            max_idx = np.argmax(returns[:, dim])
+            endpoints.extend([min_idx, max_idx])
+        endpoints = list(set(endpoints))
+        
+        center_dists = np.linalg.norm(normalized_returns - 0.5, axis=1)
+        center_weights = 1.0 / (center_dists + 0.1)
+        for idx in endpoints:
+            center_weights[idx] *= 0.1
+        weights = center_weights / np.sum(center_weights)
+        
+        n_sample = min(n_commands, len(returns))
+        replace = n_commands > len(returns)
+        r_indices = self.np_random.choice(len(returns), size=n_commands, replace=replace, p=weights)
+        
+        results = []
+        for i in range(n_commands):
+            r_i = r_indices[i]
+            original_return = returns[r_i].copy()
+            original_horizon = np.float32(horizons[r_i] - 2)
+            normalized_current = (original_return - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
+            delta = self.np_random.uniform(0, 1, size=self.reward_dim)
+            target_normalized = np.clip(normalized_current + delta, 0, 1)
+            desired_return = np.float32(target_normalized * (returns.max(axis=0) - returns.min(axis=0)) + returns.min(axis=0))
+            results.append((desired_return, original_horizon))
+        
+        return results
 
     def _act(self, obs: np.ndarray, desired_return, desired_horizon, eval_mode=False) -> int:
         obs_tensor = th.tensor(np.array([obs]), device=self.device).float()

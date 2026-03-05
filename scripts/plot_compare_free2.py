@@ -1983,6 +1983,26 @@ pcn_best=np.array([
 [103401, 2.34375]
 ])
 
+nsga_big=np.array([
+    [4597439.00, 2610.08],
+    [2187172.00, 5314.31],
+    [4419495.00, 3212.92],
+    [4002457.00, 3494.03],
+    [2831306.00, 4891.79],
+    [1554812.00, 5842.65],
+    [1812992.00, 5586.35],
+    [3601628.00, 3887.15],
+    [2860036.00, 4626.08],
+    [3498657.00, 3992.85],
+    [2954554.00, 4537.64],
+    [3395519.00, 4058.67],
+    [3029972.00, 4535.50],
+    [3081556.00, 4289.08],
+    [3048090.00, 4439.75],
+    [3036938.00, 4490.95],
+    [3184440.00, 4216.12],
+    [3316823.00, 4075.48]
+])
 
 # plot pareto front
 # plt.scatter(pareto_front_all[:, 0], pareto_front_all[:, 1], label='Pareto Front')
@@ -2020,7 +2040,7 @@ plt.scatter(pcn_best[:, 0], pcn_best[:, 1], label='pcn',marker='x')
 # plt.scatter(nsga_try[:, 0], nsga_try[:, 1], label='nsga try')
 plt.scatter(nsga_0819[:, 0], nsga_0819[:, 1], label='nsga')
 # plt.scatter(all_morning[:, 0], all_morning[:, 1], label='all morning')
-
+plt.scatter(nsga_big[:, 0], nsga_big[:, 1], label='nsga big',marker='x')
 
 
 

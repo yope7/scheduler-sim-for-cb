@@ -17,9 +17,9 @@ from typing import List, Dict, Any
 # プロジェクトのルートディレクトリをパスに追加
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 最適化された環境をインポート
+# 最適化された環境をインポート（キャッシュ最適化版を使用）
 try:
-    from src.envs.c_scheduling_env.scheduling_env_optimized import SchedulingEnvOptimized
+    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized as SchedulingEnvOptimized
     OPTIMIZED_AVAILABLE = True
 except ImportError:
     OPTIMIZED_AVAILABLE = False

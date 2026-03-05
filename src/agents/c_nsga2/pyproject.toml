@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "pybind11>=2.6.0", "numpy>=1.19.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools.package-data]
+"*" = ["*.h", "*.c", "*.cpp"]
+
+[project]
+name = "nsga2_core"
+version = "0.1.0"
+description = "NSGA-II C言語実装のPythonバインディング"
+requires-python = ">=3.7"
+dependencies = [
+    "pybind11>=2.6.0",
+    "numpy>=1.19.0",
+]
+authors = [
+    {name = "Your Name"}
+]
+

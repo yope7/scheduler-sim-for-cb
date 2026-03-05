@@ -209,6 +209,11 @@ weights/
 /debug_learning_data*/
 /distributed_*/
 /data/
+/CANDAR_resdata/
+job_trace/
+mds/
+old/
+origin_paper/
 
 # サブディレクトリ内の.pngファイルは無視しない
 !*/**/*.png
@@ -217,4 +222,6 @@ weights/
 *.gif
 *.png
 *.prof
-*.html*
+*.html
+*.txt
+*.csv

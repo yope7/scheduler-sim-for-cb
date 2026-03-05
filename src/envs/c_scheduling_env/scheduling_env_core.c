@@ -313,7 +313,7 @@ AllocationResult find_allocation_position(
     return result;
 }
 
-// 時間遷移（スライドウィンドウ）
+// 時間遷移（スライドウィンドウ、最適化版）
 void time_transition(
     int32_t* window_status,
     int32_t* window_job_id,
@@ -325,15 +325,21 @@ void time_transition(
         return;
     }
     
-    // 左シフト（各列を1つ左に移動）
+    // 左シフト（各列を1つ左に移動、最適化版）
+    // 各行ごとにmemmoveを使用してメモリコピーを最適化
+    const int32_t shift_size = (W - 1) * sizeof(int32_t);
+    
     for (int32_t i = 0; i < H; i++) {
-        for (int32_t j = 0; j < W - 1; j++) {
-            window_status[i * W + j] = window_status[i * W + (j + 1)];
-            window_job_id[i * W + j] = window_job_id[i * W + (j + 1)];
-        }
+        int32_t* status_row = window_status + i * W;
+        int32_t* job_id_row = window_job_id + i * W;
+        
+        // memmoveを使用して左シフト（オーバーラップを考慮）
+        memmove(status_row, status_row + 1, shift_size);
+        memmove(job_id_row, job_id_row + 1, shift_size);
+        
         // 最後の列をクリア
-        window_status[i * W + (W - 1)] = 0;
-        window_job_id[i * W + (W - 1)] = -1;
+        status_row[W - 1] = 0;
+        job_id_row[W - 1] = -1;
     }
 }
 
@@ -368,7 +374,8 @@ void do_schedule(
         // 分散割り当て
         int32_t a = position->pos.distributed.a;
         int32_t* node_allocation = position->pos.distributed.node_allocation;
-        int32_t allocation_size = position->pos.distributed.allocation_size;
+        // allocation_sizeは使用されていない（job_width * job_heightで計算可能）
+        // int32_t allocation_size = position->pos.distributed.allocation_size;
         
         int32_t idx = 0;
         for (int32_t col_offset = 0; col_offset < job_width; col_offset++) {
@@ -560,7 +567,7 @@ void update_cache_incremental(
     }
 }
 
-// キャッシュの差分更新（時間遷移時）
+// キャッシュの差分更新（時間遷移時、最適化版）
 void update_cache_time_transition(
     WindowCache* cache,
     const int32_t* window_status
@@ -573,7 +580,7 @@ void update_cache_time_transition(
     int32_t W = cache->W;
     
     // 時間遷移は左にシフトするため、全列を更新する必要がある
-    // ただし、効率的に更新する
+    // 最適化: メモリ割り当てを削減し、計算を効率化
     
     // 1. free_per_colの更新（全列を更新）
     for (int32_t col = 0; col < W; col++) {
@@ -586,35 +593,43 @@ void update_cache_time_transition(
         cache->free_per_col[col] = free_count;
     }
     
-    // 2. occの更新（全領域を更新）
+    // 2. occの更新（全領域を更新、最適化: ループを1つに統合）
     for (int32_t i = 0; i < H * W; i++) {
         cache->occ[i] = (window_status[i] != 0) ? 1 : 0;
     }
     
-    // 3. prefix_sumの更新（全領域を更新）
+    // 3. prefix_sumの更新（全領域を更新、最適化: メモリアクセスを最適化）
     for (int32_t i = 1; i <= H; i++) {
+        int32_t prefix_row = i * (W + 1);
+        int32_t prefix_row_prev = (i - 1) * (W + 1);
+        int32_t occ_row = (i - 1) * W;
+        
         for (int32_t j = 1; j <= W; j++) {
-            int32_t idx = i * (W + 1) + j;
-            int32_t occ_idx = (i - 1) * W + (j - 1);
+            int32_t idx = prefix_row + j;
+            int32_t occ_idx = occ_row + (j - 1);
             cache->prefix_sum[idx] = cache->occ[occ_idx]
-                + cache->prefix_sum[(i - 1) * (W + 1) + j]
-                + cache->prefix_sum[i * (W + 1) + (j - 1)]
-                - cache->prefix_sum[(i - 1) * (W + 1) + (j - 1)];
+                + cache->prefix_sum[prefix_row_prev + j]
+                + cache->prefix_sum[prefix_row + (j - 1)]
+                - cache->prefix_sum[prefix_row_prev + (j - 1)];
         }
     }
     
-    // 4. free_nodes_listの更新（全列を更新）
+    // 4. free_nodes_listの更新（全列を更新、最適化: メモリ再割り当てを削減）
     for (int32_t col = 0; col < W; col++) {
-        // 既存のリストを解放
-        if (cache->free_nodes_list[col].nodes) {
-            free(cache->free_nodes_list[col].nodes);
+        int32_t free_count = cache->free_per_col[col];
+        
+        // 既存のメモリサイズをチェック（再割り当てを削減）
+        if (cache->free_nodes_list[col].size != free_count) {
+            // サイズが変わった場合のみ再割り当て
+            if (cache->free_nodes_list[col].nodes) {
+                free(cache->free_nodes_list[col].nodes);
+            }
+            cache->free_nodes_list[col].size = free_count;
+            cache->free_nodes_list[col].nodes = (int32_t*)malloc(free_count * sizeof(int32_t));
         }
+        // サイズが同じ場合は既存のメモリを再利用
         
         // 新しいリストを構築
-        int32_t free_count = cache->free_per_col[col];
-        cache->free_nodes_list[col].size = free_count;
-        cache->free_nodes_list[col].nodes = (int32_t*)malloc(free_count * sizeof(int32_t));
-        
         if (cache->free_nodes_list[col].nodes) {
             int32_t idx = 0;
             for (int32_t row = 0; row < H; row++) {
@@ -623,6 +638,77 @@ void update_cache_time_transition(
                 }
             }
         }
+    }
+}
+
+// キャッシュの再構築（最適化版: バージョンチェックと差分更新を含む）
+WindowCache* rebuild_cache_if_needed(
+    WindowCache* cache,
+    const int32_t* window_status,
+    int32_t H,
+    int32_t W,
+    int32_t current_version,
+    int32_t* cache_version,
+    bool* window_changed
+) {
+    // 初回構築またはバージョン不一致の場合は全面再構築
+    if (cache == NULL || *cache_version != current_version) {
+        // 既存のキャッシュを解放
+        if (cache != NULL) {
+            free_cache(cache);
+        }
+        
+        // 新規キャッシュを構築
+        cache = build_cache(window_status, H, W);
+        if (cache) {
+            cache->version = current_version;
+            *cache_version = current_version;
+            *window_changed = false;  // フラグをリセット
+        }
+        return cache;
+    }
+    
+    // 変更フラグが立っている場合は差分更新
+    if (*window_changed) {
+        update_cache_time_transition(cache, window_status);
+        *window_changed = false;  // フラグをリセット
+    }
+    
+    return cache;
+}
+
+// 観測データの作成（ウィンドウ右端のスライス + ジョブキュー）
+void get_observation(
+    const int32_t* onpre_status,
+    const int32_t* cloud_status,
+    const double* job_queue,
+    int32_t H_onpre,
+    int32_t H_cloud,
+    int32_t W,
+    int32_t obs_window_size,
+    float* output
+) {
+    int32_t out_idx = 0;
+    int32_t col_start = W - obs_window_size;
+    if (col_start < 0) col_start = 0;
+
+    /* オンプレミス: 右端 obs_window_size 列を float32 で出力 */
+    for (int32_t row = 0; row < H_onpre; row++) {
+        for (int32_t col = col_start; col < W; col++) {
+            output[out_idx++] = (float)onpre_status[row * W + col];
+        }
+    }
+
+    /* クラウド: 同様 */
+    for (int32_t row = 0; row < H_cloud; row++) {
+        for (int32_t col = col_start; col < W; col++) {
+            output[out_idx++] = (float)cloud_status[row * W + col];
+        }
+    }
+
+    /* ジョブキュー: 先頭5件 x 8属性 */
+    for (int32_t i = 0; i < 5 * 8 && job_queue; i++) {
+        output[out_idx++] = (float)job_queue[i];
     }
 }
 
