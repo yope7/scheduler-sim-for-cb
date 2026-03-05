@@ -22,7 +22,7 @@ try:
     print("✓ C言語実装のインポートに成功しました")
 except ImportError as e:
     print(f"✗ C言語実装のインポートに失敗しました: {e}")
-    print("ビルドしてください: cd src/envs/c_scheduling_env && pip install -e .")
+    print("ビルドしてください: uv sync")
     sys.exit(1)
 
 

@@ -27,7 +27,7 @@ DEBUG = False
 TIME_DEBUG = True  # 各フェーズの経過時間を表示
 ENABLE_VISUALIZATION = True
 
-N_ITERATIONS = 100  # 全体の学習イテレーション数
+N_ITERATIONS = 10  # 全体の学習イテレーション数
 N_ACTORS = 16      # 並列実行するActorの数
 N_JOBS = 32 # ジョブ数
 

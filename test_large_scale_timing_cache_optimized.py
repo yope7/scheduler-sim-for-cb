@@ -24,7 +24,7 @@ except ImportError:
     CACHE_OPTIMIZED_AVAILABLE = False
     print("警告: キャッシュ最適化版の環境が利用できません。")
     print("以下のコマンドで確認してください:")
-    print("  cd src/envs/c_scheduling_env && pip install -e .")
+    print("  uv sync")
     sys.exit(1)
 
 from src.utils.job_gen.job_generator import JobGenerator

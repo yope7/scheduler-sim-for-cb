@@ -12,7 +12,7 @@ except ImportError:
     PYBIND11_AVAILABLE = False
     print("エラー: pybind11がインストールされていません。")
     print("以下のコマンドでインストールしてください:")
-    print("  pip install pybind11")
+    print("  uv sync")
     sys.exit(1)
 
 # コンパイラフラグ（C++としてコンパイル）

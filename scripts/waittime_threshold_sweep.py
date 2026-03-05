@@ -43,7 +43,7 @@ def build_env(config: Dict, jobs_set: Dict) -> "SchedulingEnvCacheOptimized":
     if not C_AVAILABLE or SchedulingEnvCacheOptimized is None:
         raise ImportError(
             "C言語実装版の環境（SchedulingEnvCacheOptimized）が利用できません。"
-            "先に `cd src/envs/c_scheduling_env && pip install -e .` でビルドしてください。"
+            "先に `uv sync` でプロジェクトをセットアップしてください。"
         )
     return SchedulingEnvCacheOptimized(
         max_step=np.inf,

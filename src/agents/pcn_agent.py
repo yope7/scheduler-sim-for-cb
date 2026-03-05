@@ -952,7 +952,7 @@ class PCN(MOAgent, MOPolicy):
             episode_length = len(episode)
             
             # エピソード内のランダムなステップを選択（各ステップで学習）
-            t = self.np_random.randint(0, episode_length)
+            t = self.np_random.integers(0, episode_length)
             transition = episode[t]
             
             # コピーを避けて直接代入

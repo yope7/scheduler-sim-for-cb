@@ -33,7 +33,7 @@ except ImportError:
     C_AVAILABLE = False
     print("警告: C言語実装が利用できません。ビルドしてください。")
     print("以下のコマンドでビルドしてください:")
-    print("  cd src/envs/c_scheduling_env && pip install -e .")
+    print("  uv sync")
     sys.exit(1)
 
 from src.envs.scheduling_env import SchedulingEnv

@@ -7,8 +7,8 @@
 ### ステップ1: C言語実装のビルドとテスト
 
 ```bash
-cd src/envs/c_scheduling_env
-pip install -e .
+# プロジェクトルートで
+uv sync
 python test_c_implementation.py
 ```
 

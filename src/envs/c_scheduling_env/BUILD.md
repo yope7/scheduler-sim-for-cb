@@ -10,22 +10,22 @@
 ## インストール
 
 ```bash
-# プロジェクトのルートディレクトリから
-cd src/envs/c_scheduling_env
-
-# 依存関係をインストール（必須）
-pip install pybind11 numpy
-
-# C言語実装をビルドしてインストール
-pip install -e .
+# プロジェクトのルートディレクトリから（推奨）
+uv sync
 ```
 
-**注意**: `pybind11`と`numpy`は事前にインストールする必要があります。
+個別にビルドする場合：
+
+```bash
+cd src/envs/c_scheduling_env
+uv pip install -e .
+```
 
 ## デバッグモードでビルド
 
 ```bash
-DEBUG=true pip install -e .
+cd src/envs/c_scheduling_env
+DEBUG=true uv pip install -e .
 ```
 
 ## テスト
@@ -43,7 +43,7 @@ python benchmark_comparison.py
 ### コンパイルエラー
 
 - **エラー**: `pybind11/pybind11.h: No such file or directory`
-  - **解決**: `pip install pybind11` を実行
+  - **解決**: `uv sync` を実行
 
 - **エラー**: `undefined reference to 'build_cache'`
   - **解決**: C言語ファイル（.c）がコンパイルされているか確認
@@ -51,7 +51,7 @@ python benchmark_comparison.py
 ### インポートエラー
 
 - **エラー**: `ModuleNotFoundError: No module named 'scheduling_env_core'`
-  - **解決**: `pip install -e .` を実行してビルド
+  - **解決**: `uv sync` を実行してビルド
 
 ### パフォーマンスが期待通りでない場合
 

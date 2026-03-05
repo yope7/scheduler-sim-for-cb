@@ -14,7 +14,7 @@ except ImportError as e:
     # 念のためエラーメッセージを表示
     print(f"エラー: pybind11のインポートに失敗しました: {e}")
     print("以下のコマンドでインストールしてください:")
-    print("  pip install pybind11")
+    print("  uv sync")
     print("または、pyproject.tomlでビルド依存関係が正しく設定されているか確認してください。")
     # PEP 517ビルドでは、setup.pyが実行される前に依存関係がインストールされるため、
     # ここでsys.exit(1)を呼ぶとビルドが失敗します

@@ -4,25 +4,24 @@ NSGA-IIアルゴリズムのコア部分をC言語で実装し、pybind11でPyth
 
 ## ビルド方法
 
-仮想環境を使用する場合：
+プロジェクトルートから一括セットアップ（推奨）：
+
+```bash
+# プロジェクトルートで
+uv sync
+```
+
+個別にビルドする場合：
 
 ```bash
 cd src/agents/c_nsga2
-# 仮想環境をアクティベート
-source /path/to/venv/bin/activate  # または適切な仮想環境
-pip install -e .
+uv pip install -e .
 ```
 
 デバッグモードでビルドする場合：
 
 ```bash
-DEBUG=true pip install -e .
-```
-
-システムパッケージを使用する場合（推奨されません）：
-
-```bash
-pip install -e . --break-system-packages
+DEBUG=true uv pip install -e .
 ```
 
 ## 実装された関数

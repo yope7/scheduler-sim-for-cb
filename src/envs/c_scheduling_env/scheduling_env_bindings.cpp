@@ -380,14 +380,15 @@ PYBIND11_MODULE(scheduling_env_core, m) {
               );
               
               // 結果を返す（キャッシュ、バージョン、変更フラグ）
+              py::object result_cache;
               if (cache) {
                   // 新しいWindowCacheWrapperを作成（所有権を持つ）
                   WindowCacheWrapper* wrapper = new WindowCacheWrapper(cache, true);
-                  py::object result_cache = py::cast(wrapper);
-                  return py::make_tuple(result_cache, cache_ver, changed);
+                  result_cache = py::cast(wrapper);
               } else {
-                  return py::make_tuple(py::none(), cache_ver, changed);
+                  result_cache = py::none();
               }
+              return py::make_tuple(result_cache, cache_ver, changed);
           },
           "キャッシュの再構築（最適化版）",
           py::arg("cache"),

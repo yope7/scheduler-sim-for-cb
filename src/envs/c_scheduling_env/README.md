@@ -5,14 +5,15 @@ SchedulingEnvのコア部分をC言語で実装し、pybind11でPythonバイン�
 ## ビルド方法
 
 ```bash
-cd src/envs/c_scheduling_env
-pip install -e .
+# プロジェクトルートで（推奨）
+uv sync
 ```
 
-デバッグモードでビルドする場合：
+個別ビルド・デバッグモードの場合：
 
 ```bash
-DEBUG=true pip install -e .
+cd src/envs/c_scheduling_env
+DEBUG=true uv pip install -e .
 ```
 
 ## 使用方法

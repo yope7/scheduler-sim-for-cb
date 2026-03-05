@@ -72,7 +72,7 @@ def run_with_pyspy(duration: int, output_path: str):
     try:
         import py_spy
     except ImportError:
-        print("py-spyがインストールされていません。pip install py-spy でインストールしてください")
+        print("py-spyがインストールされていません。uv add py-spy でインストールしてください")
         sys.exit(1)
     
     os.environ['DISTRIBUTED_PCN_QUICK'] = '1'

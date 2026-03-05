@@ -96,8 +96,8 @@ src/envs/c_scheduling_env/
 ### ビルド
 
 ```bash
-cd src/envs/c_scheduling_env
-pip install -e .
+# プロジェクトルートで
+uv sync
 ```
 
 ### 基本的な使用

@@ -3,12 +3,8 @@
 ## ビルドとインストール
 
 ```bash
-# 1. 依存関係をインストール
-cd src/envs/c_scheduling_env
-pip install pybind11 numpy
-
-# 2. C言語実装をビルドしてインストール
-pip install -e .
+# プロジェクトルートで一括セットアップ（推奨）
+uv sync
 ```
 
 ## テスト
