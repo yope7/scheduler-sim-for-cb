@@ -225,3 +225,13 @@ origin_paper/
 *.html
 *.txt
 *.csv
+dqn_models_32/
+# artifacts
+/dqn_models_32/
+/weights/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npy
+*.npz
