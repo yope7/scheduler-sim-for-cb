@@ -1869,8 +1869,14 @@ class PCN(MOAgent, MOPolicy):
                 print(f"モデルファイルが見つかりません: {model_path} および {latest_path}")
                 return
 
-        # state_dictを読み込む
-        state_dict = th.load(model_path, map_location=self.device)
+        # state_dictまたはモデルオブジェクトを読み込む
+        loaded = th.load(model_path, map_location=self.device, weights_only=False)
+
+        # モデル全体が保存されている場合（PCN_origin.py形式）はstate_dictを抽出
+        if isinstance(loaded, th.nn.Module):
+            state_dict = loaded.state_dict()
+        else:
+            state_dict = loaded
 
         try:
             if self.use_enhanced_model:

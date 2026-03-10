@@ -1,6 +1,6 @@
 import numpy as np
 import itertools
-from morl_baselines.common.pareto import get_non_dominated_inds_minimize
+from src.agents.pcn_agent import get_non_dominated_inds_minimize
 from numba import jit
 from typing import List, Dict, Tuple
 from src.envs.scheduling_env import SchedulingEnv

@@ -1,0 +1,76 @@
+Bootstrap: docker
+From: python:3.11-bookworm
+
+%labels
+    Author scheduler-sim-for-cb
+    Version 0.1.0
+    Description Singularity image for distributed_pcn.py (scheduler simulation)
+
+%help
+    distributed_pcn.py を Singularity で実行するためのイメージです。
+    
+    実行例:
+      # デフォルト（distributed_pcn）
+      singularity exec -B /path/to/output:/output scheduler-sim.sif
+    
+      # スクリプトを指定（run_distributed_pcn_sweep.py など）
+      SCHEDULER_SIM_SCRIPT=/app/scripts/run_distributed_pcn_sweep.py singularity exec -B ... scheduler-sim.sif --quick
+    
+    環境変数:
+      SCHEDULER_SIM_SCRIPT     - 実行するPythonスクリプト（省略時は src.distributed.distributed_pcn）
+      DISTRIBUTED_PCN_CONFIG   - 設定ファイルパス（デフォルト: config/config.yml）
+      DISTRIBUTED_PCN_OUTPUT_DIR - 出力ディレクトリ（デフォルト: .）
+      DISTRIBUTED_PCN_WORKDIR - 作業ディレクトリ（相対パス解決の基準）
+      DISTRIBUTED_PCN_QUICK   - 1 でクイックモード
+      DISTRIBUTED_PCN_FAST    - 1 で高速モード
+
+%environment
+    export MPLBACKEND=Agg
+    export PYTHONUNBUFFERED=1
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        g++ \
+        && rm -rf /var/lib/apt/lists/*
+
+    # プロジェクトを /app にコピー（ビルド時は空、実行時に -B でマウントする想定）
+    mkdir -p /app
+    # ビルド時にコンテキストからコピーするため、%files で対応
+
+%files
+    # ビルド時: cd /path/to/scheduler-sim-for-cb && singularity build scheduler-sim.sif singularity/scheduler-sim.def
+    # パスはビルド実行時のカレントディレクトリ（プロジェクトルート）基準
+    src /app/src
+    config /app/config
+    scripts /app/scripts
+    pyproject.toml /app/pyproject.toml
+
+%post
+    cd /app
+
+    # job_trace はオプション（job_type=2 の場合、実行時に -B でマウント）
+    mkdir -p /app/job_trace
+
+    # C拡張ビルド用
+    pip install --no-cache-dir pybind11 numpy
+
+    # ワークスペースメンバー（C拡張）をインストール
+    pip install --no-cache-dir -e ./src/envs/c_scheduling_env
+    pip install --no-cache-dir -e ./src/agents/c_nsga2
+
+    # メインプロジェクトをインストール
+    pip install --no-cache-dir -e .
+
+%runscript
+    cd /app
+    if [ -n "$SCHEDULER_SIM_SCRIPT" ]; then
+        exec python "$SCHEDULER_SIM_SCRIPT" "$@"
+    else
+        exec python -m src.distributed.distributed_pcn "$@"
+    fi
+
+%startscript
+    # バックグラウンド実行用（未使用時は無視してよい）
+    cd /app
+    exec python -m src.distributed.distributed_pcn "$@"

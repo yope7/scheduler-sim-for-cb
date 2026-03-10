@@ -24,7 +24,8 @@ from src.agents.all_agent import ExhaustiveSearchAgent
 from src.agents.all_agent_distributed import ExhaustiveSearchAgentDistributed
 np.set_printoptions(linewidth=np.inf) 
 import itertools
-from morl_baselines.common.pareto import get_non_dominated_inds, get_non_dominated_inds_minimize
+from morl_baselines.common.pareto import get_non_dominated_inds
+from src.agents.pcn_agent import get_non_dominated_inds_minimize
 from src.agents.nsga2_agent import NSGA2Agent
 from src.agents.nsga2_agent_distributed import DistributedNSGA2Agent
 from multiprocessing import Pool
@@ -33,7 +34,6 @@ import ray
 import json
 import datetime
 import cProfile
-import snakeviz
 
 
 

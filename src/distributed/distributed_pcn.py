@@ -7,6 +7,11 @@ import torch.nn.functional as F
 import heapq
 import os
 from typing import List, Tuple, Optional, Union
+
+# Singularity/コンテナ環境向け: ヘッドレスでmatplotlibを使用（ディスプレイ不要）
+if os.environ.get('MPLBACKEND') != 'Agg':
+    import matplotlib
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime
 import ray
@@ -70,15 +75,15 @@ _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
 # 高速化モード: N_UPDATESを3に削減（本番でも有効、DISTRIBUTED_PCN_FAST=1）
 _FAST_MODE = os.environ.get('DISTRIBUTED_PCN_FAST', '0') == '1'
 if _QUICK_MODE:
-    N_ITERATIONS = 3
-    N_ACTORS = 4
-    INITIAL_EPISODES = 10
+    N_ITERATIONS = 5
+    N_ACTORS = 12
+    INITIAL_EPISODES = 100
     EPISODES_PER_ITERATION = 1
-    EVAL_INTERVAL = 1
-    SUPERVISED_LEARNING_EPOCHS = 3
+    EVAL_INTERVAL = 5
+    SUPERVISED_LEARNING_EPOCHS = 10
     # N_UPDATESは変更しない（ハイパラメータ変更は高速化ではない）
-    ENABLE_VISUALIZATION = False
-    print("[PROFILE] クイックモード: N_ITERATIONS=3, N_ACTORS=4, INITIAL_EPISODES=10")
+    ENABLE_VISUALIZATION = True
+    print("[PROFILE] クイックモード: N_ITERATIONS=5, N_ACTORS=12, INITIAL_EPISODES=100")
 elif _FAST_MODE:
     # 削除: N_UPDATES変更はハイパラメータ変更のため高速化に含めない
     pass
@@ -1383,9 +1388,18 @@ def main():
     import matplotlib.pyplot as plt
     import os
     
+    # Singularity等: 作業ディレクトリを環境変数で指定可能（相対パス解決の基準）
+    workdir = os.environ.get('DISTRIBUTED_PCN_WORKDIR')
+    if workdir and os.path.isdir(workdir):
+        os.chdir(workdir)
+        if DEBUG:
+            print(f"[DISTRIBUTED_PCN] 作業ディレクトリ: {os.getcwd()}")
+    
     # 実行用のディレクトリを作成
+    # 環境変数 DISTRIBUTED_PCN_OUTPUT_DIR で出力先を指定可能（Singularity等でマウント先を指定）
+    output_base = os.environ.get('DISTRIBUTED_PCN_OUTPUT_DIR', '.')
     execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    execution_dir = f"execution_{execution_timestamp}"
+    execution_dir = os.path.join(output_base, f"execution_{execution_timestamp}")
     os.makedirs(execution_dir, exist_ok=True)
     
     if TIME_DEBUG:
@@ -1397,7 +1411,15 @@ def main():
         print(f"{'='*60}")
     
     # 設定ファイルの読み込み
-    with open('config/config.yml', 'r') as yml:
+    # 環境変数 DISTRIBUTED_PCN_CONFIG で設定ファイルパスを指定可能（Singularity等でマウント先を指定）
+    config_path = os.environ.get('DISTRIBUTED_PCN_CONFIG', 'config/config.yml')
+    if not os.path.isabs(config_path):
+        # 相対パスの場合、プロジェクトルート基準
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        config_path = os.path.join(repo_root, config_path)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"設定ファイルが見つかりません: {config_path} (DISTRIBUTED_PCN_CONFIG でパスを指定してください)")
+    with open(config_path, 'r') as yml:
         config = yaml.safe_load(yml)
     
     # スケーリングベンチマーク用: 環境変数で上書き

@@ -1,4 +1,4 @@
-from morl_baselines.common.pareto import get_non_dominated_inds_minimize
+from src.agents.pcn_agent import get_non_dominated_inds_minimize
 import numpy as np
 
 data_all = np.array([

@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple, Optional
 import os
 import datetime
-from morl_baselines.common.pareto import get_non_dominated_inds, get_non_dominated_inds_minimize
+from morl_baselines.common.pareto import get_non_dominated_inds
+from src.agents.pcn_agent import get_non_dominated_inds_minimize
 import multiprocessing as mp
 from joblib import Parallel, delayed
 import ray
