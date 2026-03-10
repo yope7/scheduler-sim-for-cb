@@ -1,10 +1,13 @@
 """
-C言語実装に最適化したSchedulingEnv（キャッシュ最適化版）
+C言語実装に最適化したSchedulingEnv（キャッシュ最適化版 + リングバッファ）
+
+- リングバッファ: time_transition を O(HW)→O(H) に削減（memmove 不要）
 - C言語実装を直接使用して高速化
-- キャッシュ再構築ロジックを最適化
-- 再構築の頻度制御: 本当に必要な時だけ再構築
-- キャッシュの再利用: 同じstep内ではキャッシュを再利用
-- 差分更新を使用してキャッシュを効率的に更新
+- キャッシュ差分更新: update_cache_time_transition_ringbuffer / update_cache_incremental_ringbuffer
+- 構造化配列廃止: C連続配列のみ保持、on_premise_window/cloud_window はプロパティで論理順ビューを提供
+- 可視化: finalize_window_history で論理順に並べ替えて取り出し
+
+旧ビットマップ実装のバックアップ: src/envs/backup_bitmap/
 """
 import numpy as np
 import sys
@@ -20,13 +23,18 @@ try:
         WindowCache,
         find_allocation_position as c_find_allocation_position,
         time_transition as c_time_transition,
+        time_transition_ringbuffer as c_time_transition_ringbuffer,
         do_schedule as c_do_schedule,
+        do_schedule_ringbuffer as c_do_schedule_ringbuffer,
         get_unique_job_ids as c_get_unique_job_ids,
         calculate_makespan as c_calculate_makespan,
         update_cache_incremental as c_update_cache_incremental,
         update_cache_time_transition as c_update_cache_time_transition,
+        update_cache_time_transition_ringbuffer as c_update_cache_time_transition_ringbuffer,
+        update_cache_incremental_ringbuffer as c_update_cache_incremental_ringbuffer,
         rebuild_cache_if_needed as c_rebuild_cache_if_needed,
         get_observation as c_get_observation,
+        get_observation_ringbuffer as c_get_observation_ringbuffer,
     )
     C_AVAILABLE = True
 except ImportError:
@@ -72,7 +80,62 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
         self._obs_cloud_size = self.n_cloud_node * self.obs_window_size
         self._obs_job_size = 8 * 5
         self._obs_total_size = self._obs_onpre_size + self._obs_cloud_size + self._obs_job_size
-    
+        
+        # リングバッファ用: 最古列の物理インデックス（論理列0=物理列head）
+        self._head_onpre = 0
+        self._head_cloud = 0
+
+    def _get_window_view(self, status_c, job_id_c, head, H, W):
+        """C配列から論理順のビューを返す（構造化配列互換）"""
+        class _WindowView:
+            __slots__ = ("_status", "_job_id", "_head", "_W", "_H")
+
+            def __init__(self, status, job_id, head, H, W):
+                self._status = status
+                self._job_id = job_id
+                self._head = head
+                self._W = W
+                self._H = H
+
+            def __getitem__(self, key):
+                if key == "status":
+                    return np.column_stack([
+                        self._status[:, (self._head + c) % self._W]
+                        for c in range(self._W)
+                    ]).astype(np.int32)
+                if key == "job_id":
+                    return np.column_stack([
+                        self._job_id[:, (self._head + c) % self._W]
+                        for c in range(self._W)
+                    ]).astype(np.int32)
+                raise KeyError(key)
+
+        return _WindowView(status_c, job_id_c, head, H, W)
+
+    @property
+    def on_premise_window(self):
+        """構造化配列互換: 論理順のビュー（status/job_id）"""
+        return self._get_window_view(
+            self._onpre_status_c, self._onpre_job_id_c,
+            self._head_onpre, self.n_on_premise_node, self.n_window
+        )
+
+    @on_premise_window.setter
+    def on_premise_window(self, _):
+        pass  # 無視（C配列がソース）
+
+    @property
+    def cloud_window(self):
+        """構造化配列互換: 論理順のビュー（status/job_id）"""
+        return self._get_window_view(
+            self._cloud_status_c, self._cloud_job_id_c,
+            self._head_cloud, self.n_cloud_node, self.n_window
+        )
+
+    @cloud_window.setter
+    def cloud_window(self, _):
+        pass  # 無視（C配列がソース）
+
     def _invalidate_window_cache(self, on_premise=True, cloud=True):
         """ウィンドウキャッシュを無効化（最適化版）"""
         # 変更フラグを設定（実際に変更されたウィンドウのみ）
@@ -85,7 +148,7 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
         super()._invalidate_window_cache(on_premise=on_premise, cloud=cloud)
     
     def _init_c_arrays(self):
-        """C連続配列を初期化（最適化）"""
+        """C連続配列を初期化（構造化配列なし・直接初期化）"""
         # オンプレミスのウィンドウをC連続配列として保持
         if self._onpre_status_c is None or self._onpre_status_c.shape != (self.n_on_premise_node, self.n_window):
             self._onpre_status_c = np.zeros(
@@ -95,13 +158,8 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
                 (self.n_on_premise_node, self.n_window), -1, dtype=np.int32
             )
         else:
-            # 既存の配列をクリア
             self._onpre_status_c.fill(0)
             self._onpre_job_id_c.fill(-1)
-        
-        # 構造化配列からC連続配列に同期
-        np.copyto(self._onpre_status_c, self.on_premise_window['status'])
-        np.copyto(self._onpre_job_id_c, self.on_premise_window['job_id'])
         
         # クラウドのウィンドウをC連続配列として保持
         if self._cloud_status_c is None or self._cloud_status_c.shape != (self.n_cloud_node, self.n_window):
@@ -112,77 +170,48 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
                 (self.n_cloud_node, self.n_window), -1, dtype=np.int32
             )
         else:
-            # 既存の配列をクリア
             self._cloud_status_c.fill(0)
             self._cloud_job_id_c.fill(-1)
-        
-        # 構造化配列からC連続配列に同期
-        np.copyto(self._cloud_status_c, self.cloud_window['status'])
-        np.copyto(self._cloud_job_id_c, self.cloud_window['job_id'])
     
     def _rebuild_cache_if_needed(self, use_cloud: bool):
-        """キャッシュを再構築（C実装版: バージョンチェックと差分更新を含む、最適化版）"""
+        """キャッシュを再構築（リングバッファ版: build_cache_from_ringbuffer を使用）"""
         self._ensure_cache_initialized()
         
         if not use_cloud:
-            # オンプレミスのキャッシュ
             current_version = getattr(self, '_version_onpre', 0)
             cache_version = getattr(self, '_cache_version_onpre', -1)
             window_changed = getattr(self, '_window_changed_onpre', False)
             
-            # キャッシュが有効で、変更もない場合は再構築不要
             if (self._cache_onpre_c is not None and 
                 cache_version == current_version and 
                 not window_changed):
                 return self._cache_onpre_c
             
-            # C実装版の再構築関数を呼び出し
-            cache_obj = self._cache_onpre_c if hasattr(self, '_cache_onpre_c') and self._cache_onpre_c is not None else None
-            result = c_rebuild_cache_if_needed(
-                cache_obj,
-                self._onpre_status_c,
-                self.n_on_premise_node,
-                self.n_window,
-                current_version,
-                cache_version,
-                window_changed
+            # リングバッファからキャッシュを構築
+            self._cache_onpre_c = WindowCache(
+                self._onpre_status_c, self.n_on_premise_node, self.n_window,
+                self._head_onpre
             )
-            
-            # 結果を取得
-            self._cache_onpre_c, new_cache_version, new_window_changed = result
-            self._cache_version_onpre = new_cache_version
-            self._window_changed_onpre = new_window_changed
-            
+            self._cache_version_onpre = current_version
+            self._window_changed_onpre = False
             return self._cache_onpre_c
         else:
-            # クラウドのキャッシュ
             current_version = getattr(self, '_version_cloud', 0)
             cache_version = getattr(self, '_cache_version_cloud', -1)
             window_changed = getattr(self, '_window_changed_cloud', False)
             
-            # キャッシュが有効で、変更もない場合は再構築不要
             if (self._cache_cloud_c is not None and 
                 cache_version == current_version and 
                 not window_changed):
                 return self._cache_cloud_c
             
-            # C実装版の再構築関数を呼び出し
-            cache_obj = self._cache_cloud_c if hasattr(self, '_cache_cloud_c') and self._cache_cloud_c is not None else None
-            result = c_rebuild_cache_if_needed(
-                cache_obj,
-                self._cloud_status_c,
-                self.n_cloud_node,
-                self.n_window,
-                current_version,
-                cache_version,
-                window_changed
+            # リングバッファからキャッシュを構築
+            self._cache_cloud_c = WindowCache(
+                self._cloud_status_c, self.n_cloud_node, self.n_window,
+                self._head_cloud
             )
-            
-            # 結果を取得
-            self._cache_cloud_c, new_cache_version, new_window_changed = result
-            self._cache_version_cloud = new_cache_version
-            self._window_changed_cloud = new_window_changed
-            
+            self._cache_version_cloud = current_version
+            self._window_changed_cloud = False
             return self._cache_cloud_c
     
     def find_allocation_position(self, action):
@@ -223,76 +252,69 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
         return position, waiting_time
     
     def time_transition(self, slide_on_premise=True, slide_cloud=True):
-        """時間遷移（最適化版: 差分更新を使用、不要な再構築を削減）"""
-        # 時間を1進める
+        """時間遷移（リングバッファ版: O(H)のみ、memmove不要）"""
         self.time += 1
         
-        # C拡張が要求する書込み可能なC連続int32を保証
         if slide_on_premise:
             self._onpre_status_c = np.ascontiguousarray(self._onpre_status_c, dtype=np.int32)
             self._onpre_job_id_c = np.ascontiguousarray(self._onpre_job_id_c, dtype=np.int32)
             self._onpre_status_c.setflags(write=True)
             self._onpre_job_id_c.setflags(write=True)
+            self._append_history_onpre(self._onpre_job_id_c[:, self._head_onpre].copy())
         if slide_cloud:
             self._cloud_status_c = np.ascontiguousarray(self._cloud_status_c, dtype=np.int32)
             self._cloud_job_id_c = np.ascontiguousarray(self._cloud_job_id_c, dtype=np.int32)
             self._cloud_status_c.setflags(write=True)
             self._cloud_job_id_c.setflags(write=True)
-
-        # C連続配列を直接使用（データ変換不要）
-        if slide_on_premise:
-            # C実装で直接変更（in-place）
-            c_time_transition(
-                self._onpre_status_c, self._onpre_job_id_c,
-                self.n_on_premise_node, self.n_window, True
-            )
-            # update_window_history()で使うため、構造化配列に同期
-            self.on_premise_window['status'] = self._onpre_status_c
-            self.on_premise_window['job_id'] = self._onpre_job_id_c
-            
-            # 差分更新を使用（キャッシュが存在する場合）
-            if self._cache_onpre_c is not None:
-                # 差分更新が成功した場合は、変更フラグを立てない（再構築不要）
-                c_update_cache_time_transition(
-                    self._cache_onpre_c, self._onpre_status_c
-                )
-                # 差分更新が成功したので、変更フラグは立てない
-            else:
-                # キャッシュが存在しない場合は変更フラグを設定
-                self._window_changed_onpre = True
+            self._append_history_cloud(self._cloud_job_id_c[:, self._head_cloud].copy())
         
-        if slide_cloud:
-            # C実装で直接変更（in-place）
-            c_time_transition(
-                self._cloud_status_c, self._cloud_job_id_c,
-                self.n_cloud_node, self.n_window, True
+        if slide_on_premise:
+            _, _, self._head_onpre = c_time_transition_ringbuffer(
+                self._onpre_status_c, self._onpre_job_id_c,
+                self.n_on_premise_node, self.n_window, self._head_onpre
             )
-            # update_window_history()で使うため、構造化配列に同期
-            self.cloud_window['status'] = self._cloud_status_c
-            self.cloud_window['job_id'] = self._cloud_job_id_c
-            
-            # 差分更新を使用（キャッシュが存在する場合）
-            if self._cache_cloud_c is not None:
-                # 差分更新が成功した場合は、変更フラグを立てない（再構築不要）
-                c_update_cache_time_transition(
-                    self._cache_cloud_c, self._cloud_status_c
-                )
-                # 差分更新が成功したので、変更フラグは立てない
+            if self._cache_onpre_c is not None:
+                c_update_cache_time_transition_ringbuffer(self._cache_onpre_c)
             else:
-                # キャッシュが存在しない場合は変更フラグを設定
+                self._window_changed_onpre = True
+        if slide_cloud:
+            _, _, self._head_cloud = c_time_transition_ringbuffer(
+                self._cloud_status_c, self._cloud_job_id_c,
+                self.n_cloud_node, self.n_window, self._head_cloud
+            )
+            if self._cache_cloud_c is not None:
+                c_update_cache_time_transition_ringbuffer(self._cache_cloud_c)
+            else:
                 self._window_changed_cloud = True
 
-        # update_window_history()で構造化配列を使うため、ここで呼び出す
-        self.update_window_history()
-
-        # 新しいジョブをジョブキューに追加
         self.append_new_job2job_queue()
-        
-        # キャッシュを無効化しない（差分更新で既に更新済み）
-        # ただし、キャッシュが存在しない場合のみ変更フラグを設定（上記で処理済み）
+    
+    def _append_history_onpre(self, col_data):
+        """オンプレミス履歴に1列を追加"""
+        if self._hist_len_onpre >= self._hist_cap_onpre:
+            new_cap = self._hist_cap_onpre * 2
+            new_buf = np.empty((self.n_on_premise_node, new_cap), dtype=int)
+            new_buf[:, :self._hist_cap_onpre] = self._hist_onpre_buf
+            new_buf[:, self._hist_cap_onpre:new_cap] = -1
+            self._hist_onpre_buf = new_buf
+            self._hist_cap_onpre = new_cap
+        self._hist_onpre_buf[:, self._hist_len_onpre] = col_data
+        self._hist_len_onpre += 1
+    
+    def _append_history_cloud(self, col_data):
+        """クラウド履歴に1列を追加"""
+        if self._hist_len_cloud >= self._hist_cap_cloud:
+            new_cap = self._hist_cap_cloud * 2
+            new_buf = np.empty((self.n_cloud_node, new_cap), dtype=int)
+            new_buf[:, :self._hist_cap_cloud] = self._hist_cloud_buf
+            new_buf[:, self._hist_cap_cloud:new_cap] = -1
+            self._hist_cloud_buf = new_buf
+            self._hist_cap_cloud = new_cap
+        self._hist_cloud_buf[:, self._hist_len_cloud] = col_data
+        self._hist_len_cloud += 1
     
     def do_schedule(self, action, job, position):
-        """ジョブをスケジュール（最適化版: 差分更新を使用、構造化配列への同期を削除）"""
+        """ジョブをスケジュール（リングバッファ版）"""
         self.jobs_processed_count += 1
         job_width = int(job[0])
         job_height = int(job[1])
@@ -300,83 +322,46 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
         when_submitted = int(job[-1])
         use_cloud = action[1]
         
-        # C連続配列を直接使用（データ変換不要）
+        if isinstance(position, tuple) and len(position) == 2:
+            i, a = position
+            i_start, i_end = i, i + job_height
+            a_start, a_end = a, a + job_width
+        elif isinstance(position, tuple) and len(position) == 3:
+            i, a, _ = position
+            i_start, i_end = 0, self.n_on_premise_node if not use_cloud else self.n_cloud_node
+            a_start, a_end = a, a + job_width
+        else:
+            i_start, i_end = 0, self.n_on_premise_node if not use_cloud else self.n_cloud_node
+            a_start, a_end = 0, self.n_window
+        
         if not use_cloud:
-            # 位置情報を取得（差分更新用）
-            if isinstance(position, tuple) and len(position) == 2:
-                # 連続割り当て
-                i, a = position
-                i_start, i_end = i, i + job_height
-                a_start, a_end = a, a + job_width
-            elif isinstance(position, tuple) and len(position) == 3:
-                # 分散割り当て
-                i, a, node_allocation = position
-                i_start, i_end = 0, self.n_on_premise_node  # 分散割り当ては全行に影響
-                a_start, a_end = a, a + job_width
-            else:
-                i_start, i_end = 0, self.n_on_premise_node
-                a_start, a_end = 0, self.n_window
-            
-            # C実装で直接変更（in-place）
-            c_do_schedule(
+            c_do_schedule_ringbuffer(
                 self._onpre_status_c, self._onpre_job_id_c,
                 self.n_on_premise_node, self.n_window,
                 job_width, job_height, job_id,
-                position
+                position, self._head_onpre
             )
-            # 構造化配列への同期は削除（get_observation()の直前で同期）
-            
-            # 差分更新を使用（キャッシュが存在する場合）
             if self._cache_onpre_c is not None:
-                # 差分更新が成功した場合は、変更フラグを立てない（再構築不要）
-                c_update_cache_incremental(
+                c_update_cache_incremental_ringbuffer(
                     self._cache_onpre_c, self._onpre_status_c,
-                    i_start, i_end, a_start, a_end
+                    i_start, i_end, a_start, a_end, self._head_onpre
                 )
-                # 差分更新が成功したので、変更フラグは立てない
             else:
-                # キャッシュが存在しない場合は変更フラグを設定
                 self._window_changed_onpre = True
-            
-            # キャッシュを無効化しない（差分更新で既に更新済み）
         else:
-            # 位置情報を取得（差分更新用）
-            if isinstance(position, tuple) and len(position) == 2:
-                # 連続割り当て
-                i, a = position
-                i_start, i_end = i, i + job_height
-                a_start, a_end = a, a + job_width
-            elif isinstance(position, tuple) and len(position) == 3:
-                # 分散割り当て
-                i, a, node_allocation = position
-                i_start, i_end = 0, self.n_cloud_node  # 分散割り当ては全行に影響
-                a_start, a_end = a, a + job_width
-            else:
-                i_start, i_end = 0, self.n_cloud_node
-                a_start, a_end = 0, self.n_window
-            
-            # C実装で直接変更（in-place）
-            c_do_schedule(
+            c_do_schedule_ringbuffer(
                 self._cloud_status_c, self._cloud_job_id_c,
                 self.n_cloud_node, self.n_window,
                 job_width, job_height, job_id,
-                position
+                position, self._head_cloud
             )
-            # 構造化配列への同期は削除（get_observation()の直前で同期）
-            
-            # 差分更新を使用（キャッシュが存在する場合）
             if self._cache_cloud_c is not None:
-                # 差分更新が成功した場合は、変更フラグを立てない（再構築不要）
-                c_update_cache_incremental(
+                c_update_cache_incremental_ringbuffer(
                     self._cache_cloud_c, self._cloud_status_c,
-                    i_start, i_end, a_start, a_end
+                    i_start, i_end, a_start, a_end, self._head_cloud
                 )
-                # 差分更新が成功したので、変更フラグは立てない
             else:
-                # キャッシュが存在しない場合は変更フラグを設定
                 self._window_changed_cloud = True
-            
-            # キャッシュを無効化しない（差分更新で既に更新済み）
         
         waiting_time = self.time - when_submitted
         self.waiting_times.append(waiting_time)
@@ -433,12 +418,6 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
                     # do_scheduleで差分更新済みなので、次回アクションで異なるuse_cloudの場合のみ再構築が必要
                     # 同じuse_cloudの場合は再構築不要
 
-                    # get_observation()が呼ばれる直前に構造化配列に同期
-                    self.on_premise_window['status'] = self._onpre_status_c
-                    self.on_premise_window['job_id'] = self._onpre_job_id_c
-                    self.cloud_window['status'] = self._cloud_status_c
-                    self.cloud_window['job_id'] = self._cloud_job_id_c
-                    
                     observation = self.get_observation()
                     cost = self.compute_cost(action, allocated_job, is_valid)
                     done = self.check_is_done()
@@ -449,48 +428,59 @@ class SchedulingEnvCacheOptimized(SchedulingEnv):
     
     def reset(self):
         """環境のリセット（最適化版）"""
-        # 親クラスのリセットを実行
         observation = super().reset()
         
-        # 変更フラグをリセット
+        self._head_onpre = 0
+        self._head_cloud = 0
         self._window_changed_onpre = False
         self._window_changed_cloud = False
-        
-        # C連続配列を再初期化（reset後にウィンドウが初期化されるため）
         self._init_c_arrays()
-        
-        # キャッシュをリセット
         self._cache_onpre_c = None
         self._cache_cloud_c = None
         self._cache_version_onpre = 0
         self._cache_version_cloud = 0
         
-        # 変更フラグをリセット
-        self._window_changed_onpre = False
-        self._window_changed_cloud = False
-        
         return observation
     
     def get_observation(self):
-        """観測取得（C側で作成、Pythonのオーバーヘッドを排除）"""
+        """観測取得（リングバッファ版: C側で直接構築、Python側の配列構築を省略）"""
         job_queue_f64 = np.ascontiguousarray(
-            self.job_queue[:5].astype(np.float64), dtype=np.float64
+            self.job_queue[:5].astype(np.float64),
+            dtype=np.float64
         )
-        return c_get_observation(
+        return c_get_observation_ringbuffer(
             self._onpre_status_c,
             self._cloud_status_c,
             job_queue_f64,
             self.n_on_premise_node,
             self.n_cloud_node,
             self.n_window,
+            self._head_onpre,
+            self._head_cloud,
             self.obs_window_size,
         )
     
     def init_window(self):
-        """ウィンドウの初期化（最適化版）"""
-        # 親クラスの初期化を実行
-        super().init_window()
-        
-        # C連続配列を再初期化
+        """ウィンドウの初期化（構造化配列なし・C配列のみ）"""
         self._init_c_arrays()
+    
+    def finalize_window_history(self):
+        """ウィンドウ全体を履歴に追加（リングバッファ版: 論理順に並べ替えてから連結）"""
+        hist_onpre = self._hist_onpre_buf[:, :self._hist_len_onpre]
+        hist_cloud = self._hist_cloud_buf[:, :self._hist_len_cloud]
+        # リングバッファを論理順（時刻の古い順）に並べ替え
+        window_onpre_chrono = np.column_stack([
+            self._onpre_job_id_c[:, (self._head_onpre + i) % self.n_window]
+            for i in range(self.n_window)
+        ])
+        window_cloud_chrono = np.column_stack([
+            self._cloud_job_id_c[:, (self._head_cloud + i) % self.n_window]
+            for i in range(self.n_window)
+        ])
+        self.on_premise_window_history_full = np.hstack((hist_onpre, window_onpre_chrono))
+        self.cloud_window_history_full = np.hstack((hist_cloud, window_cloud_chrono))
+        self.on_premise_window_history_full = np.delete(self.on_premise_window_history_full, 0, axis=1)
+        self.cloud_window_history_full = np.delete(self.cloud_window_history_full, 0, axis=1)
+        cost, _, _ = self.calc_objective_values(calc_makespan=False, calc_avg_waiting_time=False)
+        self.cost = cost
 

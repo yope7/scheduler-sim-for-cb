@@ -83,7 +83,15 @@ PYBIND11_MODULE(scheduling_env_core, m) {
     py::class_<WindowCacheWrapper>(m, "WindowCache")
         .def(py::init<py::array_t<int32_t>, int32_t, int32_t>(),
              "ウィンドウキャッシュを構築",
-             py::arg("window_status"), py::arg("H"), py::arg("W"));
+             py::arg("window_status"), py::arg("H"), py::arg("W"))
+        .def(py::init([](py::array_t<int32_t> window_status, int32_t H, int32_t W, int32_t head) {
+            auto buf = window_status.request();
+            const int32_t* data = static_cast<const int32_t*>(buf.ptr);
+            WindowCache* c = build_cache_from_ringbuffer(data, H, W, head);
+            if (!c) throw std::runtime_error("Failed to build cache from ringbuffer");
+            return new WindowCacheWrapper(c, true);
+        }), "リングバッファからウィンドウキャッシュを構築",
+             py::arg("window_status"), py::arg("H"), py::arg("W"), py::arg("head"));
     
     // find_allocation_position関数
     m.def("find_allocation_position",
@@ -115,6 +123,78 @@ PYBIND11_MODULE(scheduling_env_core, m) {
           py::arg("job_height"),
           py::arg("when_submitted"),
           py::arg("current_time"));
+    
+    // time_transition_ringbuffer関数
+    m.def("time_transition_ringbuffer",
+          [](py::array_t<int32_t> window_status,
+             py::array_t<int32_t> window_job_id,
+             int32_t H,
+             int32_t W,
+             int32_t head) {
+              if (!window_status.writeable() || !window_job_id.writeable()) {
+                  throw std::runtime_error("Arrays must be writeable");
+              }
+              auto buf_status = window_status.request();
+              auto buf_job_id = window_job_id.request();
+              int32_t* status_ptr = static_cast<int32_t*>(buf_status.ptr);
+              int32_t* job_id_ptr = static_cast<int32_t*>(buf_job_id.ptr);
+              int32_t new_head = time_transition_ringbuffer(status_ptr, job_id_ptr, H, W, head);
+              return py::make_tuple(window_status, window_job_id, new_head);
+          },
+          "リングバッファ版: 時間遷移",
+          py::arg("window_status"), py::arg("window_job_id"),
+          py::arg("H"), py::arg("W"), py::arg("head"));
+    
+    // do_schedule_ringbuffer関数
+    m.def("do_schedule_ringbuffer",
+          [](py::array_t<int32_t> window_status,
+             py::array_t<int32_t> window_job_id,
+             int32_t H,
+             int32_t W,
+             int32_t job_width,
+             int32_t job_height,
+             int32_t job_id,
+             py::object position,
+             int32_t head) {
+              auto buf_status = window_status.request();
+              auto buf_job_id = window_job_id.request();
+              int32_t* status_ptr = static_cast<int32_t*>(buf_status.ptr);
+              int32_t* job_id_ptr = static_cast<int32_t*>(buf_job_id.ptr);
+              Position pos;
+              py::tuple pos_tuple = py::cast<py::tuple>(position);
+              if (py::len(pos_tuple) == 2) {
+                  pos.is_distributed = false;
+                  pos.pos.continuous.i = py::cast<int32_t>(pos_tuple[0]);
+                  pos.pos.continuous.a = py::cast<int32_t>(pos_tuple[1]);
+              } else if (py::len(pos_tuple) == 3) {
+                  pos.is_distributed = true;
+                  pos.pos.distributed.i = py::cast<int32_t>(pos_tuple[0]);
+                  pos.pos.distributed.a = py::cast<int32_t>(pos_tuple[1]);
+                  py::list node_allocation = py::cast<py::list>(pos_tuple[2]);
+                  int32_t total_size = 0;
+                  for (auto col_nodes : node_allocation) total_size += py::len(col_nodes);
+                  pos.pos.distributed.node_allocation = (int32_t*)malloc(total_size * sizeof(int32_t));
+                  pos.pos.distributed.allocation_size = total_size;
+                  int32_t idx = 0;
+                  for (auto col_nodes : node_allocation) {
+                      py::list col_list = py::cast<py::list>(col_nodes);
+                      for (auto node : col_list) {
+                          pos.pos.distributed.node_allocation[idx++] = py::cast<int32_t>(node);
+                      }
+                  }
+              } else {
+                  throw std::runtime_error("Invalid position format");
+              }
+              do_schedule_ringbuffer(status_ptr, job_id_ptr, H, W,
+                  job_width, job_height, job_id, &pos, head);
+              if (pos.is_distributed && pos.pos.distributed.node_allocation) {
+                  free(pos.pos.distributed.node_allocation);
+              }
+          },
+          "リングバッファ版: ジョブスケジュール",
+          py::arg("window_status"), py::arg("window_job_id"),
+          py::arg("H"), py::arg("W"), py::arg("job_width"), py::arg("job_height"),
+          py::arg("job_id"), py::arg("position"), py::arg("head"));
     
     // time_transition関数
     m.def("time_transition",
@@ -307,6 +387,37 @@ PYBIND11_MODULE(scheduling_env_core, m) {
           "キャッシュの差分更新（時間遷移時）",
           py::arg("cache"),
           py::arg("window_status"));
+
+    // update_cache_time_transition_ringbuffer関数
+    m.def("update_cache_time_transition_ringbuffer",
+          [](WindowCacheWrapper& cache_wrapper) {
+              update_cache_time_transition_ringbuffer(cache_wrapper.cache);
+          },
+          "リングバッファ版: キャッシュの差分更新（時間遷移時）",
+          py::arg("cache"));
+
+    // update_cache_incremental_ringbuffer関数
+    m.def("update_cache_incremental_ringbuffer",
+          [](WindowCacheWrapper& cache_wrapper,
+             py::array_t<int32_t> window_status,
+             int32_t i_start,
+             int32_t i_end,
+             int32_t a_start,
+             int32_t a_end,
+             int32_t head) {
+              auto buf = window_status.request();
+              const int32_t* data = static_cast<const int32_t*>(buf.ptr);
+              update_cache_incremental_ringbuffer(cache_wrapper.cache, data,
+                                                  i_start, i_end, a_start, a_end, head);
+          },
+          "リングバッファ版: キャッシュの差分更新（ジョブ追加時）",
+          py::arg("cache"),
+          py::arg("window_status"),
+          py::arg("i_start"),
+          py::arg("i_end"),
+          py::arg("a_start"),
+          py::arg("a_end"),
+          py::arg("head"));
     
     // get_observation関数
     m.def("get_observation",
@@ -342,6 +453,41 @@ PYBIND11_MODULE(scheduling_env_core, m) {
           py::arg("H_onpre"),
           py::arg("H_cloud"),
           py::arg("W"),
+          py::arg("obs_window_size"));
+
+    // get_observation_ringbuffer関数（Python側の配列構築を省略）
+    m.def("get_observation_ringbuffer",
+          [](py::array_t<int32_t> onpre_status,
+             py::array_t<int32_t> cloud_status,
+             py::array_t<double> job_queue,
+             int32_t H_onpre,
+             int32_t H_cloud,
+             int32_t W,
+             int32_t head_onpre,
+             int32_t head_cloud,
+             int32_t obs_window_size) {
+              auto buf_onpre = onpre_status.request();
+              auto buf_cloud = cloud_status.request();
+              auto buf_job = job_queue.request();
+              const int32_t* onpre_ptr = static_cast<const int32_t*>(buf_onpre.ptr);
+              const int32_t* cloud_ptr = static_cast<const int32_t*>(buf_cloud.ptr);
+              const double* job_ptr = static_cast<const double*>(buf_job.ptr);
+              size_t out_size = H_onpre * obs_window_size + H_cloud * obs_window_size + 40;
+              py::array_t<float> output(out_size);
+              float* out_ptr = static_cast<float*>(output.request().ptr);
+              get_observation_ringbuffer(onpre_ptr, cloud_ptr, job_ptr,
+                  H_onpre, H_cloud, W, head_onpre, head_cloud, obs_window_size, out_ptr);
+              return output;
+          },
+          "リングバッファ版: 観測を直接構築",
+          py::arg("onpre_status"),
+          py::arg("cloud_status"),
+          py::arg("job_queue"),
+          py::arg("H_onpre"),
+          py::arg("H_cloud"),
+          py::arg("W"),
+          py::arg("head_onpre"),
+          py::arg("head_cloud"),
           py::arg("obs_window_size"));
 
     // rebuild_cache_if_needed関数

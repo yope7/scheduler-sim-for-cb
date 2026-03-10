@@ -343,6 +343,170 @@ void time_transition(
     }
 }
 
+// リングバッファ版: キャッシュ構築（論理列0=物理列head）
+WindowCache* build_cache_from_ringbuffer(
+    const int32_t* window_status,
+    int32_t H,
+    int32_t W,
+    int32_t head
+) {
+    if (!window_status || head < 0 || head >= W) {
+        return NULL;
+    }
+    WindowCache* cache = (WindowCache*)malloc(sizeof(WindowCache));
+    if (!cache) return NULL;
+    
+    cache->H = H;
+    cache->W = W;
+    cache->version = 0;
+    
+    cache->free_per_col = (int32_t*)malloc(W * sizeof(int32_t));
+    if (!cache->free_per_col) {
+        free(cache);
+        return NULL;
+    }
+    
+    for (int32_t log_col = 0; log_col < W; log_col++) {
+        int32_t phys_col = (head + log_col) % W;
+        int32_t free_count = 0;
+        for (int32_t row = 0; row < H; row++) {
+            if (window_status[row * W + phys_col] == 0) {
+                free_count++;
+            }
+        }
+        cache->free_per_col[log_col] = free_count;
+    }
+    
+    cache->occ = (int32_t*)malloc(H * W * sizeof(int32_t));
+    if (!cache->occ) {
+        free(cache->free_per_col);
+        free(cache);
+        return NULL;
+    }
+    
+    for (int32_t i = 0; i < H; i++) {
+        for (int32_t log_col = 0; log_col < W; log_col++) {
+            int32_t phys_col = (head + log_col) % W;
+            cache->occ[i * W + log_col] = (window_status[i * W + phys_col] != 0) ? 1 : 0;
+        }
+    }
+    
+    cache->prefix_sum = (int32_t*)calloc((H + 1) * (W + 1), sizeof(int32_t));
+    if (!cache->prefix_sum) {
+        free(cache->occ);
+        free(cache->free_per_col);
+        free(cache);
+        return NULL;
+    }
+    
+    for (int32_t i = 1; i <= H; i++) {
+        for (int32_t j = 1; j <= W; j++) {
+            int32_t idx = i * (W + 1) + j;
+            int32_t occ_idx = (i - 1) * W + (j - 1);
+            cache->prefix_sum[idx] = cache->occ[occ_idx]
+                + cache->prefix_sum[(i - 1) * (W + 1) + j]
+                + cache->prefix_sum[i * (W + 1) + (j - 1)]
+                - cache->prefix_sum[(i - 1) * (W + 1) + (j - 1)];
+        }
+    }
+    
+    cache->free_nodes_list = (FreeNodesList*)malloc(W * sizeof(FreeNodesList));
+    if (!cache->free_nodes_list) {
+        free(cache->prefix_sum);
+        free(cache->occ);
+        free(cache->free_per_col);
+        free(cache);
+        return NULL;
+    }
+    
+    for (int32_t log_col = 0; log_col < W; log_col++) {
+        int32_t phys_col = (head + log_col) % W;
+        int32_t free_count = cache->free_per_col[log_col];
+        cache->free_nodes_list[log_col].size = free_count;
+        cache->free_nodes_list[log_col].nodes = (int32_t*)malloc(free_count * sizeof(int32_t));
+        if (!cache->free_nodes_list[log_col].nodes) {
+            for (int32_t c = 0; c < log_col; c++) {
+                free(cache->free_nodes_list[c].nodes);
+            }
+            free(cache->free_nodes_list);
+            free(cache->prefix_sum);
+            free(cache->occ);
+            free(cache->free_per_col);
+            free(cache);
+            return NULL;
+        }
+        int32_t idx = 0;
+        for (int32_t row = 0; row < H; row++) {
+            if (window_status[row * W + phys_col] == 0) {
+                cache->free_nodes_list[log_col].nodes[idx++] = row;
+            }
+        }
+    }
+    
+    return cache;
+}
+
+// リングバッファ版: 時間遷移（列headをクリア、O(H)のみ）
+int32_t time_transition_ringbuffer(
+    int32_t* window_status,
+    int32_t* window_job_id,
+    int32_t H,
+    int32_t W,
+    int32_t head
+) {
+    if (!window_status || !window_job_id) {
+        return head;
+    }
+    for (int32_t i = 0; i < H; i++) {
+        window_status[i * W + head] = 0;
+        window_job_id[i * W + head] = -1;
+    }
+    return (head + 1) % W;
+}
+
+// リングバッファ版: ジョブスケジュール（論理列a→物理列(head+a)%W）
+void do_schedule_ringbuffer(
+    int32_t* window_status,
+    int32_t* window_job_id,
+    int32_t H,
+    int32_t W,
+    int32_t job_width,
+    int32_t job_height,
+    int32_t job_id,
+    const Position* position,
+    int32_t head
+) {
+    if (!window_status || !window_job_id || !position) {
+        return;
+    }
+    
+    if (!position->is_distributed) {
+        int32_t i = position->pos.continuous.i;
+        int32_t a = position->pos.continuous.a;
+        for (int32_t row = 0; row < job_height; row++) {
+            for (int32_t col = 0; col < job_width; col++) {
+                int32_t phys_col = (head + a + col) % W;
+                int32_t idx = (i + row) * W + phys_col;
+                window_status[idx] = 1;
+                window_job_id[idx] = job_id;
+            }
+        }
+    } else {
+        int32_t a = position->pos.distributed.a;
+        int32_t* node_allocation = position->pos.distributed.node_allocation;
+        int32_t idx = 0;
+        for (int32_t col_offset = 0; col_offset < job_width; col_offset++) {
+            int32_t phys_col = (head + a + col_offset) % W;
+            for (int32_t j = 0; j < job_height; j++) {
+                int32_t node = node_allocation[idx++];
+                int32_t pos_idx = node * W + phys_col;
+                window_status[pos_idx] = 1;
+                window_job_id[pos_idx] = job_id;
+            }
+        }
+    }
+}
+
 // ジョブのスケジュール実行
 void do_schedule(
     int32_t* window_status,
@@ -641,6 +805,144 @@ void update_cache_time_transition(
     }
 }
 
+// リングバッファ版: 時間遷移時のキャッシュ差分更新（シフトのみ、ウィンドウ参照不要）
+void update_cache_time_transition_ringbuffer(WindowCache* cache) {
+    if (!cache) return;
+    int32_t H = cache->H;
+    int32_t W = cache->W;
+
+    /* 1. free_per_col を左シフト、最終列は全空き */
+    for (int32_t col = 0; col < W - 1; col++) {
+        cache->free_per_col[col] = cache->free_per_col[col + 1];
+    }
+    cache->free_per_col[W - 1] = H;
+
+    /* 2. occ を左シフト、最終列は0 */
+    for (int32_t i = 0; i < H; i++) {
+        for (int32_t col = 0; col < W - 1; col++) {
+            cache->occ[i * W + col] = cache->occ[i * W + col + 1];
+        }
+        cache->occ[i * W + (W - 1)] = 0;
+    }
+
+    /* 3. prefix_sum を再計算 */
+    for (int32_t i = 1; i <= H; i++) {
+        int32_t prefix_row = i * (W + 1);
+        int32_t prefix_row_prev = (i - 1) * (W + 1);
+        int32_t occ_row = (i - 1) * W;
+        for (int32_t j = 1; j <= W; j++) {
+            int32_t idx = prefix_row + j;
+            int32_t occ_idx = occ_row + (j - 1);
+            cache->prefix_sum[idx] = cache->occ[occ_idx]
+                + cache->prefix_sum[prefix_row_prev + j]
+                + cache->prefix_sum[prefix_row + (j - 1)]
+                - cache->prefix_sum[prefix_row_prev + (j - 1)];
+        }
+    }
+
+    /* 4. free_nodes_list を左シフト、最終列は全行 */
+    /* 逆順でシフト（正順だとポインタの二重解放になる） */
+    if (cache->free_nodes_list[0].nodes) {
+        free(cache->free_nodes_list[0].nodes);
+        cache->free_nodes_list[0].nodes = NULL;
+    }
+    for (int32_t col = 0; col < W - 1; col++) {
+        cache->free_nodes_list[col].nodes = cache->free_nodes_list[col + 1].nodes;
+        cache->free_nodes_list[col].size = cache->free_nodes_list[col + 1].size;
+        cache->free_nodes_list[col + 1].nodes = NULL;  /* 所有権を移した */
+    }
+    /* [W-1] は [W-2] に移したので、新規確保 */
+    cache->free_nodes_list[W - 1].size = H;
+    cache->free_nodes_list[W - 1].nodes = (int32_t*)malloc(H * sizeof(int32_t));
+    if (cache->free_nodes_list[W - 1].nodes) {
+        for (int32_t row = 0; row < H; row++) {
+            cache->free_nodes_list[W - 1].nodes[row] = row;
+        }
+    }
+}
+
+// リングバッファ版: ジョブ追加時のキャッシュ差分更新（論理列→物理列マッピング）
+void update_cache_incremental_ringbuffer(
+    WindowCache* cache,
+    const int32_t* window_status,
+    int32_t i_start,
+    int32_t i_end,
+    int32_t a_start,
+    int32_t a_end,
+    int32_t head
+) {
+    if (!cache || !window_status) return;
+    int32_t H = cache->H;
+    int32_t W = cache->W;
+
+    if (i_start < 0 || i_end > H || a_start < 0 || a_end > W ||
+        i_start >= i_end || a_start >= a_end) {
+        return;
+    }
+
+    /* 1. free_per_col の更新（論理列 a_start..a_end-1） */
+    for (int32_t log_col = a_start; log_col < a_end; log_col++) {
+        int32_t phys_col = (head + log_col) % W;
+        int32_t free_count = 0;
+        for (int32_t row = 0; row < H; row++) {
+            if (window_status[row * W + phys_col] == 0) {
+                free_count++;
+            }
+        }
+        cache->free_per_col[log_col] = free_count;
+    }
+
+    /* 2. occ の更新 */
+    for (int32_t i = i_start; i < i_end; i++) {
+        for (int32_t log_col = a_start; log_col < a_end; log_col++) {
+            int32_t phys_col = (head + log_col) % W;
+            int32_t idx = i * W + log_col;
+            cache->occ[idx] = (window_status[i * W + phys_col] != 0) ? 1 : 0;
+        }
+    }
+
+    /* 3. prefix_sum の更新 */
+    for (int32_t i = i_start + 1; i <= i_end; i++) {
+        for (int32_t j = 1; j <= W; j++) {
+            int32_t idx = i * (W + 1) + j;
+            int32_t occ_idx = (i - 1) * W + (j - 1);
+            cache->prefix_sum[idx] = cache->occ[occ_idx]
+                + cache->prefix_sum[(i - 1) * (W + 1) + j]
+                + cache->prefix_sum[i * (W + 1) + (j - 1)]
+                - cache->prefix_sum[(i - 1) * (W + 1) + (j - 1)];
+        }
+    }
+    for (int32_t i = i_end + 1; i <= H; i++) {
+        for (int32_t j = a_start + 1; j <= W; j++) {
+            int32_t idx = i * (W + 1) + j;
+            int32_t occ_idx = (i - 1) * W + (j - 1);
+            cache->prefix_sum[idx] = cache->occ[occ_idx]
+                + cache->prefix_sum[(i - 1) * (W + 1) + j]
+                + cache->prefix_sum[i * (W + 1) + (j - 1)]
+                - cache->prefix_sum[(i - 1) * (W + 1) + (j - 1)];
+        }
+    }
+
+    /* 4. free_nodes_list の更新 */
+    for (int32_t log_col = a_start; log_col < a_end; log_col++) {
+        int32_t phys_col = (head + log_col) % W;
+        if (cache->free_nodes_list[log_col].nodes) {
+            free(cache->free_nodes_list[log_col].nodes);
+        }
+        int32_t free_count = cache->free_per_col[log_col];
+        cache->free_nodes_list[log_col].size = free_count;
+        cache->free_nodes_list[log_col].nodes = (int32_t*)malloc(free_count * sizeof(int32_t));
+        if (cache->free_nodes_list[log_col].nodes) {
+            int32_t idx = 0;
+            for (int32_t row = 0; row < H; row++) {
+                if (window_status[row * W + phys_col] == 0) {
+                    cache->free_nodes_list[log_col].nodes[idx++] = row;
+                }
+            }
+        }
+    }
+}
+
 // キャッシュの再構築（最適化版: バージョンチェックと差分更新を含む）
 WindowCache* rebuild_cache_if_needed(
     WindowCache* cache,
@@ -707,6 +1009,45 @@ void get_observation(
     }
 
     /* ジョブキュー: 先頭5件 x 8属性 */
+    for (int32_t i = 0; i < 5 * 8 && job_queue; i++) {
+        output[out_idx++] = (float)job_queue[i];
+    }
+}
+
+/* リングバッファ版: 論理列を物理列にマッピングして直接出力 */
+void get_observation_ringbuffer(
+    const int32_t* onpre_status,
+    const int32_t* cloud_status,
+    const double* job_queue,
+    int32_t H_onpre,
+    int32_t H_cloud,
+    int32_t W,
+    int32_t head_onpre,
+    int32_t head_cloud,
+    int32_t obs_window_size,
+    float* output
+) {
+    int32_t out_idx = 0;
+    int32_t col_start = W - obs_window_size;
+    if (col_start < 0) col_start = 0;
+
+    /* オンプレミス: 論理列 col_start..W-1 を物理列 (head+col)%W から取得 */
+    for (int32_t row = 0; row < H_onpre; row++) {
+        for (int32_t log_col = col_start; log_col < W; log_col++) {
+            int32_t phys_col = (head_onpre + log_col) % W;
+            output[out_idx++] = (float)onpre_status[row * W + phys_col];
+        }
+    }
+
+    /* クラウド: 同様 */
+    for (int32_t row = 0; row < H_cloud; row++) {
+        for (int32_t log_col = col_start; log_col < W; log_col++) {
+            int32_t phys_col = (head_cloud + log_col) % W;
+            output[out_idx++] = (float)cloud_status[row * W + phys_col];
+        }
+    }
+
+    /* ジョブキュー */
     for (int32_t i = 0; i < 5 * 8 && job_queue; i++) {
         output[out_idx++] = (float)job_queue[i];
     }

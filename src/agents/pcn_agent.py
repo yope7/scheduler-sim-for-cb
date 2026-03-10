@@ -78,107 +78,110 @@ def setup_linux_fonts():
 # Linuxフォントを自動設定
 # setup_linux_fonts()
 
+from numba import njit
+
 from morl_baselines.common.evaluation import log_all_multi_policy_metrics
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.performance_indicators import hypervolume
 from src.utils.map_visualizer import visualize_map
 
 
-# 非支配解を取得する関数をファイル内に直接実装
-def get_non_dominated_inds(points):
-    """非支配解（最大化問題用）のインデックスを取得する関数
-    
-    Args:
-        points (np.ndarray): 評価点の配列（行が各解、列が各目的関数値）
-    
-    Returns:
-        np.ndarray: 非支配解のインデックス配列
-    """
-    if len(points) == 0:
-        return np.array([])
-    
-    # データ型を浮動小数点の高精度型に変換して数値安定性を向上
-    points = np.array(points, dtype=np.float64)
-    is_efficient = np.ones(len(points), dtype=bool)
-    
-    for i, point in enumerate(points):
+# 非支配解を取得（Numba JIT版・精度同一）
+@njit(cache=True)
+def _get_non_dominated_inds_maximize_numba(points):
+    """最大化: iがjを支配 → i>=j全次元 かつ i>jが1次元以上。jを除去するのはiがjを支配するとき"""
+    n, d = points.shape
+    is_efficient = np.ones(n, dtype=np.bool_)
+    for i in range(n):
         if is_efficient[i]:
-            # 他の解と比較して、すべての目的関数において同等以上で、
-            # 少なくとも1つの目的関数において厳密に優れている場合、
-            # その他の解は支配されていると判定
-            is_efficient[is_efficient] = np.any(
-                points[is_efficient] > point, axis=1
-            ) | np.all(points[is_efficient] == point, axis=1)
-            is_efficient[i] = True  # 自分自身を再度非支配解としてマーク
-    
+            for j in range(n):
+                if is_efficient[j] and i != j:
+                    all_ge = True
+                    some_gt = False
+                    for k in range(d):
+                        if points[i, k] < points[j, k]:
+                            all_ge = False
+                            break
+                        if points[i, k] > points[j, k]:
+                            some_gt = True
+                    if all_ge and some_gt:
+                        is_efficient[j] = False
+            is_efficient[i] = True
     return np.nonzero(is_efficient)[0]
 
-def get_non_dominated_inds_minimize(points):
-    """非支配解（最小化問題用）のインデックスを取得する関数
-    
-    Args:
-        points (np.ndarray): 評価点の配列（行が各解、列が各目的関数値）
-    
-    Returns:
-        np.ndarray: 非支配解のインデックス配列
-    """
+
+@njit(cache=True)
+def _get_non_dominated_inds_minimize_numba(points):
+    """最小化: iがjを支配 → i<=j全次元 かつ i<jが1次元以上"""
+    n, d = points.shape
+    is_efficient = np.ones(n, dtype=np.bool_)
+    for i in range(n):
+        if is_efficient[i]:
+            for j in range(n):
+                if is_efficient[j] and i != j:
+                    all_le = True
+                    some_lt = False
+                    for k in range(d):
+                        if points[i, k] > points[j, k]:
+                            all_le = False
+                            break
+                        if points[i, k] < points[j, k]:
+                            some_lt = True
+                    if all_le and some_lt:
+                        is_efficient[j] = False
+            is_efficient[i] = True
+    return np.nonzero(is_efficient)[0]
+
+
+def get_non_dominated_inds(points):
+    """非支配解（最大化問題用）のインデックスを取得（Numba JITで高速化・精度同一）"""
     if len(points) == 0:
         return np.array([])
-    
-    # データ型を浮動小数点の高精度型に変換して数値安定性を向上
-    points = np.array(points, dtype=np.float64)
-    is_efficient = np.ones(len(points), dtype=bool)
-    
-    for i, point in enumerate(points):
-        if is_efficient[i]:
-            # 最小化問題では、他の解と比較して、すべての目的関数において同等以下で、
-            # 少なくとも1つの目的関数において厳密に優れている（値が小さい）場合、
-            # その他の解は支配されていると判定
-            is_efficient[is_efficient] = np.any(
-                points[is_efficient] < point, axis=1
-            ) | np.all(points[is_efficient] == point, axis=1)
-            is_efficient[i] = True  # 自分自身を再度非支配解としてマーク
-    
-    return np.nonzero(is_efficient)[0]
+    pts = np.ascontiguousarray(np.array(points, dtype=np.float64))
+    return _get_non_dominated_inds_maximize_numba(pts)
+
+
+def get_non_dominated_inds_minimize(points):
+    """非支配解（最小化問題用）のインデックスを取得（Numba JITで高速化・精度同一）"""
+    if len(points) == 0:
+        return np.array([])
+    pts = np.ascontiguousarray(np.array(points, dtype=np.float64))
+    return _get_non_dominated_inds_minimize_numba(pts)
+
+
+@njit(cache=True)
+def _crowding_distance_numba(points):
+    """混雑度計算（Numba JIT・精度同一）"""
+    n, d = points.shape
+    if n <= 2:
+        return np.ones(n, dtype=np.float64)
+    min_vals = np.empty(d)
+    ptp_vals = np.empty(d)
+    for k in range(d):
+        min_vals[k] = np.min(points[:, k])
+        ptp_vals[k] = np.max(points[:, k]) - np.min(points[:, k])
+    pts = np.empty_like(points)
+    for i in range(n):
+        for k in range(d):
+            pts[i, k] = (points[i, k] - min_vals[k]) / (ptp_vals[k] + 1e-8)
+    crowding = np.zeros((n, d))
+    for dim in range(d):
+        dim_sorted = np.argsort(pts[:, dim])
+        point_sorted = pts[dim_sorted, dim]
+        dist_0 = np.abs(point_sorted[0] - point_sorted[1]) if n >= 2 else 0.0
+        dist_n = np.abs(point_sorted[n - 1] - point_sorted[n - 2]) if n >= 2 else 0.0
+        crowding[dim_sorted[0], dim] = dist_0
+        crowding[dim_sorted[n - 1], dim] = dist_n
+        if n > 4:
+            for i in range(1, n - 1):
+                crowding[dim_sorted[i], dim] = np.abs(point_sorted[i] - point_sorted[i + 1])
+    return np.sum(crowding, axis=1)
 
 
 def crowding_distance(points):
-    """端点特別処理を除去した混雑度計算"""
-    # 数値の安定性向上のためfloat64を使用
-    points = np.array(points, dtype=np.float64)
-    
-    # 次元が少ない場合の処理
-    if points.shape[0] <= 2:
-        return np.ones(points.shape[0])
-    
-    # first normalize across dimensions
-    points = (points - points.min(axis=0)) / (np.ptp(points, axis=0) + 1e-8)
-    # sort points per dimension
-    dim_sorted = np.argsort(points, axis=0)
-    point_sorted = np.take_along_axis(points, dim_sorted, axis=0)
-    
-    # 全ての点に対して前後の点との距離を計算
-    distances_full = np.zeros((points.shape[0], points.shape[1]))
-    
-    # 中間点の処理（従来通り）
-    if points.shape[0] > 4:
-        middle_distances = np.abs(point_sorted[1:-1] - point_sorted[2:])
-        distances_full[1:-1] = middle_distances
-    
-    # 端点の処理（特別扱いせず、隣接点との距離で計算）
-    if points.shape[0] >= 2:
-        # 最初の点は2番目の点との距離
-        distances_full[0] = np.abs(point_sorted[0] - point_sorted[1])
-        # 最後の点は最後から2番目の点との距離
-        distances_full[-1] = np.abs(point_sorted[-1] - point_sorted[-2])
-    
-    # sum distances of each dimension of the same point
-    crowding = np.zeros(points.shape)
-    for d in range(points.shape[1]):
-        crowding[dim_sorted[:, d], d] = distances_full[:, d]
-    
-    crowding = np.sum(crowding, axis=1)
-    return crowding
+    """端点特別処理を除去した混雑度計算（Numba JITで高速化）"""
+    pts = np.ascontiguousarray(np.array(points, dtype=np.float64))
+    return _crowding_distance_numba(pts)
 
 
 @dataclass
@@ -1331,18 +1334,12 @@ class PCN(MOAgent, MOPolicy):
             if idx < len(crowding_distances):
                 crowding_distances[idx] *= 0.05  # さらに20分の1のペナルティ
         
-        # 距離ベースの優先度を計算
-        distances = []
-        for i, (priority, step, episode) in enumerate(nd_episodes):
-            # 非支配解からの距離を計算（自分自身との距離0を除外）
-            dists_to_others = np.linalg.norm(nd_returns - nd_returns[i], axis=1).copy()
-            dists_to_others[i] = np.inf  # 自分自身を除外してminが0にならないように
-            dist = np.min(dists_to_others)
-            # Crowding Distanceと組み合わせ
-            combined_score = crowding_distances[i] / (dist + 1e-8)
-            distances.append(combined_score)
-        
-        distances = np.array(distances)
+        # 距離ベースの優先度を計算（ベクトル化）
+        diff = nd_returns[:, np.newaxis, :] - nd_returns[np.newaxis, :, :]
+        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=2))
+        np.fill_diagonal(dist_matrix, np.inf)
+        min_dists = np.min(dist_matrix, axis=1)
+        distances = crowding_distances / (min_dists + 1e-8)
         
         # 上位n個を選択
         n = min(n, len(nd_episodes))
