@@ -28,6 +28,7 @@ project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root))
 
 # デフォルト値（--jobs / --onprem / --cloud で上書き可能）
+# デフォルトは (256,1024) と (512,2048) の2構成のみ
 DEFAULT_JOB_COUNTS = [16, 32, 64]
 DEFAULT_NODE_CONFIGS = [
     ("(256,1024)", 256, 1024),
@@ -166,7 +167,7 @@ def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=3600,
+        default=3600000,
         help="1実行あたりのタイムアウト秒（デフォルト: 3600）",
     )
     parser.add_argument(
@@ -185,7 +186,7 @@ def main():
         "--cloud",
         type=str,
         default=None,
-        help="クラウドノード数のリスト（カンマ区切り、例: 0,1024,2048）",
+        help="クラウドノード数のリスト（カンマ区切り、例: 1024,2048）",
     )
     parser.add_argument(
         "--no-stream",
