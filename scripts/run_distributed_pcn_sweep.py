@@ -151,6 +151,44 @@ def _parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
+def _save_results(
+    out_file: Path,
+    records: list,
+    timestamp: str,
+    quick: bool,
+) -> None:
+    """結果をJSONとサマリーに保存。SIGKILL対策で各実行完了後に順次呼ぶ。"""
+    result = {
+        "timestamp": timestamp,
+        "quick_mode": quick,
+        "records": records,
+    }
+    out_file.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+
+    summary_path = out_file.with_suffix(".txt")
+    lines = [
+        "=" * 80,
+        f"実行時間記録 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"クイックモード: {quick}",
+        "=" * 80,
+        "",
+        "# phase1=初期エピソード収集, phase2=教師あり学習, phase3=改良された経験の実現",
+        "n_jobs  node_config              total(秒)  phase1(秒)  phase2(秒)  phase3(秒)  status",
+        "-" * 80,
+    ]
+    for rec in records:
+        status = "OK" if rec["success"] else "FAIL"
+        p1 = f"{rec['phase1_sec']:.1f}" if rec.get("phase1_sec") is not None else "-"
+        p2 = f"{rec['phase2_sec']:.1f}" if rec.get("phase2_sec") is not None else "-"
+        p3 = f"{rec['phase3_sec']:.1f}" if rec.get("phase3_sec") is not None else "-"
+        lines.append(
+            f"{rec['n_jobs']:6d}  {rec['node_config']:20s}  "
+            f"{rec['elapsed_sec']:8.1f}  {p1:>10}  {p2:>10}  {p3:>10}  {status}"
+        )
+    lines.extend(["", "=" * 80])
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description="distributed_pcn のジョブ数×ノード構成スイープ")
     parser.add_argument(
@@ -211,6 +249,9 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = args.output or f"execution_times_{timestamp}.json"
+    out_file = Path(output_path)
+    if not out_file.is_absolute():
+        out_file = project_root / out_file
 
     records = []
     total_runs = len(job_counts) * len(node_configs)
@@ -274,6 +315,7 @@ def main():
             if not r["success"]:
                 record["error"] = r.get("error", "unknown")
             records.append(record)
+            _save_results(out_file, records, timestamp, args.quick)
 
             status = "OK" if r["success"] else "FAIL"
             phase_str = ""
@@ -282,40 +324,8 @@ def main():
             run_end_str = datetime.now().strftime("%H:%M:%S")
             print(f"  → 完了: {run_end_str}  {status}  経過: {r['elapsed_sec']:.1f}秒{phase_str}")
 
-    # 結果を保存
-    result = {
-        "timestamp": timestamp,
-        "quick_mode": args.quick,
-        "records": records,
-    }
-    out_file = Path(output_path)
-    if not out_file.is_absolute():
-        out_file = project_root / out_file
-    out_file.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-
-    # サマリーファイル（人間が読みやすい形式）も出力
-    summary_path = out_file.with_suffix(".txt")
-    lines = [
-        "=" * 80,
-        f"実行時間記録 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"クイックモード: {args.quick}",
-        "=" * 80,
-        "",
-        "# phase1=初期エピソード収集, phase2=教師あり学習, phase3=改良された経験の実現",
-        "n_jobs  node_config              total(秒)  phase1(秒)  phase2(秒)  phase3(秒)  status",
-        "-" * 80,
-    ]
-    for rec in records:
-        status = "OK" if rec["success"] else "FAIL"
-        p1 = f"{rec['phase1_sec']:.1f}" if rec.get("phase1_sec") is not None else "-"
-        p2 = f"{rec['phase2_sec']:.1f}" if rec.get("phase2_sec") is not None else "-"
-        p3 = f"{rec['phase3_sec']:.1f}" if rec.get("phase3_sec") is not None else "-"
-        lines.append(
-            f"{rec['n_jobs']:6d}  {rec['node_config']:20s}  "
-            f"{rec['elapsed_sec']:8.1f}  {p1:>10}  {p2:>10}  {p3:>10}  {status}"
-        )
-    lines.extend(["", "=" * 80])
-    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    # 最終保存（ループ中に順次保存済み。SIGKILL対策で途中結果も残る）
+    _save_results(out_file, records, timestamp, args.quick)
 
     sweep_elapsed = time.time() - sweep_start
     ok_count = sum(1 for rec in records if rec["success"])
@@ -325,7 +335,7 @@ def main():
     print(f"  総所要時間: {sweep_elapsed/60:.1f}分 ({sweep_elapsed:.0f}秒)")
     print(f"  結果を保存しました:")
     print(f"    JSON: {out_file}")
-    print(f"    サマリー: {summary_path}")
+    print(f"    サマリー: {out_file.with_suffix('.txt')}")
     print("=" * 70)
 
 
