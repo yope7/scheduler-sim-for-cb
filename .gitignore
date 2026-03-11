@@ -226,6 +226,10 @@ origin_paper/
 *.html
 *.txt
 *.csv
+*.json
+*.md
+*.MD
+
 dqn_models_32/
 # artifacts
 /dqn_models_32/
