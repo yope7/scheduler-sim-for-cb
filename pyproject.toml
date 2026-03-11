@@ -94,6 +94,9 @@ dependencies = [
     "wrapt==1.16.0",
     "scheduling_env_core",
     "nsga2_core",
+    "jax[cuda12]>=0.4.0",
+    "optax>=0.2.0",
+    "flax>=0.7.0",
 ]
 
 [tool.uv.sources]

@@ -830,6 +830,9 @@ class PCN(MOAgent, MOPolicy):
             ).to(self.device)
             
             self.target_network.load_state_dict(self.network.state_dict())
+            if os.environ.get('DISTRIBUTED_PCN_USE_TORCH_COMPILE', '0') == '1':
+                if hasattr(th, 'compile') and callable(getattr(th, 'compile', None)) and str(self.device) != 'cpu':
+                    self.network = th.compile(self.network, mode='reduce-overhead')
             self.opt = th.optim.Adam(self.network.parameters(), lr=self.learning_rate)
         else:
             if model_class is None:
@@ -841,6 +844,10 @@ class PCN(MOAgent, MOPolicy):
             self.model = model_class(
                 self.observation_dim, self.action_dim, self.reward_dim, self.scaling_factor, hidden_dim=self.hidden_dim
             ).to(self.device, non_blocking=True)
+            # torch.compile（デフォルト無効: このワークロードではオーバーヘッドが大きい）
+            if os.environ.get('DISTRIBUTED_PCN_USE_TORCH_COMPILE', '0') == '1':
+                if hasattr(th, 'compile') and callable(getattr(th, 'compile', None)) and str(self.device) != 'cpu':
+                    self.model = th.compile(self.model, mode='reduce-overhead')
             self.opt = th.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
         self.log = log
@@ -917,26 +924,11 @@ class PCN(MOAgent, MOPolicy):
             "seed": self.seed,
         }
 
-    def update(self, learning_rate=None):
-        """Update PCN model - 最適化版
-        
-        Args:
-            learning_rate (float, optional): 一時的な学習率。Noneの場合はデフォルトの学習率を使用
-        """
-        import time
-        start_time = time.time()
-        
-        # 一時的な学習率の適用
-        original_lr = None
-        if learning_rate is not None:
-            original_lr = self.opt.param_groups[0]['lr']
-            self.opt.param_groups[0]['lr'] = learning_rate
-        
-        # 1. 事前にnumpy配列を準備（メモリアロケーション削減）
+    def get_training_batch(self):
+        """学習用バッチをサンプリングして返す（JAX等の外部学習用）。
+        Returns: (observations, actions, desired_returns, desired_horizons) の numpy 配列"""
         batch_size = self.batch_size
         buffer_size = len(self.experience_replay)
-        
-        # 2. ベクトル化されたサンプリング
         sample_indices = self.np_random.choice(buffer_size, size=batch_size, replace=True)
         
         # 3. 事前に配列を確保（メモリアロケーション削減）
@@ -971,21 +963,12 @@ class PCN(MOAgent, MOPolicy):
             observations[i] = obs_data
             actions[i] = transition.action
             
-            # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i
-            remaining_return = np.zeros(reward_shape, dtype=np.float32)
-            for j in range(t, episode_length):
-                # 論文の式: R_t = Σ_{i=t}^T γ^i r_i
-                # ここで episode[j].reward は即時報酬 r_j
-                reward = episode[j].reward
-                # NaN/Infチェック
-                if np.any(np.isnan(reward)) or np.any(np.isinf(reward)):
-                    if self.debug_mode:
-                        print(f"[PCN] 警告: エピソード {idx}, ステップ {j} の報酬にNaN/Infが含まれています")
-                        print(f"  報酬: {reward}")
-                    # NaN/Infの場合は0に置き換え
-                    reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                remaining_return += (self.gamma ** (j - t)) * reward
+            # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i（ベクトル化）
+            n_remaining = episode_length - t
+            rewards_slice = np.array([episode[j].reward for j in range(t, episode_length)], dtype=np.float32)
+            rewards_slice = np.nan_to_num(rewards_slice, nan=0.0, posinf=0.0, neginf=0.0)
+            discounts = np.power(self.gamma, np.arange(n_remaining, dtype=np.float32))
+            remaining_return = np.dot(discounts, rewards_slice)
             
             # NaN/Infチェックと値のクリッピング
             if np.any(np.isnan(remaining_return)) or np.any(np.isinf(remaining_return)):
@@ -1021,11 +1004,18 @@ class PCN(MOAgent, MOPolicy):
             if self.debug_mode:
                 print(f"[PCN] 警告: desired_returnsに異常に大きい値が含まれています")
                 print(f"  min={np.min(desired_returns)}, max={np.max(desired_returns)}, mean={np.mean(desired_returns)}")
-            # クリッピングを再適用（念のため）
             desired_returns = np.clip(desired_returns, -1000.0, 1000.0)
-        
+        return observations, actions, desired_returns, desired_horizons
+
+    def update(self, learning_rate=None):
+        """Update PCN model - 最適化版"""
+        start_time = time.time()
+        original_lr = None
+        if learning_rate is not None:
+            original_lr = self.opt.param_groups[0]['lr']
+            self.opt.param_groups[0]['lr'] = learning_rate
+        observations, actions, desired_returns, desired_horizons = self.get_training_batch()
         with th.cuda.amp.autocast(enabled=self.use_amp):  # 混合精度学習
-            # 非同期転送でCPU-GPU並列化
             obs = th.from_numpy(observations).to(self.device, non_blocking=True)
             actions = th.from_numpy(actions).to(self.device, non_blocking=True)
             desired_return = th.from_numpy(desired_returns).to(self.device, non_blocking=True)

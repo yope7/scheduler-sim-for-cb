@@ -10,6 +10,7 @@ distributed_pcn.py を外側から実行し、
 使用方法:
   python scripts/run_distributed_pcn_sweep.py
   python scripts/run_distributed_pcn_sweep.py --quick   # 短時間モードでテスト
+  python scripts/run_distributed_pcn_sweep.py --event   # イベントベース観測で実行
   python scripts/run_distributed_pcn_sweep.py -o results.json
   python scripts/run_distributed_pcn_sweep.py --jobs 16,32 --onprem 256 --cloud 1024
 """
@@ -41,12 +42,14 @@ def run_distributed_pcn(
     n_on_prem: int,
     n_cloud: int,
     quick: bool = False,
+    event_obs: bool = False,
     timeout: int = 3600,
     stream_output: bool = True,
 ) -> dict:
     """
     distributed_pcn をサブプロセスで実行し、実行時間を返す。
     stream_output=True のとき、サブプロセスの出力をリアルタイムで表示する。
+    event_obs=True のとき、イベントベース観測（distributed_pcn_event）で実行する。
     """
     env = os.environ.copy()
     env["DISTRIBUTED_PCN_JOBS"] = str(n_jobs)
@@ -54,8 +57,11 @@ def run_distributed_pcn(
     env["DISTRIBUTED_PCN_CLOUD"] = str(n_cloud)
     if quick:
         env["DISTRIBUTED_PCN_QUICK"] = "1"
+    if event_obs:
+        env["DISTRIBUTED_PCN_USE_EVENT_OBS"] = "1"
 
-    cmd = [sys.executable, "-m", "src.distributed.distributed_pcn"]
+    module = "src.distributed.distributed_pcn_event" if event_obs else "src.distributed.distributed_pcn"
+    cmd = [sys.executable, "-m", module]
     start = time.time()
     output_lines: list[str] = []
     timed_out = [False]  # mutable for closure
@@ -156,11 +162,13 @@ def _save_results(
     records: list,
     timestamp: str,
     quick: bool,
+    event_obs: bool = False,
 ) -> None:
     """結果をJSONとサマリーに保存。SIGKILL対策で各実行完了後に順次呼ぶ。"""
     result = {
         "timestamp": timestamp,
         "quick_mode": quick,
+        "event_obs": event_obs,
         "records": records,
     }
     out_file.write_text(json.dumps(result, indent=2, ensure_ascii=False))
@@ -170,6 +178,7 @@ def _save_results(
         "=" * 80,
         f"実行時間記録 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"クイックモード: {quick}",
+        f"イベント観測: {event_obs}",
         "=" * 80,
         "",
         "# phase1=初期エピソード収集, phase2=教師あり学習, phase3=改良された経験の実現",
@@ -231,6 +240,11 @@ def main():
         action="store_true",
         help="distributed_pcn の出力をリアルタイム表示しない（完了後にまとめて表示）",
     )
+    parser.add_argument(
+        "--event",
+        action="store_true",
+        help="イベントベース観測（distributed_pcn_event）で実行（ビットマップ撤廃）",
+    )
     args = parser.parse_args()
 
     # ジョブ数・ノード構成の決定
@@ -265,6 +279,7 @@ def main():
     print(f"  ノード構成: {[nc[0] for nc in node_configs]}")
     print(f"  総実行数: {total_runs}")
     print(f"  クイックモード: {args.quick}")
+    print(f"  イベント観測: {args.event}")
     print(f"  出力先: {output_path}")
     print(f"  開始時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
@@ -294,6 +309,7 @@ def main():
                 n_on_prem=n_on_prem,
                 n_cloud=n_cloud,
                 quick=args.quick,
+                event_obs=args.event,
                 timeout=args.timeout,
                 stream_output=not args.no_stream,
             )
@@ -315,7 +331,7 @@ def main():
             if not r["success"]:
                 record["error"] = r.get("error", "unknown")
             records.append(record)
-            _save_results(out_file, records, timestamp, args.quick)
+            _save_results(out_file, records, timestamp, args.quick, args.event)
 
             status = "OK" if r["success"] else "FAIL"
             phase_str = ""
@@ -325,7 +341,7 @@ def main():
             print(f"  → 完了: {run_end_str}  {status}  経過: {r['elapsed_sec']:.1f}秒{phase_str}")
 
     # 最終保存（ループ中に順次保存済み。SIGKILL対策で途中結果も残る）
-    _save_results(out_file, records, timestamp, args.quick)
+    _save_results(out_file, records, timestamp, args.quick, args.event)
 
     sweep_elapsed = time.time() - sweep_start
     ok_count = sum(1 for rec in records if rec["success"])

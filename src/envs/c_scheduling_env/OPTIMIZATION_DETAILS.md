@@ -106,10 +106,10 @@ cache = WindowCache(self._onpre_status_c, H, W)
 ## 使用方法
 
 ```python
-from src.envs.c_scheduling_env.scheduling_env_optimized import SchedulingEnvOptimized
+from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
 
 # 最適化された環境を作成
-env = SchedulingEnvOptimized(
+env = SchedulingEnvCacheOptimized(
     max_step, n_window, n_on_premise_node, n_cloud_node,
     n_job_queue_obs, n_job_queue_bck,
     weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action,

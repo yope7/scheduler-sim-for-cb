@@ -33,7 +33,7 @@ def main():
     n_window = config['param_env']['n_window']
     n_on_premise = config['param_env']['n_on_premise_node']
     n_cloud = config['param_env']['n_cloud_node']
-    obs_window_size = 30  # scheduling_env.py より
+    obs_window_size = 10  # scheduling_env.py より
     
     # 観測空間サイズ
     obs_size = n_on_premise * obs_window_size + n_cloud * obs_window_size + 8 * 5

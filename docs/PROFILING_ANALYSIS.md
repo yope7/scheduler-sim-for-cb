@@ -1,42 +1,94 @@
 # 分散PCN プロファイリング分析レポート
 
 ## 実行環境
-- クイックモード: N_ITERATIONS=3, N_ACTORS=4, INITIAL_EPISODES=10
+- クイックモード: N_ITERATIONS=5, N_ACTORS=12, INITIAL_EPISODES=100
 - 観測空間: 256×30 + 1024×30 + 40 = 38,440 要素 (float32 ≈ 153KB/観測)
 
-## ボトルネック特定結果
+## 最新プロファイリング結果（2026-03-11）
+
+### cProfile + 詳細タイミング + py-spy による計測
+
+| フェーズ | 時間 | 割合 |
+|----------|------|------|
+| Phase1 (初期エピソード収集) | 32s | 32% |
+| Phase2 (教師あり学習) | 13s | 13% |
+| Phase3 (改良経験の実現) | 29s | 29% |
+| **合計** | **~100s** | 100% |
+
+### Phase1 の Learner 内訳
+| 処理 | 時間 | 備考 |
+|------|------|------|
+| **get_episodes** | **12s** | 1200エピソードの Ray シリアライゼーション・転送 |
+| add_episodes | 0.3s | 軽微 |
+| update | 1.7s | GPU学習 |
+
+### Phase3 の 1イテレーションあたり
+| 処理 | 時間 |
+|------|------|
+| Actor実行 (12エピソード) | 2.1s |
+| Learner get_episodes | 0.02-0.5s |
+| Learner update | 1.3-1.7s |
+
+### Actor 内訳（env.step）
+- **1.1-1.5ms/step**（32 steps/エピソード、約40ms/エピソード）
+- 過去の 7.5ms/step から大幅改善済み（get_observation 最適化の効果）
+
+### py-spy サンプル数 Top（アプリ関連）
+| サンプル数 | 関数 | 備考 |
+|------------|------|------|
+| 16,109 | _run_episode | Actor のエピソード実行 |
+| 13,015 | array2string / _array_str_implementation | **NumPy 配列→文字列変換** |
+| 4,284 | update | Learner の GPU 学習 |
+| 2,482 | step | env.step |
+| 1,524 | get_training_batch | バッチ取得 |
+| 1,415 | time_transition | C 拡張 |
+| 952 | _make_env | 環境作成 |
+| 795 | update_weights_ref | 重み更新 |
+| 564 | serialize / _serialize_to_msgpack | Ray シリアライゼーション |
+
+### 新規発見: array2string のボトルネック
+- **原因**: Phase1 で `hash(str(obs))` が各エピソード開始時に呼ばれる（`distributed_pcn.py:483`）
+- 観測は 38,440 要素の NumPy 配列。`str(obs)` が `array2string` を呼び、大規模配列の文字列化で重い
+- **発生箇所**: `episode_seed = ... + hash(str(obs))`（random_actions=True 時のみ、Phase1 の 1200 エピソード）
+- **対策**: `obs.tobytes()` や `hash(obs.tobytes())` など、文字列化しないハッシュ方法に変更
+
+---
+
+## ボトルネック特定結果（過去データ含む）
 
 ### 1. フェーズ3（メイン学習ループ）の内訳
 
 | 処理 | 時間 | 割合 |
 |------|------|------|
-| Actor実行 | 1.0-1.4s/iter | ~50% |
-| Learner実行 | 1.0-1.3s/iter | ~50% |
+| Actor実行 | 2.1s/iter | ~40% |
+| Learner実行 | 1.3-1.7s/iter | ~50% |
 
 ### 2. Actor内訳（1エピソードあたり）
-- **env.step ループ**: ~0.24s (32 steps, **7.5ms/step**)
+- **env.step ループ**: ~40ms (32 steps, **1.2ms/step**)
 - **_choose_commands**: 0.008-0.26s（初回のみ遅い、2回目以降はキャッシュで高速）
 - **get_weights**: エピソード開始前に1回（並列実行のため影響小）
 
 ### 3. Learner内訳
-- **get_episodes**: 0.02-0.67s（バッファサイズに依存、40エピソードで0.5s）
+- **get_episodes**: Phase1 で **12s**（1200エピソード）、Phase3 で 0.02-0.5s
 - **add_episodes**: 0.001-0.025s（軽微）
-- **update (GPU学習)**: **0.67-1.07s**（主要ボトルネック）
+- **update (GPU学習)**: **1.3-1.7s**（主要ボトルネック）
 
-## ボトルネックの優先度
+## ボトルネックの優先度（2026-03-11 更新）
 
-### 高: env.step (7.5ms/step)
-- 32ジョブ × 32ステップ/エピソード × 16 Actor × 2エピソード = 32,768 steps/iter
-- 並列化されているが、1 Actor あたり 64 steps × 7.5ms = 480ms
-- **原因**: 観測作成（38K要素の配列）、C拡張の呼び出しオーバーヘッド
+### 最優先: Phase1 get_episodes (12s)
+- 1200エピソードの Ray シリアライゼーション・転送
+- エピソードデータの圧縮、Object Store の最適化
 
-### 高: Learner update (0.8s)
+### 最優先: hash(str(obs)) → array2string (py-spy で 13k サンプル)
+- Phase1 の各エピソード開始時に `hash(str(obs))` で 38K 配列を文字列化
+- `obs.tobytes()` や `hash(obs.tobytes())` に変更
+
+### 高: Learner update (1.3-1.7s/iter)
 - GPU学習が1イテレーションの約40%を占有
 - N_UPDATES=5 のため5回のパラメータ更新
 
-### 中: get_episodes (Ray シリアライゼーション)
-- 40エピソード × 32遷移 × (観測×2 + 報酬等) ≈ 数百MBのシリアライズ
-- フェーズ1で0.5s、フェーズ3では4エピソードで0.05sと小さい
+### 中: env.step (1.2ms/step)
+- 既に最適化済み。大規模時は 4.5ms/step まで悪化
 
 ### 低: _choose_commands
 - 初回0.26s、2回目以降0.008s（Learner側の_nlargest）
@@ -95,25 +147,45 @@ watch -n 1 python scripts/check_gpu_usage.py
 # または nvidia-smi で GPU 使用率・メモリを確認
 ```
 
+## プロファイリングの実行方法
+
+```bash
+# 詳細タイミング（Actor/Learner 内訳）
+DISTRIBUTED_PCN_PROFILE=1 uv run python scripts/profile_distributed_pcn.py --quick
+
+# cProfile（メインプロセスのみ、Ray 待ちが大半）
+uv run python scripts/profile_distributed_pcn.py --cprofile -o profile_pcn.prof
+
+# py-spy（全プロセス・C拡張含むサンプリング）
+py-spy record --format speedscope --output pcn.speedscope.json --duration 100 --subprocesses -- uv run python -m src.distributed.distributed_pcn
+# 結果は https://www.speedscope.app/ で可視化
+```
+
 ## 必要な最適化（ハイパラメータ変更を除く）
 
-### 優先度 高
-1. **Ray get_episodes のシリアライゼーション** (large で 0.8s)
-   - エピソードデータの圧縮（観測の量子化、重複排除）
-   - Object Store の zero-copy 転送（Arrow 等）
-   - バッチサイズの最適化（送信単位の見直し）
+### 優先度 最優先
+1. **hash(str(obs)) の削除** (py-spy で 13k サンプル)
+   - `distributed_pcn.py:483`: `episode_seed = ... + hash(str(obs))` を `hash(obs.tobytes())` 等に変更
+   - Phase1 の 1200 エピソードで 38K 配列の文字列化が発生
 
-2. **env.step の観測作成** (large で 4.5ms/step)
+2. **Phase1 get_episodes (12s)**
+   - 1200エピソードの Ray シリアライゼーション・転送
+   - エピソードデータの圧縮、Object Store の最適化
+
+### 優先度 高
+3. **Learner update (1.3-1.7s/iter)**
+   - GPU学習のボトルネック。N_UPDATES の調整はハイパラ変更のため除外
+
+4. **env.step の観測作成** (large で 4.5ms/step)
    - C 拡張内での観測作成（Python 呼び出し削減）
    - 観測の遅延評価・差分更新
 
 ### 優先度 中
-3. **Learner の CUDA フォールバック**
+5. **Learner の CUDA フォールバック**
    - `_get_available_device` で `torch.cuda.is_available()` をチェックし、無い場合は `'cpu'` を返す
 
-4. ~~**Actor と Learner のオーバーラップ**~~ ✓ 実装済み
-   - Learner(i) と Actor(i+1) を並列実行して待ち時間を隠蔽
+6. ~~**Actor と Learner のオーバーラップ**~~ ✓ 実装済み
 
 ### 優先度 低
-5. **get_weights の共有**
+7. **get_weights の共有**
    - ObjectRef による重み共有は既に実装済み。Actor 数が多い場合の競合確認

@@ -27,7 +27,7 @@
 
 **実装:**
 ```python
-class SchedulingEnvCacheOptimized(SchedulingEnvOptimized):
+class SchedulingEnvCacheOptimized(SchedulingEnv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # 変更フラグを導入

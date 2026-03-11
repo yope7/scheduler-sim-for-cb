@@ -23,6 +23,10 @@ import psutil  # メモリ情報取得用
 # CUDAが利用できない場合の警告を抑制
 warnings.filterwarnings('ignore', message="Can't initialize NVML")
 warnings.filterwarnings('ignore', message="torch.cuda.amp.GradScaler is enabled, but CUDA is not available")
+# TF32 を有効化（A40 等で高速化）、警告も抑制
+if th.cuda.is_available():
+    th.set_float32_matmul_precision('high')
+warnings.filterwarnings('ignore', message="TensorFloat32 tensor cores")
 
 # =========================
 # 0. ハイパーパラメータ設定
@@ -32,14 +36,14 @@ DEBUG = False
 TIME_DEBUG = True  # 各フェーズの経過時間を表示
 ENABLE_VISUALIZATION = True
 
-N_ITERATIONS = 10  # 全体の学習イテレーション数
-N_ACTORS = 16      # 並列実行するActorの数
-N_JOBS = 32 # ジョブ数
+N_ITERATIONS = 200  # 全体の学習イテレーション数
+N_ACTORS = 32      # 並列実行するActorの数
+N_JOBS = 1024 # ジョブ数
 
 EVAL_INTERVAL = 5  # 評価を実行する間隔（イテレーション数）
 USE_DISTRIBUTED_EVAL = False  # 分散評価を使用するかどうか
 
-BATCH_SIZE = 2048
+BATCH_SIZE = 2048  # 実験規模を変えない（GPU 時も同じ）
 N_UPDATES = 5  # 学習更新回数（3に減らすと高速化、精度はやや低下の可能性）
 LEARNING_RATE = 1e-2
 
@@ -48,7 +52,7 @@ EARLY_STOPPING_THRESHOLD = 0.0001  # 改善とみなす最小変化量
 MIN_ITERATIONS = 5  # 最低限実行するイテレーション数
 
 
-INITIAL_EPISODES =  50 #初期エピソード数
+INITIAL_EPISODES =  200 #初期エピソード数
 
 USE_ENHANCED_MODEL = False  # True: EnhancedPCNModel, False: DiscreteActionsDefaultModel (3層NLPモデル)
 
@@ -65,7 +69,7 @@ EPISODES_PER_ITERATION = 2  # 各イテレーションで各Actorが生成する
 EVAL_SAMPLES = 100  # 評価時に使用するサンプル数
 EVAL_SAMPLES_DISTRIBUTED = 10  # 分散評価時に使用するサンプル数
 EVAL_SAMPLES_FINAL = 100  # 最終評価時に使用するサンプル数
-EVAL_SAMPLES_VISUALIZATION = 20  # 反復可視化用（少なめで高速化、パレートフロントは十分描ける）
+EVAL_SAMPLES_VISUALIZATION = 100  # 反復可視化用（少なめで高速化、パレートフロントは十分描ける）
 
 # プロファイリング用: 環境変数で短時間実行モードを有効化
 _PROFILE_MODE = os.environ.get('DISTRIBUTED_PCN_PROFILE', '0') == '1'
@@ -74,6 +78,11 @@ _QUICK_MODE = os.environ.get('DISTRIBUTED_PCN_QUICK', '0') == '1'
 _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
 # 高速化モード: N_UPDATESを3に削減（本番でも有効、DISTRIBUTED_PCN_FAST=1）
 _FAST_MODE = os.environ.get('DISTRIBUTED_PCN_FAST', '0') == '1'
+_USE_JAX_LEARNER = os.environ.get('DISTRIBUTED_PCN_USE_JAX', '0') == '1'
+# イベントベース観測（ビットマップ撤廃）: DISTRIBUTED_PCN_USE_EVENT_OBS=1
+_USE_EVENT_OBS = os.environ.get('DISTRIBUTED_PCN_USE_EVENT_OBS', '0') == '1'
+if _USE_EVENT_OBS:
+    print("[ENV] イベントベース観測モード: ビットマップ不使用、開始/終了/継続時間のみで学習")
 if _QUICK_MODE:
     N_ITERATIONS = 5
     N_ACTORS = 12
@@ -98,7 +107,11 @@ from src.agents.pcn_agent import (
 )
 from src.envs.scheduling_env import SchedulingEnv
 from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
 from src.utils.job_gen.job_generator import JobGenerator
+
+# 使用する環境クラス（イベント観測モード時はSchedulingEnvEventObs）
+_EnvClass = SchedulingEnvEventObs if _USE_EVENT_OBS else SchedulingEnvCacheOptimized
 
 # =========================
 # 1. Replay Buffer (Ray Actor)
@@ -337,7 +350,7 @@ class Actor:
                 self.config, n_jobs, 0.2, 0
             )
             jobs_set = job_generator.generate_jobs_set()
-            self.env = SchedulingEnvCacheOptimized(
+            self.env = _EnvClass(
                 np.inf,
                 self.config['param_env']['n_window'],
                 self.config['param_env']['n_on_premise_node'],
@@ -383,7 +396,9 @@ class Actor:
                 print(f"Actor {self.actor_id} model: {'EnhancedPCNModel' if USE_ENHANCED_MODEL else 'DiscreteActionsDefaultModel'}")
         return self.env
 
-    def run(self, n_episodes=10, random_actions=False):
+    def run(self, n_episodes=10, random_actions=False, pre_fetched_commands=None):
+        """pre_fetched_commands: list of (desired_return, desired_horizon), length n_actors*n_episodes.
+        指定時は_choose_commandsのリモート呼び出しをスキップ（Learner負荷削減）。"""
         if self.env is None:
             self._make_env()
         
@@ -399,7 +414,12 @@ class Actor:
         
         for ep in range(n_episodes):
             try:
-                episode = self._run_episode(random_actions)
+                cmd = None
+                if pre_fetched_commands is not None:
+                    idx = self.actor_id * n_episodes + ep
+                    if idx < len(pre_fetched_commands):
+                        cmd = pre_fetched_commands[idx]
+                episode = self._run_episode(random_actions, pre_fetched_command=cmd)
                 # print("done")
                 
                 # エピソードを一時保存
@@ -443,7 +463,8 @@ class Actor:
             print(f"[Actor {self.actor_id}] {episodes_generated} エピソードを生成し、ReplayBufferに追加しました")
         return episodes_generated
 
-    def _run_episode(self, random_actions=False):
+    def _run_episode(self, random_actions=False, pre_fetched_command=None):
+        """pre_fetched_command: (desired_return, desired_horizon) が指定されていれば_choose_commandsをスキップ"""
         obs = self.env.reset()
         done = False
         transitions = []
@@ -453,10 +474,13 @@ class Actor:
         
         if not random_actions:
             solution_selection_start_time = time.time()
-            t_choose_start = time.time()
-            desired_return, desired_horizon = ray.get(self.learner._choose_commands.remote(50))
-            if _PROFILE_MODE:
-                print(f"[PROFILE Actor {self.actor_id}] _choose_commands: {time.time()-t_choose_start:.3f}s")
+            if pre_fetched_command is not None:
+                desired_return, desired_horizon = pre_fetched_command
+            else:
+                t_choose_start = time.time()
+                desired_return, desired_horizon = ray.get(self.learner._choose_commands.remote(50))
+                if _PROFILE_MODE:
+                    print(f"[PROFILE Actor {self.actor_id}] _choose_commands: {time.time()-t_choose_start:.3f}s")
             self.agent.set_desired_return_and_horizon(desired_return, desired_horizon)
             
             # print(f"[Actor {self.actor_id}] 改良された解の選択完了: 目標報酬={desired_return}, ホライズン={desired_horizon}")
@@ -464,7 +488,7 @@ class Actor:
         # ランダムアクションの場合、エピソードごとに異なるシードを設定
         if random_actions:
             # Actor ID、現在時刻、エピソードIDを組み合わせてユニークなシードを生成
-            episode_seed = (int(time.time() * 1000000) + self.actor_id * 10000 + hash(str(obs))) % 10000
+            episode_seed = (int(time.time() * 1000000) + self.actor_id * 10000 + hash(obs.tobytes())) % 10000
             np.random.seed(episode_seed)
             if DEBUG:
                 print(f"[Actor {self.actor_id}] ランダムアクション用シード設定: {episode_seed}")
@@ -625,14 +649,14 @@ class Learner:
         # より堅牢なデバイス検出
         self.actual_device = self._get_available_device(device)
         
-        # PCNエージェントを正しいデバイスで初期化（GPU使用時はGPUで初期化）
+        # PCNエージェントを正しいデバイスで初期化（GPU使用時はGPUで初期化、BATCH_SIZE使用）
         self.agent = PCN(
             self.env,
             device=self.actual_device,  # 検出したデバイスで初期化
             state_dim=self.env.observation_space.shape[0],
             scaling_factor=np.array([1, 1, 1]),
             learning_rate=LEARNING_RATE,
-            batch_size=512,
+            batch_size=BATCH_SIZE,
             hidden_dim=512,
             project_name="temp",
             experiment_name="PCN",
@@ -647,6 +671,31 @@ class Learner:
         self.last_eval_step = 0  # 最後に評価を行ったステップ
         self._hash_cache = {}  # エピソードのハッシュ値キャッシュ（idをキーとして使用）
         self._weights_ref = None  # 重みのObjectRefを保持（重みの共有用）
+        self._use_jax = False
+        if _USE_JAX_LEARNER and USE_ENHANCED_MODEL is False:
+            try:
+                from src.agents.pcn_jax import (
+                    init_model, PCNModelJAX, jax_params_to_pytorch_state_dict,
+                    JAX_AVAILABLE,
+                )
+                import jax
+                import optax
+                if JAX_AVAILABLE:
+                    state_dim = self.env.observation_space.shape[0]
+                    action_dim = self.env.action_space.n
+                    reward_dim = self.env.reward_space.shape[0]
+                    key = jax.random.PRNGKey(42)
+                    self._jax_model, self._jax_params = init_model(
+                        state_dim, action_dim, reward_dim, 512,
+                        [1, 1, 1], key
+                    )
+                    self._jax_opt = optax.adam(LEARNING_RATE)
+                    self._jax_opt_state = self._jax_opt.init(self._jax_params)
+                    self._jax_key = key
+                    self._use_jax = True
+                    print("[Learner] JAX+CUDA 学習を有効化")
+            except Exception as e:
+                print(f"[Learner] JAX初期化失敗、PyTorchにフォールバック: {e}")
         if DEBUG:
             print(f"Learner initialized with device: {self.actual_device}")
             print(f"Learner model: {'EnhancedPCNModel' if USE_ENHANCED_MODEL else 'DiscreteActionsDefaultModel'}")
@@ -689,7 +738,7 @@ class Learner:
             self.config, n_jobs, 0.2, 0
         )
         jobs_set = job_generator.generate_jobs_set()
-        env = SchedulingEnvCacheOptimized(
+        env = _EnvClass(
             np.inf,
             self.config['param_env']['n_window'],
             self.config['param_env']['n_on_premise_node'],
@@ -710,14 +759,45 @@ class Learner:
             print("[Learner] ⚠️ C実装環境の初期化に問題があります")
         return env
 
+    def _jax_update_step(self) -> float:
+        """JAX で 1 ステップ学習更新。get_weights で PyTorch state_dict に変換して返す。"""
+        import jax
+        import jax.numpy as jnp
+        import optax
+        from src.agents.pcn_jax import JAX_AVAILABLE
+        if not JAX_AVAILABLE:
+            return 0.0
+        obs, actions, desired_returns, desired_horizons = self.agent.get_training_batch()
+        desired_horizons = desired_horizons[:, np.newaxis].astype(np.float32)
+        obs_j = jnp.array(obs)
+        dr_j = jnp.array(desired_returns)
+        dh_j = jnp.array(desired_horizons)
+        actions_j = jnp.array(actions)
+
+        def loss_fn(params):
+            logits = self._jax_model.apply(params, obs_j, dr_j, dh_j)
+            one_hot = jax.nn.one_hot(actions_j, logits.shape[-1])
+            nll = -jnp.sum(one_hot * logits, axis=-1)
+            return jnp.mean(nll)
+
+        loss_val, grads = jax.value_and_grad(loss_fn)(self._jax_params)
+        updates, self._jax_opt_state = self._jax_opt.update(grads, self._jax_opt_state)
+        self._jax_params = optax.apply_updates(self._jax_params, updates)
+        return float(np.array(loss_val))
+
     def get_weights(self):
         # CPUデバイスでモデルの重みを返す（ActorがCPUで実行されるため）
-        # use_enhanced_modelの場合はnetwork、そうでない場合はmodelを使用
+        if getattr(self, '_use_jax', False):
+            from src.agents.pcn_jax import jax_params_to_pytorch_state_dict
+            return jax_params_to_pytorch_state_dict(self._jax_params, scaling_factor=np.array([1, 1, 1]))
         if USE_ENHANCED_MODEL and hasattr(self.agent, 'network'):
             model_state = self.agent.network.state_dict()
         else:
             model_state = self.agent.model.state_dict()
-        return {k: v.cpu() for k, v in model_state.items()}
+        # torch.compile が _orig_mod. プレフィックスを付ける場合の除去
+        def strip_orig_mod(d):
+            return {k.replace('_orig_mod.', ''): v.cpu() for k, v in d.items()}
+        return strip_orig_mod(model_state)
     
     def get_weights_ref(self):
         """モデルの重みのObjectRefを取得（重みの共有用）"""
@@ -960,14 +1040,14 @@ class Learner:
             print(f"警告: 取得したエピソード数 {len(all_episodes)} に対して、Learnerのバッファには {final_buffer_size} 個しか追加されていません。")
         
         # 学習更新を実行
-        # モデルは既に正しいデバイス（GPU使用時はGPU）で初期化されているため、
-        # 毎回のto('cuda')/to('cpu')の転送は不要（無駄なオーバーヘッドを削減）
         t_update_start = time.time()
         for i in range(n_updates):
-            # PCNエージェントのupdateメソッドを呼び出し
             try:
-                loss, _ = self.agent.update()
-                loss_value = loss.item() if hasattr(loss, 'item') else float(loss)
+                if getattr(self, '_use_jax', False):
+                    loss_value = self._jax_update_step()
+                else:
+                    loss, _ = self.agent.update()
+                    loss_value = loss.item() if hasattr(loss, 'item') else float(loss)
                 
                 # NaNチェック
                 if np.isnan(loss_value) or np.isinf(loss_value):
@@ -1022,10 +1102,15 @@ class Learner:
         """エージェントの評価を実行"""
         if max_return is None:
             max_return = np.full(2, 100.0, dtype=np.float32)
-        
+        if getattr(self, '_use_jax', False):
+            from src.agents.pcn_jax import jax_params_to_pytorch_state_dict
+            sd = jax_params_to_pytorch_state_dict(self._jax_params, scaling_factor=np.array([1, 1, 1]))
+            # torch.compile 時は _orig_mod. プレフィックスが必要
+            if any(k.startswith('_orig_mod.') for k in self.agent.model.state_dict().keys()):
+                sd = {'_orig_mod.' + k: v for k, v in sd.items()}
+            self.agent.model.load_state_dict(sd, strict=False)
         if DEBUG:
             print("評価を実行中...")
-        # PCNエージェントのevaluate()を呼び出し（内部で出力処理も行われる）
         e_returns, e_value, distances, map_fin = self.agent.evaluate(self.env, max_return, n=n)
         
         # PCNエージェントのevaluate()で既に出力されているため、
@@ -1096,10 +1181,13 @@ class Learner:
         return len(self.agent.experience_replay)
 
     def update(self, learning_rate=None):
-        """PCNエージェントのupdateメソッドを呼び出す"""
-        loss, _ = self.agent.update(learning_rate=learning_rate)
-        # 学習後に重みのObjectRefを更新（全Actorで共有される）
-        # 重みが更新された場合のみObjectRefを更新
+        """PCNエージェントのupdateメソッドを呼び出す（JAX時は_jax_update_step）"""
+        if getattr(self, '_use_jax', False):
+            loss_val = self._jax_update_step()
+            loss = th.tensor(loss_val, dtype=th.float32) if loss_val is not None else None
+            _ = None
+        else:
+            loss, _ = self.agent.update(learning_rate=learning_rate)
         if loss is not None:
             self.update_weights_ref()
         return loss, _
@@ -1156,13 +1244,16 @@ class Learner:
         try:
             import torch
             import os
-            
-            # ディレクトリが存在しない場合は作成
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            
-            # モデルの状態辞書を保存
+            if getattr(self, '_use_jax', False):
+                from src.agents.pcn_jax import jax_params_to_pytorch_state_dict
+                model_state_dict = jax_params_to_pytorch_state_dict(self._jax_params, scaling_factor=np.array([1, 1, 1]))
+            elif USE_ENHANCED_MODEL and hasattr(self.agent, 'network'):
+                model_state_dict = self.agent.network.state_dict()
+            else:
+                model_state_dict = self.agent.model.state_dict()
             model_state = {
-                'model_state_dict': self.agent.model.state_dict(),
+                'model_state_dict': model_state_dict,
                 'global_step': self.global_step,
                 'config': self.config,
                 'model_type': 'EnhancedPCNModel' if USE_ENHANCED_MODEL else 'DiscreteActionsDefaultModel',
@@ -1307,7 +1398,7 @@ def visualize_initial_pareto_front(initial_batch, save_dir="pareto_front_visuali
         
         # 保存
         reward_plot_path = f"{save_dir}/pareto_front_rewards_initial_random.png"
-        plt.savefig(reward_plot_path, dpi=300, bbox_inches='tight')
+        plt.savefig(reward_plot_path, dpi=100, bbox_inches='tight')
         plt.close()
         if DEBUG:
             print(f"初期ランダム経験の報酬空間パレートフロントを保存: {reward_plot_path}")
@@ -1924,6 +2015,7 @@ def main():
     
     learner_future = None
     next_actor_futures = None
+    n_commands_per_iter = N_ACTORS * EPISODES_PER_ITERATION
     
     for iteration in range(N_ITERATIONS):
         if _ASYNC_OVERLAP and N_ITERATIONS > 1:
@@ -1932,7 +2024,9 @@ def main():
                 if DEBUG:
                     print("Actorが改良されたエピソードを生成中...")
                     print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
-                actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                # 一括で探索方向を取得（12回のリモート呼び出し→1回に削減）
+                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+                actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
                 t_actor_start = time.time()
                 actor_results = ray.get(actor_futures)
                 t_actor = time.time() - t_actor_start
@@ -1942,8 +2036,9 @@ def main():
                 if DEBUG:
                     print("Learnerが改良された経験で学習を実行中")
                 t_learner_start = time.time()
+                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
                 learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
-                next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
                 t_wait_start = time.time()
                 loss = ray.get(learner_future)
                 ray.get(next_actor_futures)  # Actor(1)完了待機（actor_resultsはActor(0)のまま）
@@ -1953,7 +2048,8 @@ def main():
                     print(f"[PROFILE Iter {iteration+1}] Learner+Actor(次)並列待機: {t_wait:.3f}s (Learner: {t_learner:.3f}s)")
                 if N_ITERATIONS > 1:
                     learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
-                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
                 else:
                     learner_future = None
                     next_actor_futures = None
@@ -1966,8 +2062,9 @@ def main():
                     print(f"[PROFILE Iter {iteration+1}] Learner+Actor並列待機: {t_wait:.3f}s (合計{sum(actor_results)}エピソード)")
                 
                 if iteration < N_ITERATIONS - 1:
+                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
                     learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES)
-                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
                 else:
                     # 最終イテレーション: Learner(N-1)を実行（Actor(N-1)のデータを使用）
                     t_learner_start = time.time()
@@ -1982,7 +2079,8 @@ def main():
             if DEBUG:
                 print("Actorが改良されたエピソードを生成中...")
                 print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
-            actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False) for actor in actors]
+            commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+            actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
             t_actor_start = time.time()
             actor_results = ray.get(actor_futures)
             t_actor = time.time() - t_actor_start
@@ -2539,7 +2637,7 @@ def main():
                 
                 # 保存
                 reward_plot_path = f"{save_dir}/pareto_front_rewards_{timestamp}.png"
-                plt.savefig(reward_plot_path, dpi=300, bbox_inches='tight')
+                plt.savefig(reward_plot_path, dpi=100, bbox_inches='tight')
                 plt.close()
                 if DEBUG:
                     print(f"報酬空間のパレートフロントを保存: {reward_plot_path}")
@@ -2584,7 +2682,7 @@ def main():
                 
                 # 保存
                 values_plot_path = f"{save_dir}/pareto_front_values_{timestamp}.png"
-                plt.savefig(values_plot_path, dpi=300, bbox_inches='tight')
+                plt.savefig(values_plot_path, dpi=100, bbox_inches='tight')
                 plt.close()
                 if DEBUG:
                     print(f"実数値空間のパレートフロントを保存: {values_plot_path}")
@@ -2684,7 +2782,7 @@ Training Statistics:
                 
                 # 保存
                 history_plot_path = f"{save_dir}/learning_history_{timestamp}.png"
-                plt.savefig(history_plot_path, dpi=300, bbox_inches='tight')
+                plt.savefig(history_plot_path, dpi=100, bbox_inches='tight')
                 plt.close()
                 if DEBUG:
                     print(f"学習履歴を保存: {history_plot_path}")

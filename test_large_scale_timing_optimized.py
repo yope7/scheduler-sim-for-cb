@@ -19,7 +19,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 最適化された環境をインポート（キャッシュ最適化版を使用）
 try:
-    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized as SchedulingEnvOptimized
+    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
     OPTIMIZED_AVAILABLE = True
 except ImportError:
     OPTIMIZED_AVAILABLE = False
@@ -99,7 +99,7 @@ def run_environment_timing_test(nb_jobs: int,
     print(f"\n環境を初期化中（C言語実装最適化版）...")
     env_start_time = time.time()
     
-    env = SchedulingEnvOptimized(
+    env = SchedulingEnvCacheOptimized(
         max_step, n_window, n_on_premise_node, n_cloud_node, 
         n_job_queue_obs, n_job_queue_bck,
         weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, 
