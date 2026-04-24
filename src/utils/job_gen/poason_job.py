@@ -1,7 +1,7 @@
 import numpy as np
 
 class JobSimulator:
-    def __init__(self, seed, n_jobs=50, n_users=50, lam=0.5, mean_processing_time=50, std_processing_time=0, min_processing_time=1, max_processing_time=100, min_required_nodes=1, max_required_nodes=256):
+    def __init__(self, seed, n_jobs=50, n_users=50, lam=0.3, mean_processing_time=50, std_processing_time=50, min_processing_time=1, max_processing_time=100, min_required_nodes=1, max_required_nodes=256):
         self.n_jobs = n_jobs
         self.n_users = n_users
         self.lam = lam
