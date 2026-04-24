@@ -48,7 +48,11 @@ def main():
     pa = config["param_agent"]
     pj = config["param_job"]
 
+    # 第1引数でジョブ数を指定可能（例: python3 scripts/verify_event_vs_bitmap_equivalence.py 128）
     n_jobs = pj.get("job_trace_n_jobs", 32)
+    if len(sys.argv) > 1:
+        n_jobs = int(sys.argv[1])
+    print(f"n_jobs = {n_jobs}\n")
     seed = 42
     np.random.seed(seed)
     nb_episodes = 2  # episode 0, 1 の検証用

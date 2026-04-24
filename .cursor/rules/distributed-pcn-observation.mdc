@@ -1,0 +1,11 @@
+---
+description: 分散PCNの既定観測（イベント+ラーナー側ビットマップ）
+alwaysApply: true
+---
+
+# 分散PCN 観測の既定
+
+- `src.distributed.distributed_pcn` の**既定**は **イベント駆動環境**（`SchedulingEnvEventObs`）とし、**NN入力はラーナー側でビットマップへ復元**する（`DISTRIBUTED_PCN_EVENT_TO_BITMAP` 既定 `1`）。
+- 従来どおり **C が返すビットマップ観測のみ**に戻す場合は **`DISTRIBUTED_PCN_USE_EVENT_OBS=0`** を import 前に設定する（サブプロセスの `env` で明示）。
+- `python -m src.distributed.distributed_pcn_event` は互換用（`USE_EVENT_OBS` 強制）で、本体既定と実質同じ。
+- **学習規模の既定**（`config.yml` の `param_algorithm_compare.distributed_pcn`）: `initial_episodes: 100`（フェーズ1・各Actor）、`n_iterations: 100`（フェーズ3）。短時間テストのみ `DISTRIBUTED_PCN_QUICK=1`。

@@ -3,7 +3,7 @@ import heapq
 import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 from matplotlib.animation import FuncAnimation
 import signal
 import time
@@ -209,9 +209,15 @@ class BasePCNModel(nn.Module, ABC):
     def forward(self, state, desired_return, desired_horizon):
         """Return log-probabilities of actions or return action directly in case of continuous action space."""
         # 入力値の検証とクリッピング（NaN/Infを防ぐ）
-        desired_return = th.clamp(desired_return, min=-1000.0, max=1000.0)
-        desired_horizon = th.clamp(desired_horizon, min=0.0, max=1000.0)
-        state = th.clamp(state.float(), min=-1000.0, max=1000.0)
+        #
+        # NOTE:
+        # このプロジェクトの desired_return（報酬）は桁が大きく（例: -1e5〜-1e6）なり得る。
+        # ここで [-1000,1000] に強くクリップすると、異なるターゲットが同一値に潰れて
+        # 条件付き方策が事実上「条件を無視」する挙動を引き起こす。
+        # そのため、数値安全のためのクリップ幅は大きく取る（LogSoftmax 等で安定に扱える範囲）。
+        desired_return = th.clamp(desired_return, min=-1e9, max=1e9)
+        desired_horizon = th.clamp(desired_horizon, min=0.0, max=1e6)
+        state = th.clamp(state.float(), min=-1e6, max=1e6)
         
         c = th.cat((desired_return, desired_horizon), dim=-1)
         c = c * self.scaling_factor
@@ -545,10 +551,11 @@ class EnhancedPCNModel(nn.Module):
                 print(f"ホライゾン入力形状: {h.shape}")
         
         # 入力値の検証とクリッピング（NaN/Infを防ぐ）
-        x = th.clamp(x, min=-1000.0, max=1000.0)
-        r = th.clamp(r, min=-1000.0, max=1000.0)
+        # NOTE: desired_return が大きい桁になり得るため、条件が潰れないよう広めに取る。
+        x = th.clamp(x, min=-1e6, max=1e6)
+        r = th.clamp(r, min=-1e9, max=1e9)
         if h is not None:
-            h = th.clamp(h, min=0.0, max=1000.0)
+            h = th.clamp(h, min=0.0, max=1e6)
         
         # 状態特徴抽出
         state_features = self.extract_state_features(x)
@@ -858,6 +865,7 @@ class PCN(MOAgent, MOPolicy):
         self.evaluation_history = []
         self.evaluation_timestamps = []
         self.global_steps_at_evaluation = []
+        self.wall_seconds_at_evaluation = []
 
     def register_signal_handlers(self):
         """シグナルハンドラを登録する"""
@@ -1403,24 +1411,13 @@ class PCN(MOAgent, MOPolicy):
                 endpoints.extend([min_idx, max_idx])
             endpoints = list(set(endpoints))
             
-            # 端点を避け、中央付近の解を優先（より強力なペナルティ）
-            center_dists = np.linalg.norm(normalized_returns - 0.5, axis=1)
-            center_weights = 1.0 / (center_dists + 0.1)  # 中央に近いほど重み大きく
+            # 一様サンプリング（パレートフロント全体を均等に探索）
+            r_i = self.np_random.integers(0, len(returns))
             
-            # 端点に対する大幅なペナルティ
-            for idx in endpoints:
-                center_weights[idx] *= 0.1  # 100分の1のペナルティ
-            
-            # 最近選択された端点を追跡して追加ペナルティ
-            if not hasattr(self, '_recently_chosen_endpoints'):
-                self._recently_chosen_endpoints = []
-            
-            # 確率的サンプリング（中央寄りの点が選ばれやすい）
-            weights = center_weights / np.sum(center_weights)
-            r_i = self.np_random.choice(len(returns), p=weights)
-            
-            # 選択された端点を記録
+            # 選択された端点を記録（将来の拡張用）
             if r_i in endpoints:
+                if not hasattr(self, "_recently_chosen_endpoints"):
+                    self._recently_chosen_endpoints = []
                 self._recently_chosen_endpoints = [r_i] + self._recently_chosen_endpoints[:4]  # 最新5個を保持
             
             # 元の報酬を保存
@@ -1483,23 +1480,10 @@ class PCN(MOAgent, MOPolicy):
         if len(returns) == 0:
             return [default_cmd] * n_commands
         
-        normalized_returns = (returns - returns.min(axis=0)) / (returns.max(axis=0) - returns.min(axis=0) + 1e-8)
-        endpoints = []
-        for dim in range(returns.shape[1]):
-            min_idx = np.argmin(returns[:, dim])
-            max_idx = np.argmax(returns[:, dim])
-            endpoints.extend([min_idx, max_idx])
-        endpoints = list(set(endpoints))
-        
-        center_dists = np.linalg.norm(normalized_returns - 0.5, axis=1)
-        center_weights = 1.0 / (center_dists + 0.1)
-        for idx in endpoints:
-            center_weights[idx] *= 0.1
-        weights = center_weights / np.sum(center_weights)
-        
+        # 一様サンプリング（パレートフロント全体を均等に探索、中心バイアスを除去）
         n_sample = min(n_commands, len(returns))
         replace = n_commands > len(returns)
-        r_indices = self.np_random.choice(len(returns), size=n_commands, replace=replace, p=weights)
+        r_indices = self.np_random.choice(len(returns), size=n_commands, replace=replace)
         
         results = []
         for i in range(n_commands):
@@ -1546,6 +1530,23 @@ class PCN(MOAgent, MOPolicy):
                     probs = th.exp(scores)
                 action = th.multinomial(probs, 1)[0].item()
             return action
+
+    def _policy_logits_1d(
+        self, obs: np.ndarray, desired_return, desired_horizon
+    ) -> np.ndarray:
+        """評価診断用: 1 ステップの方策出力（離散は LogSoftmax  logits、連続はそのまま）。"""
+        obs_tensor = th.tensor(np.array([obs]), device=self.device).float()
+        return_tensor = th.tensor(np.array([desired_return]), device=self.device).float()
+        horizon_tensor = th.tensor([[desired_horizon]], device=self.device).float()
+        if self.use_enhanced_model:
+            prediction_output = self.network(obs_tensor, return_tensor, horizon_tensor)
+        else:
+            prediction_output = self.model(obs_tensor, return_tensor, horizon_tensor)
+        if isinstance(prediction_output, tuple):
+            prediction_scores = prediction_output[0]
+        else:
+            prediction_scores = prediction_output
+        return prediction_scores.detach().cpu().numpy()[0]
 
     def _run_episode(self, env, desired_return, desired_horizon, max_return, eval_mode=False):
         transitions = []
@@ -1722,7 +1723,7 @@ class PCN(MOAgent, MOPolicy):
 
         return best_transitions, [wt_sum, mkspan, cost]
 
-    def evaluate(self, env, max_return, n=10, save_history=True):
+    def evaluate(self, env, max_return, n=10, save_history=True, eval_diag: Optional[Dict[str, Any]] = None):
         """評価結果を履歴に保存し、優れた解を経験再生バッファに追加するよう拡張したevaluate"""
         n = min(n, len(self.experience_replay))
         episodes = self._nlargest(n)
@@ -1739,11 +1740,35 @@ class PCN(MOAgent, MOPolicy):
         e_returns = []
         e_values = []
         all_transitions = []  # 全てのtransitionsを保存するリスト
+        first_actions: List[int] = []
+        episode_lens: List[int] = []
+        trajectory_samples: List[Dict[str, Any]] = []
+        sample_idx: set = set()
+        if eval_diag and eval_diag.get("path"):
+            sample_idx = {0, actual_n // 2, actual_n - 1}
+            sample_idx = {j for j in sample_idx if 0 <= j < actual_n}
         
         # print(f"\n===== {actual_n}個のエピソード評価結果 =====")
         
         for i in range(actual_n):
+            logits0_list: Optional[List[float]] = None
+            if i in sample_idx:
+                obs_probe = env.reset()
+                logits0 = self._policy_logits_1d(
+                    obs_probe, returns[i], np.float32(horizons[i])
+                )
+                logits0_list = [float(round(x, 6)) for x in np.asarray(logits0).ravel()]
             transitions, _, _, _, map_fin, value = self._run_episode(env, returns[i], np.float32(horizons[i]), max_return, eval_mode=True)
+            if i in sample_idx:
+                trajectory_samples.append(
+                    {
+                        "i": i,
+                        "target_return": np.asarray(returns[i], dtype=np.float64).tolist(),
+                        "target_horizon": float(horizons[i]),
+                        "logits_step0": logits0_list,
+                        "actions": [int(t.action) for t in transitions],
+                    }
+                )
             
             # 累積報酬を計算（表示用のみ）
             transitions_copy = []
@@ -1762,6 +1787,8 @@ class PCN(MOAgent, MOPolicy):
             e_returns.append(transitions_copy[0].reward)
             e_values.append(value)
             all_transitions.append(transitions)  # 元のtransitionsを保存
+            first_actions.append(int(transitions[0].action) if transitions else -1)
+            episode_lens.append(len(transitions))
             
             # 各エピソードの結果を表示
             # print(f"エピソード {i+1}:")
@@ -1802,6 +1829,46 @@ class PCN(MOAgent, MOPolicy):
             })
             self.evaluation_timestamps.append("1")
             self.global_steps_at_evaluation.append(self.global_step)
+            if hasattr(self, '_train_wall_t0'):
+                self.wall_seconds_at_evaluation.append(
+                    time.perf_counter() - self._train_wall_t0
+                )
+            else:
+                self.wall_seconds_at_evaluation.append(time.perf_counter())
+        
+        if eval_diag and eval_diag.get("path"):
+            from pathlib import Path
+
+            from src.utils.pcn_eval_diag import append_jsonl, count_unique_targets, count_unique_values
+
+            n_uni_t, _target_rows = count_unique_targets(returns, horizons)
+            n_uni_v = count_unique_values(e_values)
+            n_uni_er = len(
+                {
+                    tuple(np.round(np.asarray(r, dtype=np.float64).ravel(), 5))
+                    for r in e_returns
+                }
+            )
+            heap_ids = [str(ep[1]) if len(ep) > 1 else "" for ep in episodes]
+            n_uni_seq = 0
+            if all_transitions:
+                n_uni_seq = len(
+                    {tuple(int(t.action) for t in tr) for tr in all_transitions}
+                )
+            record: Dict[str, Any] = {
+                "training_iteration": eval_diag.get("training_iteration"),
+                "n_eval_episodes": actual_n,
+                "experience_replay_size": len(self.experience_replay),
+                "n_unique_targets_return_horizon": n_uni_t,
+                "n_unique_e_values": n_uni_v,
+                "n_unique_e_returns_vector": n_uni_er,
+                "n_unique_action_sequences": n_uni_seq,
+                "first_actions": first_actions[: min(32, len(first_actions))],
+                "episode_lens": episode_lens[: min(32, len(episode_lens))],
+                "heap_entry_step_ids": heap_ids[: min(32, len(heap_ids))],
+                "trajectory_samples": trajectory_samples,
+            }
+            append_jsonl(Path(eval_diag["path"]), record)
         
         return e_returns, e_values, distances, map_fin
 
@@ -1933,6 +2000,10 @@ class PCN(MOAgent, MOPolicy):
         """Train PCN with support for safe termination."""
         # シグナルハンドラを登録
         self.register_signal_handlers()
+        self._train_wall_t0 = time.perf_counter()
+        self.evaluation_history = []
+        self.global_steps_at_evaluation = []
+        self.wall_seconds_at_evaluation = []
         
         try:
             # ユーザーに中断機能について通知
@@ -2553,7 +2624,9 @@ class PCN(MOAgent, MOPolicy):
                 done = False
                 
                 # 各エピソードで異なるシードを使用して多様性を確保
-                episode_seed = int(time.time() * 1000) + p_idx * 1000 + ep + self.global_step
+                # np.random.seed は 0..2**32-1 に収める必要がある
+                _raw = int(time.time() * 1000) + p_idx * 1000 + ep + int(self.global_step)
+                episode_seed = _raw % (2**32)
                 np.random.seed(episode_seed)
                 
                 while not done:

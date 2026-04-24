@@ -1,0 +1,67 @@
+param_agent:
+  weight_cost: 1
+  weight_wt: 0
+param_algorithm_compare:
+  distributed_pcn:
+    initial_episodes: 100
+    n_actors: 32
+    n_iterations: 100
+    profile: false
+    quick: false
+    use_event_obs: false
+  dqn_distributed_pareto:
+    episodes_per_weight: 100
+    num_workers: 4
+    weight_steps: 10
+  dqn_single:
+    train_episodes: 100
+  env_backend: c
+  job_generation_episodes: 2000
+  micro_benchmark_wall_clock:
+    dqn_episodes: 100
+    nsga_gen: 100
+    nsga_pop: 200
+  mo_hypervolume_benchmark:
+    algorithms: nsga2,pcn_distributed
+    dqn_episodes_per_weight: 500
+    dqn_weight_steps: 5
+    hv_threshold: null
+    nsga_n_workers: -1
+    out_dir: mo_hv_out
+    ref_margin: 0.05
+    tts_fraction: 0.9
+  n_cloud_node: 1024
+  n_on_premise_node: 256
+  nb_jobs: 128
+  nsga2:
+    n_workers: -1
+    num_generations: 100
+    pop_size: 200
+  seed: 0
+param_env:
+  n_cloud_node: 1024
+  n_job_queue_bck: 5
+  n_job_queue_obs: 5
+  n_jobs: 128
+  n_on_premise_node: 256
+  n_window: 100
+  penalty_invalid_action: 0.1
+  penalty_not_allocate: 0
+param_job:
+  job_is_constant: true
+  job_trace_n_jobs: 128
+  job_trace_path: job_trace/FY2024/scacctreq_202412_dec1_1000_jobs.csv
+  job_type: 1
+  max_n_required_nodes: 3
+  max_processing_time: 3
+  max_t: 10
+  max_user_id: 8
+  n_job_per_time: 4
+  nb_jobs_per_user: 1
+  user_increment: 1
+param_simulation:
+  folder_suffix: result
+  multi_algorithm: true
+  nb_episodes: 2000
+  nb_max_episode_steps: -1
+  nb_steps: 1

@@ -1,16 +1,15 @@
 """
-分散PCN - イベントベース観測版 (distributed_pcn_event)
+分散PCN - イベント観測の明示エントリポイント (distributed_pcn_event)
 
-ビットマップを撤廃し、イベントの開始/終了/継続時間のみで学習する。
-distributed_pcn をベースに、環境を SchedulingEnvEventObs に固定した版。
+本体 (src.distributed.distributed_pcn) は既定でイベント観測 + ラーナー側ビットマップ復元（NN入力）を使う。
+このモジュールは互換用にイベント観測を import 前に強制する。
 
 実行:
-  uv run python -m src.distributed.distributed_pcn_event
-  DISTRIBUTED_PCN_QUICK=1 uv run python -m src.distributed.distributed_pcn_event  # 短時間テスト
+  uv run python -m src.distributed.distributed_pcn
+  uv run python -m src.distributed.distributed_pcn_event  # 同等（USE_EVENT_OBS 強制）
 """
 import os
 
-# イベント観測を強制（distributed_pcn の import 前に設定必須）
 os.environ["DISTRIBUTED_PCN_USE_EVENT_OBS"] = "1"
 
 from src.distributed.distributed_pcn import main

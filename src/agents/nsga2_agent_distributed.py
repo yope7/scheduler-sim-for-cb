@@ -143,10 +143,9 @@ class NSGA2Worker:
                         total_reward[0] += reward[0]
                         total_reward[1] += reward[1]
                     
-                    # 目的関数値の計算（0番目と2番目を最小化）
+                    # 目的関数値をそのまま最小化として扱う
                     cost, _, avg_waiting_time = env_copy.calc_objective_values()
-                    # 0番目と2番目を最小化するため、NSGAには負の値を渡す
-                    ind.objectives = [-cost, -avg_waiting_time]
+                    ind.objectives = [cost, avg_waiting_time]
                     # 累積報酬も保存
                     ind.cumulative_reward = total_reward
                     
@@ -531,11 +530,11 @@ class DistributedNSGA2Agent:
         for pop in populations:
             all_individuals.extend(pop)
         
-        # 非支配ソートを実行
+        # 非支配判定（最小化）
         domination_counts = [0] * len(all_individuals)
         for i in range(len(all_individuals)):
             for j in range(len(all_individuals)):
-                if i != j and all_individuals[i].dominates(all_individuals[j]):
+                if i != j and all_individuals[j].dominates(all_individuals[i]):
                     domination_counts[i] += 1
         
         # ランク1の個体を返す
@@ -705,4 +704,4 @@ def visualize_nsga2_results(result):
     print("----------------------------------")
     
     for i, obj in enumerate(objectives):
-        print(f"{i+1:2d} | {-obj[0]:7.2f} | {-obj[1]:7.2f}")
+        print(f"{i+1:2d} | {obj[0]:7.2f} | {obj[1]:7.2f}")

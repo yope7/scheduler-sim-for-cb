@@ -638,14 +638,19 @@ class Learner:
         
         return replay_copy
 
-    def evaluate(self, max_return=None, n=10):
+    def evaluate(self, max_return=None, n=10, training_iteration=None, eval_diag_path=None):
         """エージェントの評価を実行"""
         if max_return is None:
             max_return = np.full(2, 100.0, dtype=np.float32)
         
         if DEBUG:
             print("評価を実行中...")
-        e_returns, e_value, distances, map_fin = self.agent.evaluate(self.env, max_return, n=n)
+        eval_diag = None
+        if eval_diag_path:
+            eval_diag = {"path": eval_diag_path, "training_iteration": training_iteration}
+        e_returns, e_value, distances, map_fin = self.agent.evaluate(
+            self.env, max_return, n=n, eval_diag=eval_diag
+        )
         return e_returns, e_value, distances, map_fin
 
 

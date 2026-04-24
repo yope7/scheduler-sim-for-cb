@@ -1,0 +1,71 @@
+# 3アルゴリズム本番ベンチ用（micro_benchmark_three_algorithms.py + CLI 上書き）
+# 予算: NSGA 集団200×世代100, DQN 重み10分割×各100 ep（分散）, PCN 反復10・アクター32・初期100, QUICKなし
+
+param_env:
+  n_window: 100
+  n_on_premise_node: 256
+  n_cloud_node: 1024
+  n_job_queue_obs: 5
+  n_job_queue_bck: 5
+  penalty_not_allocate: 0
+  penalty_invalid_action: 0.1
+param_agent:
+  weight_wt: 0
+  weight_cost: 1
+param_simulation:
+  nb_steps: 1
+  nb_episodes: 2000
+  nb_max_episode_steps: -1
+  multi_algorithm: true
+  folder_suffix: "result"
+
+param_algorithm_compare:
+  env_backend: c
+  seed: 0
+  nb_jobs: 24
+  n_on_premise_node: 256
+  n_cloud_node: 1024
+  job_generation_episodes: 2000
+  nsga2:
+    pop_size: 200
+    num_generations: 100
+    n_workers: -1
+  dqn_single:
+    train_episodes: 100
+  dqn_distributed_pareto:
+    weight_steps: 10
+    episodes_per_weight: 100
+    num_workers: 4
+  distributed_pcn:
+    n_iterations: 10
+    n_actors: 32
+    initial_episodes: 100
+    quick: false
+    profile: false
+    use_event_obs: false
+  micro_benchmark_wall_clock:
+    nsga_pop: 200
+    nsga_gen: 100
+    dqn_episodes: 100
+  mo_hypervolume_benchmark:
+    ref_margin: 0.05
+    tts_fraction: 0.9
+    hv_threshold: null
+    out_dir: mo_hv_out
+    algorithms: "nsga2,pcn_distributed"
+    dqn_weight_steps: 5
+    dqn_episodes_per_weight: 500
+    nsga_n_workers: -1
+
+param_job:
+  max_t: 10
+  job_is_constant: true
+  job_type: 1
+  job_trace_path: job_trace/FY2024/scacctreq_202412_dec1_1000_jobs.csv
+  job_trace_n_jobs: 32
+  n_job_per_time: 4
+  max_processing_time: 3
+  max_n_required_nodes: 3
+  max_user_id: 8
+  nb_jobs_per_user: 1
+  user_increment: 1

@@ -19,7 +19,6 @@ import copy
 import warnings
 import gc  # ガベージコレクション用
 import psutil  # メモリ情報取得用
-
 # CUDAが利用できない場合の警告を抑制
 warnings.filterwarnings('ignore', message="Can't initialize NVML")
 warnings.filterwarnings('ignore', message="torch.cuda.amp.GradScaler is enabled, but CUDA is not available")
@@ -36,9 +35,9 @@ DEBUG = False
 TIME_DEBUG = True  # 各フェーズの経過時間を表示
 ENABLE_VISUALIZATION = True
 
-N_ITERATIONS = 200  # 全体の学習イテレーション数
+N_ITERATIONS = 100  # フェーズ3の学習イテレーション数（config.yml で上書き可）
 N_ACTORS = 32      # 並列実行するActorの数
-N_JOBS = 1024 # ジョブ数
+N_JOBS = 256 # ジョブ数
 
 EVAL_INTERVAL = 5  # 評価を実行する間隔（イテレーション数）
 USE_DISTRIBUTED_EVAL = False  # 分散評価を使用するかどうか
@@ -52,7 +51,7 @@ EARLY_STOPPING_THRESHOLD = 0.0001  # 改善とみなす最小変化量
 MIN_ITERATIONS = 5  # 最低限実行するイテレーション数
 
 
-INITIAL_EPISODES =  200 #初期エピソード数
+INITIAL_EPISODES = 100  # フェーズ1: 各Actorあたりのランダム収集エピソード数（config.yml で上書き可）
 
 USE_ENHANCED_MODEL = False  # True: EnhancedPCNModel, False: DiscreteActionsDefaultModel (3層NLPモデル)
 
@@ -64,7 +63,7 @@ SUPERVISED_LEARNING_RATE = 1e-2
 
 VISUALIZATION_INTERVAL = 5  # 可視化を実行する間隔（イテレーション数）
 
-EPISODES_PER_ITERATION = 2  # 各イテレーションで各Actorが生成するエピソード数
+EPISODES_PER_ITERATION = 10  # 各イテレーションで各Actorが生成するエピソード数
 
 EVAL_SAMPLES = 100  # 評価時に使用するサンプル数
 EVAL_SAMPLES_DISTRIBUTED = 10  # 分散評価時に使用するサンプル数
@@ -79,11 +78,11 @@ _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
 # 高速化モード: N_UPDATESを3に削減（本番でも有効、DISTRIBUTED_PCN_FAST=1）
 _FAST_MODE = os.environ.get('DISTRIBUTED_PCN_FAST', '0') == '1'
 _USE_JAX_LEARNER = os.environ.get('DISTRIBUTED_PCN_USE_JAX', '0') == '1'
-# イベントベース観測（ビットマップ撤廃）: DISTRIBUTED_PCN_USE_EVENT_OBS=1
-_USE_EVENT_OBS = os.environ.get('DISTRIBUTED_PCN_USE_EVENT_OBS', '0') == '1'
-if _USE_EVENT_OBS:
-    print("[ENV] イベントベース観測モード: ビットマップ不使用、開始/終了/継続時間のみで学習")
+# 既定: イベント観測（環境はイベント駆動）+ ラーナー側でビットマップ復元してNN入力
+# 従来のCビットマップ観測のみに戻す: DISTRIBUTED_PCN_USE_EVENT_OBS=0
+_USE_EVENT_OBS = os.environ.get('DISTRIBUTED_PCN_USE_EVENT_OBS', '1') == '1'
 if _QUICK_MODE:
+    # 短時間デバッグ用（本番実験規約の 100/100 ではない）
     N_ITERATIONS = 5
     N_ACTORS = 12
     INITIAL_EPISODES = 100
@@ -92,7 +91,7 @@ if _QUICK_MODE:
     SUPERVISED_LEARNING_EPOCHS = 10
     # N_UPDATESは変更しない（ハイパラメータ変更は高速化ではない）
     ENABLE_VISUALIZATION = True
-    print("[PROFILE] クイックモード: N_ITERATIONS=5, N_ACTORS=12, INITIAL_EPISODES=100")
+    print("[PROFILE] クイックモード（デバッグ）: N_ITERATIONS=5, N_ACTORS=12, INITIAL_EPISODES=100")
 elif _FAST_MODE:
     # 削除: N_UPDATES変更はハイパラメータ変更のため高速化に含めない
     pass
@@ -108,10 +107,29 @@ from src.agents.pcn_agent import (
 from src.envs.scheduling_env import SchedulingEnv
 from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
 from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
+from src.utils.event_obs_bitmap_adapter import (
+    learner_bitmap_enabled,
+    apply_learner_bitmap_to_event_env,
+)
 from src.utils.job_gen.job_generator import JobGenerator
+from src.utils.algorithm_compare_config import get_param_algorithm_compare
 
 # 使用する環境クラス（イベント観測モード時はSchedulingEnvEventObs）
 _EnvClass = SchedulingEnvEventObs if _USE_EVENT_OBS else SchedulingEnvCacheOptimized
+
+# イベント観測環境使用時、NN入力をラーナー側でビットマップへ復元（既定ON、SCHEDULER_LEARNER_BITMAP / DISTRIBUTED_PCN_EVENT_TO_BITMAP）
+if _USE_EVENT_OBS:
+    if learner_bitmap_enabled():
+        print("[ENV] イベント観測（環境）+ ラーナー側ビットマップ復元（NN入力）")
+    else:
+        print("[ENV] イベントベース観測（NNはイベントベクトルのみ、ビットマップ復元OFF）")
+
+
+def _enable_event_bitmap_adapter(env):
+    """イベント観測環境の get_observation をビットマップ復元版へ差し替える（共通ユーティリティ）。"""
+    if not _USE_EVENT_OBS:
+        return env
+    return apply_learner_bitmap_to_event_env(env)
 
 # =========================
 # 1. Replay Buffer (Ray Actor)
@@ -364,6 +382,7 @@ class Actor:
                 jobs_set,
                 None, flag=0
             )
+            self.env = _enable_event_bitmap_adapter(self.env)
             # C実装が正しく使用されているか確認
             # if hasattr(self.env, '_cache_onpre_c'):
             #     print(f"[Actor {self.actor_id}] ✓ C実装環境が正しく初期化されました")
@@ -672,6 +691,7 @@ class Learner:
         self._hash_cache = {}  # エピソードのハッシュ値キャッシュ（idをキーとして使用）
         self._weights_ref = None  # 重みのObjectRefを保持（重みの共有用）
         self._use_jax = False
+        self._mo_hv_wall0 = time.perf_counter()  # mo_benchmark_hv 用の壁時計起点
         if _USE_JAX_LEARNER and USE_ENHANCED_MODEL is False:
             try:
                 from src.agents.pcn_jax import (
@@ -752,6 +772,7 @@ class Learner:
             jobs_set,
             None, flag=0
         )
+        env = _enable_event_bitmap_adapter(env)
         # C実装が正しく使用されているか確認
         if hasattr(env, '_cache_onpre_c'):
             print("[Learner] ✓ C実装環境が正しく初期化されました")
@@ -1098,7 +1119,7 @@ class Learner:
         
         return np.mean(total_loss) if total_loss else 0.0
 
-    def evaluate(self, max_return=None, n=10):
+    def evaluate(self, max_return=None, n=10, training_iteration=None, eval_diag_path=None):
         """エージェントの評価を実行"""
         if max_return is None:
             max_return = np.full(2, 100.0, dtype=np.float32)
@@ -1111,7 +1132,12 @@ class Learner:
             self.agent.model.load_state_dict(sd, strict=False)
         if DEBUG:
             print("評価を実行中...")
-        e_returns, e_value, distances, map_fin = self.agent.evaluate(self.env, max_return, n=n)
+        eval_diag = None
+        if eval_diag_path:
+            eval_diag = {"path": eval_diag_path, "training_iteration": training_iteration}
+        e_returns, e_value, distances, map_fin = self.agent.evaluate(
+            self.env, max_return, n=n, eval_diag=eval_diag
+        )
         
         # PCNエージェントのevaluate()で既に出力されているため、
         # ここでは追加の出力処理を行わず、結果のみを返す
@@ -1174,8 +1200,31 @@ class Learner:
         })
         self.agent.evaluation_timestamps.append("1")
         self.agent.global_steps_at_evaluation.append(self.global_step)
+        if not hasattr(self.agent, "wall_seconds_at_evaluation"):
+            self.agent.wall_seconds_at_evaluation = []
+        self.agent.wall_seconds_at_evaluation.append(
+            float(time.perf_counter() - self._mo_hv_wall0)
+        )
         
         return e_returns, e_values, [], map_fin  # distancesは計算しない（分散評価では不要）
+
+    def export_mo_hv_data(self) -> dict:
+        """アルゴリズム比較用: 解空間パレート（pareto_front_values）と時系列メタデータを JSON 化可能な dict で返す。"""
+        out = {
+            "name": "pcn_distributed",
+            "pareto_fronts_per_eval": [],
+            "global_steps_at_evaluation": [],
+            "wall_seconds_at_evaluation": [],
+        }
+        for h in self.agent.evaluation_history:
+            v = h["pareto_front_values"]
+            arr = np.asarray(v, dtype=np.float64)
+            out["pareto_fronts_per_eval"].append(arr.tolist())
+        out["global_steps_at_evaluation"] = [int(x) for x in self.agent.global_steps_at_evaluation]
+        out["wall_seconds_at_evaluation"] = [
+            float(x) for x in getattr(self.agent, "wall_seconds_at_evaluation", [])
+        ]
+        return out
 
     def _get_buffer_size(self) -> int:
         return len(self.agent.experience_replay)
@@ -1492,6 +1541,11 @@ def main():
     execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     execution_dir = os.path.join(output_base, f"execution_{execution_timestamp}")
     os.makedirs(execution_dir, exist_ok=True)
+    EVAL_DIAG = os.environ.get("DISTRIBUTED_PCN_EVAL_DIAG", "0") == "1"
+    eval_diag_path = os.path.join(execution_dir, "pcn_eval_diag.jsonl") if EVAL_DIAG else None
+    if EVAL_DIAG:
+        print(f"[EVAL_DIAG] 各評価の統計を追記: {eval_diag_path}")
+    _main_wall_t0 = time.perf_counter()
     
     if TIME_DEBUG:
         overall_start_time = time.time()
@@ -1524,6 +1578,36 @@ def main():
         config['param_env']['n_cloud_node'] = int(os.environ['DISTRIBUTED_PCN_CLOUD'])
     if _PROFILE_MODE or _QUICK_MODE:
         print(f"[SCALE] N_JOBS={config['param_env']['n_jobs']}, onprem={config['param_env']['n_on_premise_node']}, cloud={config['param_env']['n_cloud_node']}")
+
+    # param_algorithm_compare.distributed_pcn（config.yml）で学習規模を上書きし、続けて QUICK があれば短縮
+    global N_ITERATIONS, N_ACTORS, INITIAL_EPISODES, EPISODES_PER_ITERATION, EVAL_INTERVAL, SUPERVISED_LEARNING_EPOCHS
+    _dpc = get_param_algorithm_compare(config).get("distributed_pcn") or {}
+    N_ITERATIONS = int(_dpc.get("n_iterations", N_ITERATIONS))
+    N_ACTORS = int(_dpc.get("n_actors", N_ACTORS))
+    INITIAL_EPISODES = int(_dpc.get("initial_episodes", INITIAL_EPISODES))
+    if _dpc.get("quick") is True:
+        os.environ["DISTRIBUTED_PCN_QUICK"] = "1"
+    elif _dpc.get("quick") is False:
+        os.environ["DISTRIBUTED_PCN_QUICK"] = "0"
+    if _dpc.get("profile") is True:
+        os.environ["DISTRIBUTED_PCN_PROFILE"] = "1"
+    elif _dpc.get("profile") is False:
+        os.environ["DISTRIBUTED_PCN_PROFILE"] = "0"
+    if os.environ.get("DISTRIBUTED_PCN_QUICK", "0") == "1":
+        N_ITERATIONS = 5
+        N_ACTORS = 12
+        INITIAL_EPISODES = 100
+        EPISODES_PER_ITERATION = 1
+        EVAL_INTERVAL = 5
+        SUPERVISED_LEARNING_EPOCHS = 10
+
+    # 環境変数で学習規模を最終上書き（ジョブ数スイープ等）
+    if os.environ.get("DISTRIBUTED_PCN_N_ITERATIONS"):
+        N_ITERATIONS = int(os.environ["DISTRIBUTED_PCN_N_ITERATIONS"])
+    if os.environ.get("DISTRIBUTED_PCN_N_ACTORS"):
+        N_ACTORS = int(os.environ["DISTRIBUTED_PCN_N_ACTORS"])
+    if os.environ.get("DISTRIBUTED_PCN_INITIAL_EPISODES"):
+        INITIAL_EPISODES = int(os.environ["DISTRIBUTED_PCN_INITIAL_EPISODES"])
 
     # Rayの初期化時にGPUリソースを明示的に指定
     import torch
@@ -2126,7 +2210,13 @@ def main():
                     print("分散評価を使用しました")
             else:
                 # 通常の評価を使用
-                e_returns, e_values, distances, map_fin = ray.get(learner.evaluate.remote(n=EVAL_SAMPLES))
+                e_returns, e_values, distances, map_fin = ray.get(
+                    learner.evaluate.remote(
+                        n=EVAL_SAMPLES,
+                        training_iteration=iteration + 1,
+                        eval_diag_path=eval_diag_path,
+                    )
+                )
                 print(len(np.unique(e_returns, axis=0)))
                 if DEBUG:
                     print("通常評価を使用しました")
@@ -2442,6 +2532,45 @@ def main():
         print(f"経過時間: {phase3_duration:.2f}秒 ({phase3_duration/60:.2f}分)")
         print(f"実行イテレーション数: {len(training_history['iterations'])}")
         print(f"{'='*40}")
+
+    # イテレーションごとの学習サマリーを JSON で保存（実験比較用）
+    try:
+        import json as _json
+        _rows = []
+        for _i in range(len(training_history['losses'])):
+            _it = training_history['iterations'][_i] if _i < len(training_history['iterations']) else _i + 1
+            _loss = float(training_history['losses'][_i])
+            _pf = training_history['pareto_front_sizes'][_i] if _i < len(training_history['pareto_front_sizes']) else None
+            _dlist = training_history['distances'][_i] if _i < len(training_history['distances']) else None
+            _avg_d = None
+            _min_d = None
+            _max_d = None
+            if _dlist is not None and len(_dlist) > 0:
+                _avg_d = float(np.mean(_dlist))
+                _min_d = float(np.min(_dlist))
+                _max_d = float(np.max(_dlist))
+            _rows.append({
+                "iteration": int(_it),
+                "loss": _loss,
+                "pareto_front_size": _pf,
+                "distance_avg": _avg_d,
+                "distance_min": _min_d,
+                "distance_max": _max_d,
+            })
+        _summary = {
+            "n_jobs": int(config['param_env'].get('n_jobs', N_JOBS)),
+            "n_iterations_config": int(N_ITERATIONS),
+            "eval_interval": int(EVAL_INTERVAL),
+            "use_event_obs": bool(_USE_EVENT_OBS),
+            "event_to_bitmap": bool(_EVENT_TO_BITMAP),
+            "rows": _rows,
+        }
+        _summary_path = os.path.join(execution_dir, "training_iteration_summary.json")
+        with open(_summary_path, "w", encoding="utf-8") as _sf:
+            _json.dump(_summary, _sf, indent=2, allow_nan=False)
+        print(f"[SUMMARY] イテレーション別サマリーを保存: {_summary_path}")
+    except Exception as _e:
+        print(f"[SUMMARY] JSON 保存に失敗: {_e}")
     
     # 学習完了後の総括
     if DEBUG:
@@ -2858,6 +2987,20 @@ Training Statistics:
             import traceback
             traceback.print_exc()
     
+    _mo_hv_path = os.environ.get("DISTRIBUTED_PCN_MO_HV_EXPORT")
+    if _mo_hv_path:
+        try:
+            import json as _json
+            _mo_hv_path = os.path.abspath(_mo_hv_path)
+            os.makedirs(os.path.dirname(_mo_hv_path) or ".", exist_ok=True)
+            _data = ray.get(learner.export_mo_hv_data.remote())
+            _data["wall_total_s"] = float(time.perf_counter() - _main_wall_t0)
+            with open(_mo_hv_path, "w", encoding="utf-8") as _mf:
+                _json.dump(_data, _mf, indent=2, allow_nan=False)
+            print(f"[MO_HV] 評価トレースを書き出しました: {_mo_hv_path}")
+        except Exception as _e:
+            print(f"[MO_HV] 書き出し失敗: {_e}")
+
     # 全体の完了時間を記録
     if TIME_DEBUG:
         overall_end_time = time.time()

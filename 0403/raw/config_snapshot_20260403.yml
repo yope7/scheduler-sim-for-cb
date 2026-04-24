@@ -1,0 +1,29 @@
+param_env:
+  n_window: 100 # リソースマップの横幅
+  n_on_premise_node: 256 # オンプレミスノードの数
+  n_cloud_node: 1024 # クラウドノードの数
+  n_job_queue_obs: 5 # ジョブキューの観測部分の長さ
+  n_job_queue_bck: 5 # ジョブキューの非観測部分の長さ
+  penalty_not_allocate: 0 # ジョブを割り当てなかった時のペナルティ
+  penalty_invalid_action: 0.1 # 無効な行動をした時のペナルティ
+param_agent:
+  weight_wt: 0 # 報酬における待ち時間の重み
+  weight_cost: 1 # 報酬におけるコストの重み
+param_simulation:
+  nb_steps: 1 # ステップ数
+  nb_episodes: 2000 # エピソード数（500から2000に増加）
+  nb_max_episode_steps: -1 # 1エピソードあたりの最大ステップ数(-1:最大ステップ無し)
+  multi_algorithm: true # true: multi algorithm(先にジョブを決める) false: single algorithm(後でジョブを決める)
+  folder_suffix: "result" # 実験結果画像を保存するフォルダの名前の末尾につける文字列
+param_job:
+  max_t: 10 # 最大実時間
+  job_is_constant: true # true: 全エピソードで同じジョブを使う false: 全てのエピソードで別々のジョブを使う
+  job_type: 1 # 1: default 2: job_trace file 3: random
+  job_trace_path: job_trace/FY2024/scacctreq_202412_dec1_1000_jobs.csv # job_type=2用
+  job_trace_n_jobs: 32 # 0以下で全件
+  n_job_per_time: 4 # -1: random(1,6)
+  max_processing_time: 3 # -1: random
+  max_n_required_nodes: 3 # -1: random
+  max_user_id: 8 # -1: random
+  nb_jobs_per_user: 1 # -1: random
+  user_increment: 1 # 1:true, 0:false

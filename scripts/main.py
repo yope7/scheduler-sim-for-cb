@@ -5,7 +5,6 @@ import argparse
 import itertools
 import matplotlib.pyplot as plt
 
-from src.agents.pcn_agent import PCN  
 from src.envs.scheduling_env import SchedulingEnv
 from src.utils.job_gen.job_generator import JobGenerator
 
@@ -35,9 +34,16 @@ import json
 import datetime
 import cProfile
 
+from src.utils.algorithm_compare_config import (
+    job_generation_episodes,
+    get_param_algorithm_compare,
+    scheduling_env_class_for_config,
+)
 
-
-with open('config/config.yml', 'r') as yml:
+_CONFIG_PATH = os.environ.get('SCHEDULER_CONFIG', 'config/config.yml')
+if not os.path.isabs(_CONFIG_PATH):
+    _CONFIG_PATH = os.path.abspath(_CONFIG_PATH)
+with open(_CONFIG_PATH, 'r', encoding='utf-8') as yml:
     config = yaml.safe_load(yml)
 # 環境のパラメータをUUU
 max_step = np.inf
@@ -97,23 +103,25 @@ def evaluate_and_render(agent, env, objective_index):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    _pac = get_param_algorithm_compare(config)
+    _nsga = _pac.get('nsga2') or {}
+    _dqn = _pac.get('dqn_single') or {}
+    _nb_jobs_d = int(_pac.get('nb_jobs', 11))
     parser.add_argument('--mode', type=str, default='single', 
-                      choices=['single', 'pareto', 'pareto_distributed', 'pcn', 'all', 'all_distributed', 'nsga2', 'nsga2_distributed', 'heuristic'], 
-                      help='実行モード（single: 単一重み, pareto: パレートフロント探索, pareto_distributed: 分散パレートフロント探索, pcn: PCN, all: 全探索, all_distributed: 分散処理による全探索（20ジョブ以上はサンプリング）, nsga2: NSGA-II, nsga2_distributed: 分散処理によるNSGA-II, heuristic: ヒューリスティック）')
+                      choices=['single', 'pareto', 'pareto_distributed', 'all', 'all_distributed', 'nsga2', 'nsga2_distributed', 'heuristic'], 
+                      help='実行モード（single: 単一重み, pareto: パレートフロント探索, pareto_distributed: 分散パレートフロント探索, all: 全探索, all_distributed: 分散処理による全探索（20ジョブ以上はサンプリング）, nsga2: NSGA-II, nsga2_distributed: 分散処理によるNSGA-II, heuristic: ヒューリスティック）。PCN は python -m src.distributed.distributed_pcn を使用')
     # 既存の引数
     parser.add_argument('--how_many_episodes', type=int, default=1000)
-    parser.add_argument('--nb_jobs', type=int, default=11)
-    # CNN関連の引数
-    parser.add_argument('--use_cnn', action='store_true', 
-                      help='PCNモードでCNNベースの拡張モデルを使用する')
-    parser.add_argument('--use_wandb', action='store_true', 
-                      help='Wandbを使用するかどうかを設定')
+    parser.add_argument('--nb_jobs', type=int, default=_nb_jobs_d)
+    parser.add_argument(
+        '--dqn_episodes',
+        type=int,
+        default=int(_dqn.get('train_episodes', 50_000)),
+        help='single（DQN）モードの学習エピソード数（既定: config.param_algorithm_compare.dqn_single.train_episodes）',
+    )
     # NSGA-II用の引数
-    parser.add_argument('--pop_size', type=int, default=100, help='NSGA-IIの集団サイズ')
-    parser.add_argument('--num_generations', type=int, default=300, help='NSGA-IIの世代数')
-    parser.add_argument('--load_model', action='store_true', help='保存済みモデルを読み込む')
-    parser.add_argument('--model_path', type=str, default='PCN_model_latest', 
-                      help='読み込むモデルのパス（拡張子なし）')
+    parser.add_argument('--pop_size', type=int, default=int(_nsga.get('pop_size', 100)), help='NSGA-IIの集団サイズ')
+    parser.add_argument('--num_generations', type=int, default=int(_nsga.get('num_generations', 300)), help='NSGA-IIの世代数')
     # 分散処理版NSGA-II用の引数
     parser.add_argument('--num_workers', type=int, default=32, help='分散処理のワーカー数')
     parser.add_argument('--migration_interval', type=int, default=10, help='解の移住間隔')
@@ -123,12 +131,19 @@ def parse_args():
     
     # ヒューリスティック用の引数
     parser.add_argument('--base_threshold', type=int, default=5, help='基本待ち時間閾値')
-    parser.add_argument('--width_factor', type=float, default=0.3, help='ジョブ幅の影響度（0.3 = 幅の30%）')
+    parser.add_argument('--width_factor', type=float, default=0.3, help='ジョブ幅の影響度（0.3 = 幅の30%%）')
     
     # プロファイリング用の引数
     parser.add_argument('--prof_output', type=str, default=None, 
                       help='プロファイルoutputファイル名（拡張子なし）')
-    
+    parser.add_argument(
+        '--env-backend',
+        type=str,
+        choices=['c', 'python'],
+        default=None,
+        help='上書き: param_algorithm_compare.env_backend（c=C最適化環境, python=純Python）',
+    )
+
     return parser.parse_args()
 
 def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
@@ -136,18 +151,19 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     next_init_windows = None
     values_all = []
     np.random.seed(0)
+    jg_ep = job_generation_episodes(config)
     job_generator = JobGenerator(0, nb_steps, n_window, n_on_premise_node, 
-                               n_cloud_node, config, nb_jobs, 0.2, how_many_episodes)
+                               n_cloud_node, config, nb_jobs, 0.2, jg_ep)
     jobs_set = job_generator.generate_jobs_set()
 
-    env = SchedulingEnv(
+    EnvCls, _ = scheduling_env_class_for_config(config)
+    env = EnvCls(
         max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
         weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
         next_init_windows, flag=0
     )
 
-    # 観測空間のサイズを取得
-    obs_space_size = (12790)
+    obs_space_size = int(env.observation_space.shape[0])
 
     agent = DQNAgent(
         env,
@@ -177,76 +193,6 @@ def run_single_rl_mode(nb_steps: int, lams: list, loops: int, how_many_episodes:
     plt.close()
     
     return 0
-
-def run_PCN_mode(nb_steps: int, lams: list, loops: int, how_many_episodes: int, 
-                ob_number: int, nb_jobs: int, use_cnn: bool = True, use_wandb: bool = False, load_model: bool = False, model_path: str = 'PCN_model_latest') -> list:
-    """PCN強化学習モードの実行"""
-    next_init_windows = None
-    values_all = []
-    np.random.seed(0)
-    job_generator = JobGenerator(0, nb_steps, n_window, n_on_premise_node, 
-                               n_cloud_node, config, nb_jobs, 0.2, how_many_episodes)
-    jobs_set = job_generator.generate_jobs_set()
-
-    # print("jobs_set: ",jobs_set)
-
-    env = SchedulingEnv(
-        max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
-        weight_wt, weight_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
-        next_init_windows, flag=0
-    )
-
-    # CNN拡張モデルを使用するかどうかを設定
-    agent = PCN(
-        env,
-        device="auto",
-        state_dim=1,
-        scaling_factor=np.array([1, 1, 1]),
-        learning_rate=1e-3,
-        batch_size=512,
-        hidden_dim=256,
-        project_name="temp",
-        experiment_name="PCN_Enhanced" if use_cnn else "PCN",
-        log=True,
-        use_wandb=use_wandb,  # CNNベースの拡張モデルを使用
-        use_enhanced_model=use_cnn,  # CNNベースの拡張モデルを使用
-        debug_mode=False,  # デバッグモードをオフに設定
-    )
-
-    # 保存済みモデルが指定されている場合は読み込む
-    if load_model:
-        print(f"保存済みモデル weights/{model_path} を読み込みます...")
-        try:
-            agent.load(filename=model_path, savedir="weights")
-            print(f"モデルの読み込みが完了しました。学習を継続します。")
-        except Exception as e:
-            print(f"モデルの読み込み中にエラーが発生しました: {e}")
-            print("新規モデルから学習を開始します。")
-
-    agent.initialize_buffer_with_heuristics(env, num_episodes_per_pattern=50)
-    
-    agent.train(
-        eval_env=env,
-        total_timesteps=int(how_many_episodes),
-        ref_point=np.array([-100000,-100000]),
-        num_er_episodes=1000,
-        num_step_episodes=20,  
-        num_model_updates=10,
-        num_eval_episodes=100,
-        max_buffer_size=10000,
-        known_pareto_front=[1, 1],
-        max_return=np.array([1000, 1000]),
-        log_episode_only=True,
-        reset_buffer=False,  # ヒューリスティックで初期化されたバッファを保持する
-    )
-
-    on_premise_map, cloud_map = env.get_windows()
-    # print(env.calc_objective_values())
-    # print(agent.get_e_returns())
-
-    agent.visualize_evaluation_history()
-
-    return agent.get_mapmap()
 
 def run_exhaustive_mode(nb_jobs: int):
     """全探索モードの実行"""
@@ -356,11 +302,13 @@ def run_pareto_search(nb_steps: int, how_many_episodes: int, nb_jobs: int, weigh
         
         # 環境の初期化
         np.random.seed(0)
+        jg_ep = job_generation_episodes(config)
         job_generator = JobGenerator(0, nb_steps, n_window, n_on_premise_node, 
-                                   n_cloud_node, config, nb_jobs, 0.2, how_many_episodes)
+                                   n_cloud_node, config, nb_jobs, 0.2, jg_ep)
         jobs_set = job_generator.generate_jobs_set()
         
-        env = SchedulingEnv(
+        EnvCls, _ = scheduling_env_class_for_config(config)
+        env = EnvCls(
             max_step, n_window, n_on_premise_node, n_cloud_node, n_job_queue_obs, n_job_queue_bck,
             w_wt, w_cost, penalty_not_allocate, penalty_invalid_action, jobs_set,
             None, flag=0
@@ -370,7 +318,7 @@ def run_pareto_search(nb_steps: int, how_many_episodes: int, nb_jobs: int, weigh
         agent = DQNAgent(
             env,
             device="auto",
-            state_dim=(12790),
+            state_dim=int(np.prod(env.observation_space.shape)),
             learning_rate=1e-3,
             gamma=0.99,
             epsilon_start=1.0,
@@ -606,11 +554,10 @@ def run_nsga2_mode(nb_jobs: int, pop_size: int = 100, num_generations: int = 100
     jobs_set = job_generator.generate_jobs_set()
 
     print(f"生成されたjobs_set: {jobs_set}")
-    # C言語実装版の環境を強制使用
-    if not C_AVAILABLE:
-        raise ImportError("C言語実装版の環境（SchedulingEnvCacheOptimized）が利用できません。C実装版をビルドしてから実行してください。")
+    EnvCls, env_label = scheduling_env_class_for_config(config)
+    print(f"[env_backend={env_label}] 環境クラス: {EnvCls.__name__}")
     
-    env = SchedulingEnvCacheOptimized(
+    env = EnvCls(
         np.inf,
         config['param_env']['n_window'],
         config['param_env']['n_on_premise_node'],
@@ -901,30 +848,46 @@ class DistributedDQNWorker:
         print(f"Worker {weight_id}: 学習開始 - 重み[WT: {w_wt:.3f}, Cost: {w_cost:.3f}]")
         
         try:
-            # 環境の初期化（C実装版優先）
+            from src.utils.algorithm_compare_config import job_generation_episodes, get_param_algorithm_compare
+            from src.utils.event_obs_bitmap_adapter import apply_learner_bitmap_to_event_env
 
+            jg_ep = job_generation_episodes(self.config)
             job_generator = JobGenerator(
                 0, 1,
                 self.config['param_env']['n_window'],
                 self.config['param_env']['n_on_premise_node'],
                 self.config['param_env']['n_cloud_node'],
-                self.config, nb_jobs, 0.2, 0
+                self.config, nb_jobs, 0.2, jg_ep
             )
             jobs_set = job_generator.generate_jobs_set()
-            self.env = SchedulingEnvCacheOptimized(
-                np.inf,
-                self.config['param_env']['n_window'],
-                self.config['param_env']['n_on_premise_node'],
-                self.config['param_env']['n_cloud_node'],
-                self.config['param_env']['n_job_queue_obs'],
-                self.config['param_env']['n_job_queue_bck'],
-                self.config['param_agent']['weight_wt'],
-                self.config['param_agent']['weight_cost'],
-                self.config['param_env']['penalty_not_allocate'],
-                self.config['param_env']['penalty_invalid_action'],
-                jobs_set,
-                None, flag=0
+            pac = get_param_algorithm_compare(self.config)
+            dpcn = pac.get("distributed_pcn") or {}
+            ev = os.environ.get("DISTRIBUTED_PCN_USE_EVENT_OBS")
+            if ev is None:
+                use_event_obs = bool(dpcn.get("use_event_obs", True))
+            else:
+                use_event_obs = ev == "1"
+            env_kwargs = dict(
+                max_step=np.inf,
+                n_window=self.config['param_env']['n_window'],
+                n_on_premise_node=self.config['param_env']['n_on_premise_node'],
+                n_cloud_node=self.config['param_env']['n_cloud_node'],
+                n_job_queue_obs=self.config['param_env']['n_job_queue_obs'],
+                n_job_queue_bck=self.config['param_env']['n_job_queue_bck'],
+                weight_wt=w_wt,
+                weight_cost=w_cost,
+                penalty_not_allocate=self.config['param_env']['penalty_not_allocate'],
+                penalty_invalid_action=self.config['param_env']['penalty_invalid_action'],
+                jobs_set=jobs_set,
+                job_type=None,
+                flag=0,
             )
+            if use_event_obs:
+                from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
+                self.env = SchedulingEnvEventObs(**env_kwargs)
+                self.env = apply_learner_bitmap_to_event_env(self.env)
+            else:
+                self.env = SchedulingEnvCacheOptimized(**env_kwargs)
             
             # エージェントの初期化（観測空間は環境から取得）
             state_dim = self.env.observation_space.shape[0]
@@ -941,7 +904,6 @@ class DistributedDQNWorker:
                 batch_size=512,
                 hidden_dim=512,
                 target_update=10,
-                # weight_wt=w_wt,
                 weight_cost=w_cost,
                 weight_id=weight_id
             )
@@ -1018,8 +980,11 @@ def run_pareto_search_distributed(nb_steps: int, how_many_episodes: int, nb_jobs
     weights = np.linspace(0, 1, weight_steps)
     print(weights)
     
-    # 設定ファイルから環境パラメータを読み込み
-    with open('config/config.yml', 'r') as yml:
+    # 設定ファイル（SCHEDULER_CONFIG 優先 — micro_benchmark 等の一時 YAML 対応）
+    _cfg_path = os.environ.get("SCHEDULER_CONFIG", "config/config.yml")
+    if not os.path.isabs(_cfg_path):
+        _cfg_path = os.path.abspath(_cfg_path)
+    with open(_cfg_path, "r", encoding="utf-8") as yml:
         config = yaml.safe_load(yml)
     
     # ワーカーを作成
@@ -1393,32 +1358,10 @@ def main(args=None):
     if args is None:
         args = parse_args()
 
-    if args.mode == 'pcn':
-        # 強化学習モードのパラメータ設定と実行
+    if args.mode == 'single':
         loops = 0
         lams = [0.2] * loops
-        how_many_episodes = 1000000
-        ob_number = 1
-        nb_jobs = args.nb_jobs
-        mapmap = run_PCN_mode(
-            nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs, 
-            use_cnn=args.use_cnn,  # CNNを使用するかどうかをコマンドライン引数から設定
-            use_wandb=args.use_wandb,  # Wandbを使用するかどうかをコマンドライン引数から設定
-            load_model=args.load_model,  # 保存済みモデルを読み込むかどうかをコマンドライン引数から設定
-            model_path=args.model_path  # 読み込むモデルのパスをコマンドライン引数から設定
-        )
-        print("PCN強化学習による実行が完了しました")
-        if args.use_cnn:
-            print("CNNベースの拡張モデルを使用しました")
-        if args.use_wandb:
-            print("Wandbによるログ記録を有効にしました")
-        if args.load_model:
-            print(f"保存済みモデル weights/{args.model_path}の学習を引き継ぎました")
-
-    elif args.mode == 'single':
-        loops = 0
-        lams = [0.2] * loops
-        how_many_episodes = 50000
+        how_many_episodes = args.dqn_episodes
         ob_number = 1
         nb_jobs = args.nb_jobs
         mapmap = run_single_rl_mode(nb_steps, lams, loops, how_many_episodes, ob_number, nb_jobs)
@@ -1511,7 +1454,10 @@ def main(args=None):
 if __name__ == "__main__":
     # コマンドライン引数の解析
     args = parse_args()
-    
+    if args.env_backend is not None:
+        config.setdefault("param_algorithm_compare", {})
+        config["param_algorithm_compare"]["env_backend"] = args.env_backend
+
     # プロファイリングが有効な場合
     if args.prof_output:
         prof_filename = f"{args.prof_output}.prof"

@@ -57,8 +57,11 @@ def run_distributed_pcn(
     env["DISTRIBUTED_PCN_CLOUD"] = str(n_cloud)
     if quick:
         env["DISTRIBUTED_PCN_QUICK"] = "1"
+    # distributed_pcn は既定でイベント観測+ラーナー側ビットマップ。従来C観測は明示的にOFF。
     if event_obs:
         env["DISTRIBUTED_PCN_USE_EVENT_OBS"] = "1"
+    else:
+        env["DISTRIBUTED_PCN_USE_EVENT_OBS"] = "0"
 
     module = "src.distributed.distributed_pcn_event" if event_obs else "src.distributed.distributed_pcn"
     cmd = [sys.executable, "-m", module]
