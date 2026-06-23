@@ -1,11 +1,17 @@
 ---
-description: 分散PCNの既定観測（イベント+ラーナー側ビットマップ）
+description: 分散PCNの既定観測（イベント／ビットマップ切替）
 alwaysApply: true
 ---
 
 # 分散PCN 観測の既定
 
-- `src.distributed.distributed_pcn` の**既定**は **イベント駆動環境**（`SchedulingEnvEventObs`）とし、**NN入力はラーナー側でビットマップへ復元**する（`DISTRIBUTED_PCN_EVENT_TO_BITMAP` 既定 `1`）。
-- 従来どおり **C が返すビットマップ観測のみ**に戻す場合は **`DISTRIBUTED_PCN_USE_EVENT_OBS=0`** を import 前に設定する（サブプロセスの `env` で明示）。
-- `python -m src.distributed.distributed_pcn_event` は互換用（`USE_EVENT_OBS` 強制）で、本体既定と実質同じ。
+- `src.distributed.distributed_pcn` の**既定**（`DISTRIBUTED_PCN_USE_EVENT_OBS=1` 時）は **イベント観測 + イベントネイティブ step**（`SchedulingEnvEventNative`、time_transition なし）、**ビットマップ復元OFF**（`SCHEDULER_LEARNER_BITMAP=0`）、**フェーズ1 action sweep ON**（`DISTRIBUTED_PCN_INITIAL_ACTION_SWEEP=1`）。NN 入力もイベントベクトルのまま。
+- 旧 step（ビットマップ C + time_transition ループ）に戻す: **`DISTRIBUTED_PCN_USE_EVENT_NATIVE=0`** または CLI **`--bitmap-step`**（観測は `SchedulingEnvEventObs` のまま）。
+- **CLI**（`python -m src.distributed.distributed_pcn`）: `--event-obs` / `--bitmap-obs`、`--event-native` / `--bitmap-step`、`--learner-bitmap` / `--no-learner-bitmap`、`--phase1-sweep` / `--no-phase1-sweep`。未指定時は上記既定。
+- **C ビットマップ観測**にする場合: `--bitmap-obs` または **`DISTRIBUTED_PCN_USE_EVENT_OBS=0`**。
+- **ビットマップ復元ON**にする場合: `--learner-bitmap` または **`SCHEDULER_LEARNER_BITMAP=1`**。
+- `python -m src.distributed.distributed_pcn_event` は **`USE_EVENT_OBS` を強制**する明示エントリポイント（本体と同じ観測既定）。
 - **学習規模の既定**（`config.yml` の `param_algorithm_compare.distributed_pcn`）: `initial_episodes: 100`（フェーズ1・各Actor）、`n_iterations: 100`（フェーズ3）。短時間テストのみ `DISTRIBUTED_PCN_QUICK=1`。
+- **左上先端本番プロファイル**: `python -m src.distributed.distributed_pcn_event --left-tail --no-viz`（または `config.yml` の `distributed_pcn.left_tail: true`）。dual12 系 + 低域 Eval ギャップ FB + **学習中 PF 図**（`execution_dir/uniform_cmd_pf_iter_XXX.png`, `uniform_cmd_pf_latest.png`）。`DISTRIBUTED_PCN_LIVE_UNIFORM_PF=1` で単体 ON 可。
+- **Eval ギャップ FB 単体**（`--left-tail` なし）: `PCN_EVAL_GAP_FEEDBACK=1`。帯域は `PCN_EVAL_GAP_BAND_NAMES` で限定可。
+- **スケジュールマップ行列**（ノード×時刻・重い）: 既定は構築しない。必要時のみ `SCHEDULER_BUILD_SCHEDULE_MAPS=1` または `--build-schedule-maps`。Gantt は `scripts/visualize_event_env_schedule_map.py`（イベント records から描画、行列不要）。

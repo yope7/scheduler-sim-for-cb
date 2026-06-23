@@ -50,7 +50,7 @@ DISTRIBUTED_PCN_QUICK=1 uv run python -m src.distributed.distributed_pcn_event
 uv run bash scripts/run_distributed_pcn_event.sh
 ```
 
-- **SchedulingEnvEventObs**: `src/envs/scheduling_env_event_obs.py`
+- **SchedulingEnvEventObs**: `src/envs/scheduling_variants/event_c_env.py`（一覧・切り替えは `src/envs/scheduling_variants/__init__.py` の `OBSERVATION_ENV_BY_KEY`）
 - **バックアップ**: `src/envs/backup_c_current/README.md`（現在のC環境の復元方法）
 
 ## 従来の pip からの移行

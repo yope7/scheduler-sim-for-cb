@@ -3,7 +3,7 @@
 
 分散PCN・DQN など、NN に入れる直前で get_observation を差し替える用途。
 環境変数:
-  SCHEDULER_LEARNER_BITMAP … 既定 '1'（ON）。'0' で生イベントベクトルのまま。
+  SCHEDULER_LEARNER_BITMAP … 分散PCN 既定 '0'（OFF）。'1' で Learner 側ビットマップ復元。
   DISTRIBUTED_PCN_EVENT_TO_BITMAP … 未設定時は SCHEDULER_LEARNER_BITMAP にフォールバックしないが、
     両方ある場合は SCHEDULER_LEARNER_BITMAP を優先し、無ければこちらを参照（後方互換）。
 """
@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from gym import spaces
 
-from src.envs.scheduling_env_event_obs import (
+from src.envs.scheduling_variants.event_c_env import (
     SchedulingEnvEventObs,
     N_EVENTS_OBS,
     EVENT_FEATURES,
@@ -30,6 +30,20 @@ def learner_bitmap_enabled() -> bool:
     if "SCHEDULER_LEARNER_BITMAP" in os.environ:
         return os.environ.get("SCHEDULER_LEARNER_BITMAP", "1") == "1"
     return os.environ.get("DISTRIBUTED_PCN_EVENT_TO_BITMAP", "1") == "1"
+
+
+def bitmap_flat_dim_from_event_env(env) -> int:
+    """SchedulingEnvEventObs 由来のイベント観測1本から復元したフラットビットマップ観測の次元数。"""
+    ow = int(getattr(env, "obs_window_size", 10))
+    dummy = np.zeros(N_EVENTS_OBS * EVENT_FEATURES + JOB_QUEUE_SIZE, dtype=np.float32)
+    out = event_obs_to_bitmap_observation(
+        dummy,
+        int(env.n_window),
+        int(env.n_on_premise_node),
+        int(env.n_cloud_node),
+        ow,
+    )
+    return int(out.shape[0])
 
 
 def event_obs_to_bitmap_observation(
@@ -126,5 +140,8 @@ def apply_learner_bitmap_to_event_env(env: SchedulingEnvEventObs) -> SchedulingE
     sample = wrapped_get_observation()
     env.observation_space = spaces.Box(low=0, high=1, shape=(sample.shape[0],), dtype=np.float32)
     env._event_bitmap_adapter_enabled = True
-    print(f"[ENV] イベント観測をビットマップへ復元してNN入力に使用: dim={sample.shape[0]}")
+    print(
+        f"[ENV] Learner ローカル観測: ビットマップ互換 dim={sample.shape[0]} "
+        f"（Actor からの教師はイベントベクトル→Learner で復元）"
+    )
     return env

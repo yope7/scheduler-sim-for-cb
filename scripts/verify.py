@@ -45,7 +45,7 @@ def main():
     try:
         import numpy as np
         import yaml
-        from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+        from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
         from src.utils.job_gen.job_generator import JobGenerator
 
         with open("config/config.yml") as f:

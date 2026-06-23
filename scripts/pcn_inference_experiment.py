@@ -24,13 +24,13 @@ os.chdir(repo_root)
 
 from src.agents.pcn_agent import PCN, get_non_dominated_inds_minimize
 from src.agents.nsga2_agent import NSGA2Agent
-from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
+from src.envs.scheduling_variants.event_c_env import SchedulingEnvEventObs
 from src.utils.job_gen.job_generator import JobGenerator
 
 # distributed_pcnの設定を参照
 USE_ENHANCED_MODEL = False
 N_JOBS = 32
-DESIRED_HORIZON = 32  # 残りステップ数 = ジョブ数
 
 
 def load_config():
@@ -38,7 +38,7 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def create_env(config, job_seed: int, nb_jobs: int = N_JOBS):
+def create_env(config, job_seed: int, nb_jobs: int = N_JOBS, env_backend: str = "c"):
     """ジョブセットを生成し環境を作成"""
     job_generator = JobGenerator(
         job_seed, 1,
@@ -49,7 +49,8 @@ def create_env(config, job_seed: int, nb_jobs: int = N_JOBS):
     )
     jobs_set = job_generator.generate_jobs_set()
 
-    env = SchedulingEnvCacheOptimized(
+    env_cls = SchedulingEnvCacheOptimized if env_backend == "c" else SchedulingEnvEventObs
+    env = env_cls(
         np.inf,
         config["param_env"]["n_window"],
         config["param_env"]["n_on_premise_node"],
@@ -90,9 +91,9 @@ def load_model(checkpoint_path: str, env, device: str = "cpu"):
 
     if "model_state_dict" in state:
         if agent.use_enhanced_model and hasattr(agent, "network"):
-            agent.network.load_state_dict(state["model_state_dict"])
+            agent.network.load_state_dict(state["model_state_dict"], strict=False)
         else:
-            agent.model.load_state_dict(state["model_state_dict"])
+            agent.model.load_state_dict(state["model_state_dict"], strict=False)
         print(f"モデルを読み込みました: {checkpoint_path}")
     else:
         raise ValueError(f"モデル状態が含まれていません: {checkpoint_path}")
@@ -104,12 +105,15 @@ def load_model(checkpoint_path: str, env, device: str = "cpu"):
 
 
 # 広範囲グリッド用のデフォルト（cost, wt を幅広くカバー）
-WIDE_COST_RANGE = (0, 300000)
+WIDE_COST_RANGE = (0, 1600000)
 WIDE_WT_RANGE = (10, 500)
 
 
 def create_diverse_commands(
     n_points: int,
+    desired_horizon: int,
+    horizon_schedule: str = "fixed",
+    horizon_min: int = 1,
     reference_pf_path: str = None,
     cost_range: tuple = None,
     wt_range: tuple = None,
@@ -146,7 +150,16 @@ def create_diverse_commands(
         cc, ww = np.meshgrid(costs, wts)
         values = np.column_stack([cc.ravel(), ww.ravel()])[:n_points]
         desired_returns = np.column_stack([-values[:, 1], -values[:, 0]]).astype(np.float32)
-        horizons = np.full(len(desired_returns), DESIRED_HORIZON, dtype=np.float32)
+        n_cmds = len(desired_returns)
+        if horizon_schedule == "countdown":
+            h0 = max(1, int(desired_horizon))
+            hmin = max(1, min(int(horizon_min), h0))
+            horizons = np.array(
+                [max(hmin, h0 - i) for i in range(n_cmds)],
+                dtype=np.float32
+            )
+        else:
+            horizons = np.full(n_cmds, desired_horizon, dtype=np.float32)
         return desired_returns, horizons
 
     values = None
@@ -196,7 +209,16 @@ def create_diverse_commands(
         values = np.column_stack([cc.ravel(), ww.ravel()])[:n_points]
         desired_returns = np.column_stack([-values[:, 1], -values[:, 0]]).astype(np.float32)
 
-    horizons = np.full(len(desired_returns), DESIRED_HORIZON, dtype=np.float32)
+    n_cmds = len(desired_returns)
+    if horizon_schedule == "countdown":
+        h0 = max(1, int(desired_horizon))
+        hmin = max(1, min(int(horizon_min), h0))
+        horizons = np.array(
+            [max(hmin, h0 - i) for i in range(n_cmds)],
+            dtype=np.float32
+        )
+    else:
+        horizons = np.full(n_cmds, desired_horizon, dtype=np.float32)
     return desired_returns, horizons
 
 
@@ -258,7 +280,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="execution_20260211_182837/final/final_model.pth",
+        default="execution_logs/execution_20260211_182837/final/final_model.pth",
         help="モデルチェックポイントのパス",
     )
     parser.add_argument(
@@ -268,6 +290,32 @@ def main():
         help="多様な条件点の数（広範囲グリッド時は大量に使用）",
     )
     parser.add_argument(
+        "--env_backend",
+        type=str,
+        choices=["c", "event"],
+        default="c",
+        help="推論に使う環境バックエンド（既定: c）",
+    )
+    parser.add_argument(
+        "--nb_jobs",
+        type=int,
+        default=N_JOBS,
+        help="推論時のジョブ数",
+    )
+    parser.add_argument(
+        "--horizon_schedule",
+        type=str,
+        choices=["fixed", "countdown"],
+        default="fixed",
+        help="desired_horizon の与え方（fixed: 全点同一、countdown: 32,31,30...）",
+    )
+    parser.add_argument(
+        "--horizon_min",
+        type=int,
+        default=1,
+        help="--horizon_schedule countdown 時の下限",
+    )
+    parser.add_argument(
         "--no_wide_grid",
         action="store_true",
         help="広範囲グリッドを無効化し参照PFを使用（デフォルトは広範囲グリッド cost 0~300k, wt 10~500）",
@@ -275,7 +323,7 @@ def main():
     parser.add_argument(
         "--ref_pf",
         type=str,
-        default="execution_20260212_003852/iteration_100/pareto_front_details_current_20260212_010353.txt",
+        default="execution_logs/execution_20260212_003852/iteration_100/pareto_front_details_current_20260212_010353.txt",
         help="参照PFファイル（多様な点の生成に使用）",
     )
     parser.add_argument(
@@ -307,6 +355,21 @@ def main():
         default=100,
         help="NSGA-IIの世代数（--nsga2時のみ）",
     )
+    parser.add_argument(
+        "--skip_known",
+        action="store_true",
+        help="既知ジョブ(seed=known_seed)での推論をスキップ",
+    )
+    parser.add_argument(
+        "--skip_unknown",
+        action="store_true",
+        help="未知ジョブ(seed=unknown_seed)での推論をスキップ",
+    )
+    parser.add_argument(
+        "--no_plot",
+        action="store_true",
+        help="可視化画像の保存をスキップ（実行時間短縮）",
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -320,17 +383,22 @@ def main():
     print(f"出力ディレクトリ: {out_dir}")
 
     # 既知ジョブ用環境
-    env_known = create_env(config, args.known_seed)
+    env_known = create_env(config, args.known_seed, args.nb_jobs, args.env_backend)
     agent = load_model(args.model, env_known, device)
+    print(f"環境バックエンド: {args.env_backend} ({type(env_known).__name__})")
 
     # 多様な条件点を生成（デフォルト: 広範囲グリッド、--no_wide_gridで参照PF使用）
     use_wide_grid = not args.no_wide_grid
     desired_returns, desired_horizons = create_diverse_commands(
         args.n_points,
+        desired_horizon=args.nb_jobs,
+        horizon_schedule=args.horizon_schedule,
+        horizon_min=args.horizon_min,
         reference_pf_path=args.ref_pf,
         use_wide_grid=use_wide_grid,
     )
-    print(f"条件点数: {len(desired_returns)}, desired_horizon={DESIRED_HORIZON}")
+    print(f"条件点数: {len(desired_returns)}, nb_jobs={args.nb_jobs}, horizon_schedule={args.horizon_schedule}")
+    print(f"desired_horizon 先頭5件: {desired_horizons[:5].astype(int).tolist()}")
     # PCN入力の範囲を表示（desired_return = [-wt, -cost]、報酬空間）
     print(f"PCN入力 desired_return (報酬空間[-wt,-cost]): "
           f"dim0(wt)={desired_returns[:, 0].min():.0f}~{desired_returns[:, 0].max():.0f}, "
@@ -339,21 +407,33 @@ def main():
     max_return = np.full(2, 1000.0, dtype=np.float32)
 
     # === 既知ジョブで推論 ===
-    print("\n=== 既知ジョブ（seed={}）で推論 ===".format(args.known_seed))
-    e_returns_known, e_values_known = run_inference(
-        agent, env_known, desired_returns, desired_horizons, max_return
-    )
-    pf_known = extract_pareto_front(e_values_known)
-    print(f"既知ジョブ: 全解数={len(e_values_known)}, PF解数={len(pf_known)}")
+    if not args.skip_known:
+        print("\n=== 既知ジョブ（seed={}）で推論 ===".format(args.known_seed))
+        e_returns_known, e_values_known = run_inference(
+            agent, env_known, desired_returns, desired_horizons, max_return
+        )
+        pf_known = extract_pareto_front(e_values_known)
+        print(f"既知ジョブ: 全解数={len(e_values_known)}, PF解数={len(pf_known)}")
+    else:
+        e_returns_known = np.array([]).reshape(0, 2)
+        e_values_known = np.array([]).reshape(0, 2)
+        pf_known = np.array([]).reshape(0, 2)
+        print("\n=== 既知ジョブ推論をスキップ ===")
 
     # === 未知ジョブで推論 ===
-    print("\n=== 未知ジョブ（seed={}）で推論 ===".format(args.unknown_seed))
-    env_unknown = create_env(config, args.unknown_seed)
-    e_returns_unknown, e_values_unknown = run_inference(
-        agent, env_unknown, desired_returns, desired_horizons, max_return
-    )
-    pf_unknown = extract_pareto_front(e_values_unknown)
-    print(f"未知ジョブ: 全解数={len(e_values_unknown)}, PF解数={len(pf_unknown)}")
+    if not args.skip_unknown:
+        print("\n=== 未知ジョブ（seed={}）で推論 ===".format(args.unknown_seed))
+        env_unknown = create_env(config, args.unknown_seed, args.nb_jobs, args.env_backend)
+        e_returns_unknown, e_values_unknown = run_inference(
+            agent, env_unknown, desired_returns, desired_horizons, max_return
+        )
+        pf_unknown = extract_pareto_front(e_values_unknown)
+        print(f"未知ジョブ: 全解数={len(e_values_unknown)}, PF解数={len(pf_unknown)}")
+    else:
+        e_returns_unknown = np.array([]).reshape(0, 2)
+        e_values_unknown = np.array([]).reshape(0, 2)
+        pf_unknown = np.array([]).reshape(0, 2)
+        print("\n=== 未知ジョブ推論をスキップ ===")
 
     # === NSGA-II（オプション指定時のみ）===
     pf_nsga2 = np.array([]).reshape(0, 2)
@@ -361,7 +441,7 @@ def main():
     if args.nsga2:
         print(f"\n=== NSGA-II（seed={args.unknown_seed}, {args.nsga2_generations}世代）===")
         all_nsga2, pf_nsga2 = run_nsga2(
-            config, args.unknown_seed, N_JOBS,
+            config, args.unknown_seed, args.nb_jobs,
             num_generations=args.nsga2_generations, verbose=False
         )
         print(f"NSGA-II: 全解数={len(all_nsga2)}, PF解数={len(pf_nsga2)}")
@@ -398,54 +478,63 @@ def main():
                 f.write(f"解{i+1}: [cost={v[0]:.2f}, wt={v[1]:.2f}]\n")
 
     # === 可視化 ===
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    if not args.no_plot:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # 既知ジョブ
-    ax = axes[0]
-    ax.scatter(e_values_known[:, 0], e_values_known[:, 1], c="steelblue", alpha=0.6, s=40, label="全解")
-    ax.scatter(pf_known[:, 0], pf_known[:, 1], c="red", s=80, marker="*", label="PF", zorder=5)
-    if len(pf_known) > 1:
-        order = np.lexsort((pf_known[:, 1], pf_known[:, 0]))
-        sorted_pf = pf_known[order]
-        ax.plot(sorted_pf[:, 0], sorted_pf[:, 1], "r-", alpha=0.8, linewidth=1.5)
-    ax.set_xlabel("Cost")
-    ax.set_ylabel("Avg Waiting Time")
-    ax.set_title(f"既知ジョブ (seed={args.known_seed})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        # 既知ジョブ
+        ax = axes[0]
+        if len(e_values_known) > 0:
+            ax.scatter(e_values_known[:, 0], e_values_known[:, 1], c="steelblue", alpha=0.6, s=40, label="全解")
+        if len(pf_known) > 0:
+            ax.scatter(pf_known[:, 0], pf_known[:, 1], c="red", s=80, marker="*", label="PF", zorder=5)
+        if len(pf_known) > 1:
+            order = np.lexsort((pf_known[:, 1], pf_known[:, 0]))
+            sorted_pf = pf_known[order]
+            ax.plot(sorted_pf[:, 0], sorted_pf[:, 1], "r-", alpha=0.8, linewidth=1.5)
+        ax.set_xlabel("Cost")
+        ax.set_ylabel("Avg Waiting Time")
+        ax.set_title(f"既知ジョブ (seed={args.known_seed})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
-    # 未知ジョブ
-    ax = axes[1]
-    ax.scatter(e_values_unknown[:, 0], e_values_unknown[:, 1], c="steelblue", alpha=0.6, s=40, label="全解")
-    ax.scatter(pf_unknown[:, 0], pf_unknown[:, 1], c="red", s=80, marker="*", label="PF", zorder=5)
-    if len(pf_unknown) > 1:
-        order = np.lexsort((pf_unknown[:, 1], pf_unknown[:, 0]))
-        sorted_pf = pf_unknown[order]
-        ax.plot(sorted_pf[:, 0], sorted_pf[:, 1], "r-", alpha=0.8, linewidth=1.5)
-    ax.set_xlabel("Cost")
-    ax.set_ylabel("Avg Waiting Time")
-    ax.set_title(f"未知ジョブ (seed={args.unknown_seed})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        # 未知ジョブ
+        ax = axes[1]
+        if len(e_values_unknown) > 0:
+            ax.scatter(e_values_unknown[:, 0], e_values_unknown[:, 1], c="steelblue", alpha=0.6, s=40, label="全解")
+        if len(pf_unknown) > 0:
+            ax.scatter(pf_unknown[:, 0], pf_unknown[:, 1], c="red", s=80, marker="*", label="PF", zorder=5)
+        if len(pf_unknown) > 1:
+            order = np.lexsort((pf_unknown[:, 1], pf_unknown[:, 0]))
+            sorted_pf = pf_unknown[order]
+            ax.plot(sorted_pf[:, 0], sorted_pf[:, 1], "r-", alpha=0.8, linewidth=1.5)
+        ax.set_xlabel("Cost")
+        ax.set_ylabel("Avg Waiting Time")
+        ax.set_title(f"未知ジョブ (seed={args.unknown_seed})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "pareto_inference.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"可視化を保存: {out_dir}/pareto_inference.png")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "pareto_inference.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"可視化を保存: {out_dir}/pareto_inference.png")
 
-    # 比較プロット（両方のPFを重ねて表示）
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(pf_known[:, 0], pf_known[:, 1], c="blue", s=100, marker="o", label=f"既知 (seed={args.known_seed})", alpha=0.8)
-    ax.scatter(pf_unknown[:, 0], pf_unknown[:, 1], c="orange", s=100, marker="s", label=f"未知 (seed={args.unknown_seed})", alpha=0.8)
-    ax.set_xlabel("Cost")
-    ax.set_ylabel("Avg Waiting Time")
-    ax.set_title("PF比較: 既知 vs 未知ジョブ")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "pareto_comparison.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"比較図を保存: {out_dir}/pareto_comparison.png")
+        # 比較プロット（両方のPFを重ねて表示）
+        fig, ax = plt.subplots(figsize=(8, 6))
+        if len(pf_known) > 0:
+            ax.scatter(pf_known[:, 0], pf_known[:, 1], c="blue", s=100, marker="o", label=f"既知 (seed={args.known_seed})", alpha=0.8)
+        if len(pf_unknown) > 0:
+            ax.scatter(pf_unknown[:, 0], pf_unknown[:, 1], c="orange", s=100, marker="s", label=f"未知 (seed={args.unknown_seed})", alpha=0.8)
+        ax.set_xlabel("Cost")
+        ax.set_ylabel("Avg Waiting Time")
+        ax.set_title("PF-comparison: known vs unknown jobs")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "pareto_comparison.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"比較図を保存: {out_dir}/pareto_comparison.png")
+    else:
+        print("可視化保存をスキップしました (--no_plot)")
 
     # PCN vs NSGA-II 比較（seed42の同一問題で最適化度合いを比較）
     if len(pf_nsga2) > 0:

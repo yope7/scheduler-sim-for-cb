@@ -104,4 +104,4 @@ scheduling_env_core = { workspace = true }
 nsga2_core = { workspace = true }
 
 [tool.uv.workspace]
-members = ["src/envs/c_scheduling_env", "src/agents/c_nsga2"]
+members = ["src/envs/scheduling_native", "src/agents/c_nsga2"]

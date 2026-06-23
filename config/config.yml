@@ -46,7 +46,9 @@ param_algorithm_compare:
     initial_episodes: 100
     quick: false
     profile: false
-    # 実装既定: python -m src.distributed.distributed_pcn はイベント観測 + ラーナー側ビットマップ復元（NN入力）
+    # 左上先端 PF 本番（dual12 + 低域 EvalギャップFB）。CLI --left-tail と同じ
+    left_tail: true
+    # 実装既定: イベント観測 + ビットマップ復元OFF + フェーズ1 action sweep ON
     use_event_obs: true
   micro_benchmark_wall_clock:
     nsga_pop: 5

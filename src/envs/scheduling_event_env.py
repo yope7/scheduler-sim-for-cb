@@ -1,5 +1,6 @@
 import gym
 import numpy as np
+import os
 from collections import deque, defaultdict
 import sys
 from sklearn.preprocessing import MinMaxScaler
@@ -658,42 +659,31 @@ class EventDrivenSchedulingEnv(gym.core.Env):
         if job_width > max_w or job_height > max_h:
             return False, -1, None
     
-        # 列ごとに利用可能なリソースを確認する方法
-        for a in range(max_w - job_width + 1):  # 横方向（時間軸）の開始位置を探索
-            can_allocate = True
-            
-            # この開始位置から job_width 分の幅で配置できるか確認
-            for col_offset in range(job_width):
-                col = a + col_offset
-                available_nodes = max_h - np.count_nonzero(window[:, col])
-                
-                # この列に必要なノード数が確保できるか
-                if available_nodes < job_height:
-                    can_allocate = False
-                    break
-            
-            if can_allocate:
-                # 利用可能な連続したノード領域を探す（優先的に上から詰める）
-                for i in range(max_h - job_height + 1):
-                    if np.all(window[i:i + job_height, a:a + job_width] == 0):
-                        return True, time + a - when_submitted, (i, a)
-                
-                # 連続した領域がない場合、分散して割り当てる
-                node_allocation = []
-                for col_offset in range(job_width):
-                    col = a + col_offset
-                    free_nodes = [i for i in range(max_h) if window[i, col] == 0][:job_height]
-                    if len(free_nodes) >= job_height:
-                        node_allocation.append(free_nodes[:job_height])
-                    else:
-                        can_allocate = False
-                        break
-                
-                if can_allocate:
-                    return True, time + a - when_submitted, (0, a, node_allocation)
-    
-        # 有効な配置位置が見つからなかった
-        return False, np.inf, None
+        # 現在列 (a=0) のみ
+        a = 0
+        for col_offset in range(job_width):
+            col = a + col_offset
+            if max_h - np.count_nonzero(window[:, col]) < job_height:
+                return False, np.inf, None
+
+        for i in range(max_h - job_height + 1):
+            if np.all(window[i:i + job_height, a:a + job_width] == 0):
+                return True, time + a - when_submitted, (i, a)
+
+        if use_cloud:
+            return False, np.inf, None
+
+        free_nodes_a = [i for i in range(max_h) if window[i, a] == 0][:job_height]
+        if len(free_nodes_a) < job_height:
+            return False, np.inf, None
+        fixed_nodes = free_nodes_a[:job_height]
+        for col_offset in range(job_width):
+            col = a + col_offset
+            for node in fixed_nodes:
+                if window[node, col] != 0:
+                    return False, np.inf, None
+        node_allocation = [fixed_nodes] * job_width
+        return True, time + a - when_submitted, (0, a, node_allocation)
 
     def compute_cost(self, action, allocated_job, is_valid):
         """コストを計算"""

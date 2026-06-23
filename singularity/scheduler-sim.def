@@ -56,7 +56,7 @@ From: python:3.11-bookworm
     pip install --no-cache-dir pybind11 numpy
 
     # ワークスペースメンバー（C拡張）をインストール
-    pip install --no-cache-dir -e ./src/envs/c_scheduling_env
+    pip install --no-cache-dir -e ./src/envs/scheduling_native
     pip install --no-cache-dir -e ./src/agents/c_nsga2
 
     # メインプロジェクトをインストール

@@ -168,6 +168,8 @@ def _save_results(
     event_obs: bool = False,
 ) -> None:
     """結果をJSONとサマリーに保存。SIGKILL対策で各実行完了後に順次呼ぶ。"""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
     result = {
         "timestamp": timestamp,
         "quick_mode": quick,
@@ -265,7 +267,7 @@ def main():
         node_configs = DEFAULT_NODE_CONFIGS
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = args.output or f"execution_times_{timestamp}.json"
+    output_path = args.output or Path("execution_logs") / f"execution_times_{timestamp}.json"
     out_file = Path(output_path)
     if not out_file.is_absolute():
         out_file = project_root / out_file

@@ -193,7 +193,17 @@ class SchedulingEnv(gym.core.Env):
         self.cloud_window = np.zeros((self.n_cloud_node, self.n_window), dtype=self.dtype)
         # 初期化
 
-        self.n_action = 2  # 行動数
+        # 後回し(defer)行動: SCHEDULER_ALLOW_DEFER=1 で action=2(現ジョブを今は置かず後回し)を追加。
+        # 既定OFF時は n_action=2 で完全に従来通り(ビット一致)。巨大ジョブの配置タイミングを選べる。
+        self._allow_defer = os.environ.get("SCHEDULER_ALLOW_DEFER", "0") == "1"
+        self._defer_max = int(os.environ.get("SCHEDULER_DEFER_MAX", "3"))       # 1ジョブの後回し上限(終了保証)
+        self._defer_offset = int(os.environ.get("SCHEDULER_DEFER_OFFSET", "1"))  # 何ジョブ後ろへ回すか(既定1=1つ後ろ。ユーザー設計: deferは1つ後ろのみ認める)
+        # 待ち時間の目的指標: "wait"(生待ち時間, 既定=従来通り) / "slowdown"(待ち÷処理時間=stretch)。
+        # slowdown は巨大ジョブの待ちを pt で割って平準化し、「巨大ジョブの待ちが報酬を支配」を緩和する
+        # (谷口案: でかいジョブは待たせてもslowdownは大して変わらん・小ジョブを待たせない)。
+        # env が報酬・目的値の両方で slowdown を返すので、学習/NSGA/eval が自動で同じ座標系になる。
+        self._wait_metric = os.environ.get("SCHEDULER_WAIT_METRIC", "wait")
+        self.n_action = 3 if self._allow_defer else 2  # 行動数
         self.action_space = gym.spaces.Discrete(self.n_action)  # 行動空間
         self.tmp_queue = deque()  # 割り当てられなかったジョブを一時的に格納するキュー
         obs_space_size = (self.n_on_premise_node * self.obs_window_size +
@@ -1092,6 +1102,7 @@ class SchedulingEnv(gym.core.Env):
         free_per_col = cache['free_per_col']
         ps = cache['prefix_sum']
         free_nodes_list = cache['free_nodes_list']
+        occ = cache['occ']
 
         W = max_w
         need = job_height
@@ -1108,33 +1119,38 @@ class SchedulingEnv(gym.core.Env):
             # kが大きすぎる場合は早期リターン
             return None, np.inf
 
-        # a昇順、i昇順でFirst-Fit
-        limit_a = W - k + 1
-        for a in range(limit_a):
-            if mins[a] < need:
-                continue
-            a2 = a + k
-            max_i = max_h - job_height + 1
-            for i in range(max_i):
-                i2 = i + job_height
-                occ_sum = ps[i2, a2] - ps[i, a2] - ps[i2, a] + ps[i, a]
-                if occ_sum == 0:
-                    return (i, a), time + a - when_submitted
+        # 現在列 (a=0) のみ。未来列への先取り予約はしない
+        a = 0
+        if mins[a] < need:
+            return None, np.inf
+        a2 = a + k
+        max_i = max_h - job_height + 1
+        for i in range(max_i):
+            i2 = i + job_height
+            occ_sum = ps[i2, a2] - ps[i, a2] - ps[i2, a] + ps[i, a]
+            if occ_sum == 0:
+                return (i, a), time + a - when_submitted
 
-            # 分散割り当て
-            node_allocation = []
-            ok = True
-            for col_offset in range(k):
-                col = a + col_offset
-                nodes = free_nodes_list[col]
-                if nodes.size < job_height:
-                    ok = False
-                    break
-                node_allocation.append(nodes[:job_height].tolist())
-            if ok:
-                return (0, a, node_allocation), time + a - when_submitted
+        # クラウドは連続矩形のみ（載せた後はノード変更不可）
+        if not use_cloud:
+            # 分散割り当て: 開始列でノード集合を固定し、全期間同一ノードを使用
+            nodes_at_a = free_nodes_list[a]
+            if nodes_at_a.size >= need:
+                fixed_nodes = nodes_at_a[:need]
+                ok = True
+                for col_offset in range(k):
+                    col = a + col_offset
+                    for node in fixed_nodes:
+                        if occ[node, col] != 0:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    fixed_list = fixed_nodes.tolist()
+                    node_allocation = [fixed_list] * k
+                    return (0, a, node_allocation), time + a - when_submitted
 
-        # 有効な配置位置が見つからなかった
         return None, np.inf
 
     # エピソード終了条件を判定

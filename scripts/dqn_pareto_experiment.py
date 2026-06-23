@@ -24,7 +24,7 @@ os.chdir(repo_root)
 
 from src.agents.dqn_agent import DQNAgent
 from src.agents.pcn_agent import get_non_dominated_inds_minimize
-from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
 from src.utils.job_gen.job_generator import JobGenerator
 
 N_JOBS = 32

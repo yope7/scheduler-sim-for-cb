@@ -45,7 +45,7 @@ from src.agents.pcn_agent import (
     crowding_distance,
     hypervolume
 )
-from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
 from src.utils.job_gen.job_generator import JobGenerator
 
 
@@ -641,7 +641,7 @@ class Learner:
     def evaluate(self, max_return=None, n=10, training_iteration=None, eval_diag_path=None):
         """エージェントの評価を実行"""
         if max_return is None:
-            max_return = np.full(2, 100.0, dtype=np.float32)
+            max_return = np.full(2, np.inf, dtype=np.float32)
         
         if DEBUG:
             print("評価を実行中...")
@@ -664,7 +664,7 @@ def main():
     
     # 実行用のディレクトリを作成
     execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    execution_dir = f"execution_{execution_timestamp}"
+    execution_dir = os.path.join("execution_logs", f"execution_{execution_timestamp}")
     os.makedirs(execution_dir, exist_ok=True)
     
     if TIME_DEBUG:

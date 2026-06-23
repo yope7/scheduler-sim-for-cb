@@ -57,7 +57,7 @@ def load_bitmap_env():
 
 def load_ringbuffer_env():
     """現在のリングバッファ版の環境クラスを読み込み"""
-    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+    from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
     return SchedulingEnvCacheOptimized
 
 

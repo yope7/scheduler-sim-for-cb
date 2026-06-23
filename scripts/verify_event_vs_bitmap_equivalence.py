@@ -15,8 +15,8 @@ sys.path.insert(0, str(project_root))
 import numpy as np
 import yaml
 
-from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
-from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
+from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
+from src.envs.scheduling_variants.event_c_env import SchedulingEnvEventObs
 from src.utils.job_gen.job_generator import JobGenerator
 
 

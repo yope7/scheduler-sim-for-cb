@@ -2205,7 +2205,7 @@ requires-dist = [
     { name = "requests", specifier = "==2.32.3" },
     { name = "rich", specifier = "==13.9.3" },
     { name = "scalene", specifier = "==1.5.49" },
-    { name = "scheduling-env-core", editable = "src/envs/c_scheduling_env" },
+    { name = "scheduling-env-core", editable = "src/envs/scheduling_native" },
     { name = "scikit-learn", specifier = "==1.5.0" },
     { name = "scipy", specifier = "==1.14.0" },
     { name = "scs", specifier = "==3.2.5" },
@@ -2229,7 +2229,7 @@ requires-dist = [
 [[package]]
 name = "scheduling-env-core"
 version = "0.1.0"
-source = { editable = "src/envs/c_scheduling_env" }
+source = { editable = "src/envs/scheduling_native" }
 dependencies = [
     { name = "numpy" },
     { name = "pybind11" },

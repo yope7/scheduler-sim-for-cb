@@ -15,7 +15,7 @@ sys.path.insert(0, str(project_root))
 import numpy as np
 import yaml
 
-from src.envs.scheduling_env_event_obs import (
+from src.envs.scheduling_variants.event_c_env import (
     SchedulingEnvEventObs,
     N_EVENTS_OBS,
     EVENT_FEATURES,

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -54,14 +55,51 @@ class JobGenerator:
     def generate_jobs_set(self):
         if self.job_type == 1:
             np.random.seed(self.seed)
+            # 合成↔trace の連続補間ダイヤル（占有量 power-law 裾）。
+            # env(SYNTH_TAIL_*) > config(param_job.synth_tail_*) > 既定OFF の優先順。
+            # 既定(level=0)では JobSimulator が裾ブロックを実行せず従来とビット一致。
+            pj = self.config.get('param_job', {})
+
+            def _envcfg(env_key, cfg_key, default=None):
+                v = os.environ.get(env_key)
+                if v is not None and v != "":
+                    return v
+                return pj.get(cfg_key, default)
+
+            _tl = _envcfg("SYNTH_TAIL_LEVEL", "synth_tail_level", 0.0)
+            tail_level = float(_tl) if _tl not in (None, "") else 0.0
+            _ta = _envcfg("SYNTH_TAIL_ALPHA", "synth_tail_alpha", None)
+            tail_alpha = float(_ta) if _ta not in (None, "") else None
+            _tf = _envcfg("SYNTH_TAIL_FRAC", "synth_tail_frac", None)
+            tail_frac = float(_tf) if _tf not in (None, "") else None
+            _tc = _envcfg("SYNTH_TAIL_PT_CAP", "synth_tail_pt_cap", None)
+            tail_pt_cap = int(float(_tc)) if _tc not in (None, "") else None
+            _tb = _envcfg("SYNTH_TAIL_BURST", "synth_tail_burst", 0)
+            tail_burst = int(float(_tb)) if _tb not in (None, "") else 0
+
             # JobSimulatorのデフォルト設定を使用（過去の実験と一致）
             jobgen = JobSimulator(
-                self.seed, 
-                n_jobs=self.n_jobs, 
-                n_users=self.n_jobs, 
-                lam=self.lam
+                self.seed,
+                n_jobs=self.n_jobs,
+                n_users=self.n_jobs,
+                lam=self.lam,
+                tail_level=tail_level,
+                tail_alpha=tail_alpha,
+                tail_frac=tail_frac,
+                tail_max_nodes=self.n_cloud_node,
+                tail_seed=int(self.seed) + 1000003,
+                tail_pt_cap=tail_pt_cap,
+                tail_burst=tail_burst,
             )
             jobs = jobgen.generate_jobs()
+            if tail_level and tail_level > 0:
+                _occ = (jobs[:, 1] * jobs[:, 2]).astype(float)
+                _srt = np.sort(_occ)[::-1]
+                _top10 = float(_srt[:10].sum() / max(_occ.sum(), 1e-9))
+                print(
+                    f"[JobGenerator] SYNTH_TAIL_LEVEL={tail_level} alpha={tail_alpha} frac={tail_frac} "
+                    f"→ occupancy max/median={_occ.max()/max(np.median(_occ),1):.1f}x, top10={_top10:.1%}"
+                )
             for episode in range(self.nb_episodes + 1):
                 self.jobs_set[episode] = jobs
 
@@ -80,10 +118,49 @@ class JobGenerator:
 
             n_rows = self.config["param_job"].get("job_trace_n_jobs", -1)
             n_rows = int(n_rows) if n_rows is not None else -1
+            exclude_outlier = bool(
+                self.config["param_job"].get("job_trace_exclude_largest_outlier", False)
+            )
             read_n = None if n_rows <= 0 else n_rows
+            if exclude_outlier and read_n is not None and read_n > 0:
+                read_n = int(read_n) + 1
 
             jobs_df = pd.read_csv(trace_path, nrows=read_n)
             jobs = jobs_df.values.tolist()
+
+            # 退化ジョブの防御的クランプ: processing_time<=0 はイベント割当
+            # (_find_event_allocation) で width=0 となり ValueError を起こす。
+            # アカウンティングログ由来の 0 秒ジョブを最小 1 に丸める（件数は維持）。
+            _n_clamped_pt = 0
+            for row in jobs:
+                if float(row[1]) < 1:
+                    row[1] = 1
+                    _n_clamped_pt += 1
+            if _n_clamped_pt:
+                print(
+                    f"[JobGenerator] clamped processing_time>=1 for {_n_clamped_pt} "
+                    f"degenerate (pt<=0) trace job(s)"
+                )
+
+            if exclude_outlier and n_rows > 0:
+                if len(jobs) <= n_rows:
+                    raise ValueError(
+                        f"job_trace_exclude_largest_outlier: need at least {n_rows + 1} rows, got {len(jobs)}"
+                    )
+                scores = [float(row[1]) * float(row[2]) for row in jobs]
+                drop_i = int(np.argmax(scores))
+                dropped = jobs.pop(drop_i)
+                for i, row in enumerate(jobs):
+                    row[5] = i
+                print(
+                    "[JobGenerator] excluded largest outlier: "
+                    f"trace job_id={dropped[5]}, pt={dropped[1]}, nodes={dropped[2]}, "
+                    f"pt*nodes={scores[drop_i]:.0f}"
+                )
+                if len(jobs) != n_rows:
+                    raise ValueError(
+                        f"expected {n_rows} jobs after outlier exclusion, got {len(jobs)}"
+                    )
 
             print(f"[JobGenerator] job trace読み込み: {trace_path} (取得件数={len(jobs)} / nrows={read_n})")
             print("[JobGenerator] 先頭5件サンプル:", jobs[:5])

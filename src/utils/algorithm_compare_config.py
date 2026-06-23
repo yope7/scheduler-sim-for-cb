@@ -100,7 +100,7 @@ def scheduling_env_class_for_config(cfg: Dict[str, Any]) -> Tuple[Type[Any], str
         from src.envs.scheduling_env import SchedulingEnv
 
         return SchedulingEnv, "python"
-    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import (
+    from src.envs.scheduling_variants.bitmap_c_env import (
         SchedulingEnvCacheOptimized,
     )
 

@@ -10,7 +10,7 @@ from src.utils.job_gen.job_generator import JobGenerator
 
 # C言語実装版の環境をインポート
 try:
-    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+    from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
     C_AVAILABLE = True
 except ImportError:
     C_AVAILABLE = False
@@ -883,7 +883,7 @@ class DistributedDQNWorker:
                 flag=0,
             )
             if use_event_obs:
-                from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
+                from src.envs.scheduling_variants.event_c_env import SchedulingEnvEventObs
                 self.env = SchedulingEnvEventObs(**env_kwargs)
                 self.env = apply_learner_bitmap_to_event_env(self.env)
             else:

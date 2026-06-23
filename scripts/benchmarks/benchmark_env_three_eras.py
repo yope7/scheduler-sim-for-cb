@@ -28,10 +28,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.agents.heuristic_agent import HeuristicAgent
 from src.envs.scheduling_env import SchedulingEnv
-from src.envs.c_scheduling_env.scheduling_env_cache_optimized import (
+from src.envs.scheduling_variants.bitmap_c_env import (
     SchedulingEnvCacheOptimized,
 )
-from src.envs.scheduling_env_event_obs import SchedulingEnvEventObs
+from src.envs.scheduling_variants.event_c_env import SchedulingEnvEventObs
 from src.utils.job_gen.job_generator import JobGenerator
 
 

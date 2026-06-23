@@ -20,6 +20,10 @@ except Exception:
 
 def _build_env_params(env):
     return {
+        # trace 系ワークロード（処理時間がウィンドウ幅 n_window を大きく超える）は
+        # スライドウィンドウ方式の bitmap env では評価できないため、渡された env と同じ
+        # backend を worker でも再構築する（event 系なら SchedulingEnvEventNative）。
+        "env_backend": "event" if "Event" in type(env).__name__ else "bitmap",
         "max_step": env.max_step,
         "n_window": env.n_window,
         "n_on_premise_node": env.n_on_premise_node,
@@ -35,11 +39,24 @@ def _build_env_params(env):
     }
 
 
+def _make_env(env_params):
+    params = dict(env_params)
+    backend = params.pop("env_backend", "bitmap")
+    if backend == "event":
+        from src.envs.scheduling_variants.event_native_env import SchedulingEnvEventNative
+
+        return SchedulingEnvEventNative(**params)
+    from src.envs.scheduling_variants.bitmap_c_env import SchedulingEnvCacheOptimized
+
+    return SchedulingEnvCacheOptimized(**params)
+
+
 def _evaluate_worker(args):
     chromosome, env_params = args
-    from src.envs.c_scheduling_env.scheduling_env_cache_optimized import SchedulingEnvCacheOptimized
+    return _rollout(_make_env(env_params), chromosome)
 
-    env = SchedulingEnvCacheOptimized(**env_params)
+
+def _rollout(env, chromosome):
     env.reset()
     done = False
     step_idx = 0
@@ -50,8 +67,21 @@ def _evaluate_worker(args):
             step_idx += 1
         if done:
             env.finalize_window_history()
-    cost, _, avg_waiting_time = env.calc_objective_values()
+    cost, _, avg_waiting_time = env.calc_objective_values(calc_makespan=False)
     return np.array([cost, avg_waiting_time], dtype=np.float64)
+
+
+# --- persistent pool 用 worker（env を worker プロセスで1回だけ構築し、以後 chromosome のみ受け取る。
+#     jobs_set を含む env_params の個体ごと pickle 転送を排除する。結果は _evaluate_worker と同一） ---
+_POOL_ENV = {}
+
+
+def _pool_init(env_params):
+    _POOL_ENV["env"] = _make_env(env_params)
+
+
+def _pool_eval(chromosome):
+    return _rollout(_POOL_ENV["env"], chromosome)
 
 
 @dataclass
@@ -93,27 +123,56 @@ class NSGA2Agent:
         self.eliminate_duplicates = eliminate_duplicates
         self.population: List[Individual] = []
         self.history = {"pareto_fronts": [], "all_solutions": []}
+        self._eval_cache = {}
+        self._pool = None
+        self.n_evaluations = 0
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.execution_dir = f"execution_{ts}"
+        self.execution_dir = os.path.join("execution_logs", f"execution_{ts}")
         os.makedirs(self.execution_dir, exist_ok=True)
 
-    def initialize_population(self, nb_jobs: int):
+    def initialize_population(self, nb_jobs: int, seed_extremes: bool = False):
         self.population = []
-        for _ in range(self.pop_size):
+        if seed_extremes:
+            # PF の両端（全オンプレ=最安 / 全クラウド=最短待ち）を初期集団に明示的に入れる。
+            # 一様ランダムだけだと端の発見が世代任せになり、端到達の評価が初期化運に左右される。
+            self.population.append(Individual(chromosome=[0] * nb_jobs))
+            self.population.append(Individual(chromosome=[1] * nb_jobs))
+        while len(self.population) < self.pop_size:
             chrom = np.random.randint(0, 2, size=nb_jobs, dtype=np.int32).tolist()
             self.population.append(Individual(chromosome=chrom))
 
+    def _close_pool(self):
+        if self._pool is not None:
+            self._pool.close()
+            self._pool.join()
+            self._pool = None
+
     def _evaluate_population(self, env, n_jobs=-1):
         env_params = _build_env_params(env)
-        tasks = [(ind.chromosome, env_params) for ind in self.population]
-        if n_jobs == 1:
-            results = [_evaluate_worker(t) for t in tasks]
-        else:
-            n_proc = max(1, os.cpu_count() // 2) if n_jobs == -1 else max(1, int(n_jobs))
-            with mp.Pool(processes=n_proc) as pool:
-                results = pool.map(_evaluate_worker, tasks)
-        for ind, obj in zip(self.population, results):
-            ind.objectives = obj
+        # 評価キャッシュ: 同一遺伝子（無変異の親コピー等）の再ロールアウトを省く。決定的 env なので結果不変。
+        todo = []
+        for ind in self.population:
+            if ind.objectives is None:
+                key = tuple(ind.chromosome)
+                cached = self._eval_cache.get(key)
+                if cached is not None:
+                    ind.objectives = cached.copy()
+                else:
+                    todo.append(ind)
+        if todo:
+            self.n_evaluations += len(todo)
+            if n_jobs == 1:
+                results = [_evaluate_worker((ind.chromosome, env_params)) for ind in todo]
+            else:
+                n_proc = max(1, os.cpu_count() // 2) if n_jobs == -1 else max(1, int(n_jobs))
+                if self._pool is None:
+                    # pool は1回だけ作り全世代で再利用。env は initializer で worker ごとに1回構築
+                    #（jobs_set を含む env_params を個体ごとに pickle して送る転送コストを排除）。
+                    self._pool = mp.Pool(processes=n_proc, initializer=_pool_init, initargs=(env_params,))
+                results = self._pool.map(_pool_eval, [ind.chromosome for ind in todo], chunksize=4)
+            for ind, obj in zip(todo, results):
+                ind.objectives = obj
+                self._eval_cache[tuple(ind.chromosome)] = obj.copy()
 
     def non_dominated_sort(self):
         n = len(self.population)
@@ -208,38 +267,48 @@ class NSGA2Agent:
         self.history["pareto_fronts"].append(np.array(pf, dtype=np.float64) if pf else np.zeros((0, 2)))
         self.history["all_solutions"].append(np.array(allv, dtype=np.float64) if allv else np.zeros((0, 2)))
 
-    def run(self, env, nb_jobs: int, verbose: bool = True, n_jobs=-1):
-        self.initialize_population(nb_jobs)
-        self._evaluate_population(env, n_jobs=n_jobs)
-        self.non_dominated_sort()
-        self.calculate_crowding_distance()
-        self.save_pareto_front()
-
-        for gen in range(1, self.num_generations + 1):
-            parents = self.population.copy()
-            self.population = self.create_offspring()
+    def run(self, env, nb_jobs: int, verbose: bool = True, n_jobs=-1,
+            seed: Optional[int] = None, seed_extremes: bool = False):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        t_start = time.time()
+        try:
+            self.initialize_population(nb_jobs, seed_extremes=seed_extremes)
             self._evaluate_population(env, n_jobs=n_jobs)
-            self.population = parents + self.population
             self.non_dominated_sort()
             self.calculate_crowding_distance()
-
-            next_pop = []
-            r = 1
-            while len(next_pop) < self.pop_size:
-                front = [ind for ind in self.population if ind.rank == r]
-                if not front:
-                    break
-                remain = self.pop_size - len(next_pop)
-                if len(front) <= remain:
-                    next_pop.extend(front)
-                else:
-                    front.sort(key=lambda x: x.crowding_distance, reverse=True)
-                    next_pop.extend(front[:remain])
-                r += 1
-            self.population = next_pop
             self.save_pareto_front()
-            if verbose and (gen % 10 == 0 or gen == self.num_generations):
-                print(f"世代 {gen} - PF size: {len([i for i in self.population if i.rank == 1])}")
+
+            for gen in range(1, self.num_generations + 1):
+                parents = self.population.copy()
+                self.population = self.create_offspring()
+                self._evaluate_population(env, n_jobs=n_jobs)
+                self.population = parents + self.population
+                self.non_dominated_sort()
+                self.calculate_crowding_distance()
+
+                next_pop = []
+                r = 1
+                while len(next_pop) < self.pop_size:
+                    front = [ind for ind in self.population if ind.rank == r]
+                    if not front:
+                        break
+                    remain = self.pop_size - len(next_pop)
+                    if len(front) <= remain:
+                        next_pop.extend(front)
+                    else:
+                        front.sort(key=lambda x: x.crowding_distance, reverse=True)
+                        next_pop.extend(front[:remain])
+                    r += 1
+                self.population = next_pop
+                self.save_pareto_front()
+                if verbose and (gen % 10 == 0 or gen == self.num_generations):
+                    pf_n = len([i for i in self.population if i.rank == 1])
+                    print(f"世代 {gen} - PF size: {pf_n} evals: {self.n_evaluations} "
+                          f"elapsed: {time.time() - t_start:.1f}s", flush=True)
+        finally:
+            self._close_pool()
 
         return self.get_final_pareto_front()
 
