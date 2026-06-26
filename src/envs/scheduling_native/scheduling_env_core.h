@@ -254,6 +254,29 @@ int scheduling_event_buffer_append6(
     double sn,
     double jh);
 
+/* event-native sweep 配置探索の C 実装。Python の _find_event_allocation_sweep_np とビット一致。
+ * イベントの占有ノードは CSR 形式: イベント e のノードは nodes_flat[node_off[e] .. node_off[e+1])。
+ * 候補時刻 = {arrival} ∪ {ends[e] >= arrival} の昇順ユニーク。各候補で区間[start,start+width)に
+ * 重なるイベントの占有を per-node count に増分反映し、最初に height ノード空く時刻を返す。
+ * 出力: *out_start=開始時刻, *out_is_contiguous=連続割当か(1/0),
+ *       out_nodes[0..*out_count)=選択ノード(昇順)。out_nodes は呼び出し側が height 以上確保。
+ * 常に有効な配置を返す(全候補不成立なら末尾フォールバック=最大終了時刻に range(height))。 */
+void event_sweep_alloc(
+    const int64_t* starts,
+    const int64_t* ends,
+    const int32_t* nodes_flat,
+    const int32_t* node_off,
+    int32_t n,
+    int32_t width,
+    int32_t height,
+    int32_t n_nodes,
+    bool continuous_only,
+    int64_t arrival,
+    int64_t* out_start,
+    int32_t* out_is_contiguous,
+    int32_t* out_nodes,
+    int32_t* out_count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1280,6 +1280,151 @@ int scheduling_event_buffer_append6(
     return 0;
 }
 
+/* ---- event-native sweep 配置探索 (C実装) ---- */
+
+/* (key, index) ペアの昇順比較。key 同値は index 昇順で決定的に(安定sortと等価)。 */
+typedef struct { int64_t key; int32_t idx; } EvKIdx;
+static int evkidx_cmp(const void* a, const void* b) {
+    const EvKIdx* x = (const EvKIdx*)a;
+    const EvKIdx* y = (const EvKIdx*)b;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    if (x->idx < y->idx) return -1;
+    if (x->idx > y->idx) return 1;
+    return 0;
+}
+static int evi64_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a;
+    int64_t y = *(const int64_t*)b;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
+}
+
+void event_sweep_alloc(
+    const int64_t* starts,
+    const int64_t* ends,
+    const int32_t* nodes_flat,
+    const int32_t* node_off,
+    int32_t n,
+    int32_t width,
+    int32_t height,
+    int32_t n_nodes,
+    bool continuous_only,
+    int64_t arrival,
+    int64_t* out_start,
+    int32_t* out_is_contiguous,
+    int32_t* out_nodes,
+    int32_t* out_count
+) {
+    int64_t* cand = (int64_t*)malloc((size_t)(n + 1) * sizeof(int64_t));
+    EvKIdx* ks = (EvKIdx*)malloc((size_t)(n > 0 ? n : 1) * sizeof(EvKIdx));
+    EvKIdx* ke = (EvKIdx*)malloc((size_t)(n > 0 ? n : 1) * sizeof(EvKIdx));
+    int32_t* count = (int32_t*)calloc((size_t)(n_nodes > 0 ? n_nodes : 1), sizeof(int32_t));
+    unsigned char* counted = (unsigned char*)calloc((size_t)(n > 0 ? n : 1), sizeof(unsigned char));
+
+    int32_t i;
+    /* order_start / order_end: start / end 昇順のイベント index 列。 */
+    for (i = 0; i < n; i++) {
+        ks[i].key = starts[i]; ks[i].idx = i;
+        ke[i].key = ends[i];   ke[i].idx = i;
+    }
+    qsort(ks, (size_t)n, sizeof(EvKIdx), evkidx_cmp);
+    qsort(ke, (size_t)n, sizeof(EvKIdx), evkidx_cmp);
+
+    /* 候補時刻 = {arrival} ∪ {ends[e] >= arrival} を昇順ユニーク化。 */
+    int32_t ncand = 0;
+    cand[ncand++] = arrival;
+    for (i = 0; i < n; i++) {
+        if (ends[i] >= arrival) cand[ncand++] = ends[i];
+    }
+    qsort(cand, (size_t)ncand, sizeof(int64_t), evi64_cmp);
+    int32_t m = 0;
+    for (i = 0; i < ncand; i++) {
+        if (m == 0 || cand[i] != cand[m - 1]) cand[m++] = cand[i];
+    }
+    ncand = m;
+
+    int32_t i_en = 0, i_ex = 0, free_count = n_nodes;
+    int32_t ci;
+    for (ci = 0; ci < ncand; ci++) {
+        int64_t start = cand[ci];
+        int64_t win_end = start + (int64_t)width;
+        /* ENTER: start_e < win_end かつ end_e > start のイベントを占有に加える(単調前進)。 */
+        while (i_en < n && starts[ks[i_en].idx] < win_end) {
+            int32_t idx = ks[i_en].idx;
+            if (ends[idx] > start) {
+                int32_t k;
+                for (k = node_off[idx]; k < node_off[idx + 1]; k++) {
+                    int32_t node = nodes_flat[k];
+                    if (count[node] == 0) free_count--;
+                    count[node]++;
+                }
+                counted[idx] = 1;
+            }
+            i_en++;
+        }
+        /* EXIT: end_e <= start のイベントを占有から外す(単調前進)。 */
+        while (i_ex < n && ends[ke[i_ex].idx] <= start) {
+            int32_t idx = ke[i_ex].idx;
+            if (counted[idx]) {
+                int32_t k;
+                for (k = node_off[idx]; k < node_off[idx + 1]; k++) {
+                    int32_t node = nodes_flat[k];
+                    count[node]--;
+                    if (count[node] == 0) free_count++;
+                }
+                counted[idx] = 0;
+            }
+            i_ex++;
+        }
+        /* pick: free<height は即不成立。最低位の height 連続 free run を最優先、
+         * 無ければ continuous_only は不成立、そうでなければ最低位 height 個の free ノード。 */
+        if (free_count >= height) {
+            int32_t run_start = -1, found = -1, node;
+            for (node = 0; node < n_nodes; node++) {
+                if (count[node] != 0) { run_start = -1; continue; }
+                if (run_start < 0) run_start = node;
+                if (node - run_start + 1 >= height) { found = run_start; break; }
+            }
+            if (found >= 0) {
+                int32_t j;
+                for (j = 0; j < height; j++) out_nodes[j] = found + j;
+                *out_count = height; *out_is_contiguous = 1; *out_start = start;
+                goto cleanup;
+            }
+            if (!continuous_only) {
+                int32_t cnt = 0, j, is_contig = 1;
+                for (node = 0; node < n_nodes && cnt < height; node++) {
+                    if (count[node] == 0) out_nodes[cnt++] = node;
+                }
+                for (j = 1; j < height; j++) {
+                    if (out_nodes[j] != out_nodes[j - 1] + 1) { is_contig = 0; break; }
+                }
+                *out_count = height; *out_is_contiguous = is_contig; *out_start = start;
+                goto cleanup;
+            }
+            /* continuous_only かつ連続runなし → 次候補へ */
+        }
+    }
+
+    /* フォールバック: 全候補不成立 → 最大終了時刻に range(height) を連続割当。 */
+    {
+        int64_t maxend = arrival;
+        int32_t j;
+        for (i = 0; i < n; i++) if (ends[i] > maxend) maxend = ends[i];
+        for (j = 0; j < height; j++) out_nodes[j] = j;
+        *out_count = height; *out_is_contiguous = 1; *out_start = maxend;
+    }
+
+cleanup:
+    free(cand);
+    free(ks);
+    free(ke);
+    free(count);
+    free(counted);
+}
+
 #ifdef __cplusplus
 }
 #endif

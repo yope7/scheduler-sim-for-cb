@@ -282,6 +282,17 @@ _VALUE_WAIT_SCALE = float(os.environ.get("PCN_VALUE_WAIT_SCALE", "500.0"))
 _VALUE_REPRO_MAX_EPISODES = int(os.environ.get("PCN_VALUE_REPRO_MAX_EPISODES", "48"))
 _MODEL_NAN_WARN_LIMIT = int(os.environ.get("PCN_MODEL_NAN_WARN_LIMIT", "5"))
 _model_nan_warn_count = 0
+# forward の NaN/Inf 検査を旧来の .any()+print 経路にする（既定 OFF=高速パス）。
+# 高速パスは th.nan_to_num を無条件適用する: NaN/Inf が無ければ恒等変換なのでクリーンrunで
+# bit 一致を保ちつつ、.any() の reduction が起こす host 同期（GPU→CPU）を消す。
+# "1" で旧来の if .any(): _warn_nan; nan_to_num 経路（診断 print 復活）に戻す。
+_FWD_NANCHECK = os.environ.get("PCN_FWD_NANCHECK", "0") == "1"
+# update 内の入力(obs/desired_return/desired_horizon) と出力(prediction_logits) の
+# 純診断 NaN/Inf チェック(print のみ・補正なし)を有効化する（既定 OFF=スキップ）。
+# クリーンrunでは元々 print されないので bit 一致のまま、.any() 同期コストだけが消える。
+# 出力側の step skip は AMP の GradScaler / 非AMP の _NAN_SKIP_STEP が backward 後に二重に担うため、
+# この診断ブロックを既定スキップしても安全網は維持される。"1" で旧来の診断 print 経路に戻す。
+_UPDATE_NANCHECK = os.environ.get("PCN_UPDATE_NANCHECK", "0") == "1"
 
 # 固定シードを削除して多様性を確保
 # np.random.seed(42)
@@ -578,16 +589,23 @@ class BasePCNModel(nn.Module, ABC):
             _model_nan_warn_count += 1
             print(f"[BasePCNModel] 警告: {tag}にNaN/Infが含まれています{extra}")
 
-        if th.isnan(c).any() or th.isinf(c).any():
-            _warn_nan("条件ベクトルc")
+        if _FWD_NANCHECK:
+            if th.isnan(c).any() or th.isinf(c).any():
+                _warn_nan("条件ベクトルc")
+                c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            # 高速パス: 無条件 nan_to_num（NaN/Inf 無しなら恒等＝bit 一致, .any() 同期を除去）
             c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
 
         s = self.s_emb(state)
         if self.training and _S_EMB_DROPOUT > 0.0:
             s = F.dropout(s, p=min(max(_S_EMB_DROPOUT, 0.0), 0.95), training=True)
 
-        if th.isnan(s).any() or th.isinf(s).any():
-            _warn_nan("状態埋め込みs")
+        if _FWD_NANCHECK:
+            if th.isnan(s).any() or th.isinf(s).any():
+                _warn_nan("状態埋め込みs")
+                s = th.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
             s = th.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
 
         c = self._encode_cmd(c)  # b2: Fourier展開（OFF時は素通り）。FiLM/c_emb 両経路で共通。
@@ -600,22 +618,29 @@ class BasePCNModel(nn.Module, ABC):
             prediction = self.fc(s * gamma + beta)
         else:
             c = self.c_emb(c)
-            if th.isnan(c).any() or th.isinf(c).any():
-                _warn_nan("条件埋め込みc")
+            if _FWD_NANCHECK:
+                if th.isnan(c).any() or th.isinf(c).any():
+                    _warn_nan("条件埋め込みc")
+                    c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
                 c = th.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
             if _COND_ADD_SCALE > 0.0:
                 prediction = self.fc(s * c + _COND_ADD_SCALE * c)
             else:
                 prediction = self.fc(s * c)
 
-        if th.isnan(prediction).any() or th.isinf(prediction).any():
-            _warn_nan(
-                "予測出力",
-                f" (s=[{float(s.min()):.3g},{float(s.max()):.3g}] "
-                f"c=[{float(c.min()):.3g},{float(c.max()):.3g}])",
-            )
+        if _FWD_NANCHECK:
+            if th.isnan(prediction).any() or th.isinf(prediction).any():
+                _warn_nan(
+                    "予測出力",
+                    f" (s=[{float(s.min()):.3g},{float(s.max()):.3g}] "
+                    f"c=[{float(c.min()):.3g},{float(c.max()):.3g}])",
+                )
+                prediction = th.nan_to_num(prediction, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            # 高速パス: 警告メッセージの s.min()/c.min() 自体が host 同期なので呼ばず無条件補正
             prediction = th.nan_to_num(prediction, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         return prediction
 
 
@@ -3066,22 +3091,23 @@ class PCN(MOAgent, MOPolicy):
             # 7. 最適化された勾配計算
             self.opt.zero_grad(set_to_none=True)
             
-            # 8. モデル推論前のデータ検証
-            if th.isnan(obs).any() or th.isinf(obs).any():
-                print(f"[PCN] 警告: 観測データにNaN/Infが含まれています")
-                print(f"  NaN: {th.isnan(obs).any()}, Inf: {th.isinf(obs).any()}")
-                print(f"  観測データ範囲: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
-            
-            if th.isnan(desired_return).any() or th.isinf(desired_return).any():
-                print(f"[PCN] 警告: desired_returnにNaN/Infが含まれています")
-                print(f"  NaN: {th.isnan(desired_return).any()}, Inf: {th.isinf(desired_return).any()}")
-                print(f"  desired_return範囲: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
-            
-            if th.isnan(desired_horizon).any() or th.isinf(desired_horizon).any():
-                print(f"[PCN] 警告: desired_horizonにNaN/Infが含まれています")
-                print(f"  NaN: {th.isnan(desired_horizon).any()}, Inf: {th.isinf(desired_horizon).any()}")
-                print(f"  desired_horizon範囲: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
-            
+            # 8. モデル推論前のデータ検証（純診断 print のみ・補正なし。既定スキップで .any() 同期を除去）
+            if _UPDATE_NANCHECK:
+                if th.isnan(obs).any() or th.isinf(obs).any():
+                    print(f"[PCN] 警告: 観測データにNaN/Infが含まれています")
+                    print(f"  NaN: {th.isnan(obs).any()}, Inf: {th.isinf(obs).any()}")
+                    print(f"  観測データ範囲: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
+
+                if th.isnan(desired_return).any() or th.isinf(desired_return).any():
+                    print(f"[PCN] 警告: desired_returnにNaN/Infが含まれています")
+                    print(f"  NaN: {th.isnan(desired_return).any()}, Inf: {th.isinf(desired_return).any()}")
+                    print(f"  desired_return範囲: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
+
+                if th.isnan(desired_horizon).any() or th.isinf(desired_horizon).any():
+                    print(f"[PCN] 警告: desired_horizonにNaN/Infが含まれています")
+                    print(f"  NaN: {th.isnan(desired_horizon).any()}, Inf: {th.isinf(desired_horizon).any()}")
+                    print(f"  desired_horizon範囲: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
+
             # モデル推論
             try:
                 if self.use_enhanced_model:
@@ -3105,15 +3131,20 @@ class PCN(MOAgent, MOPolicy):
             else:
                 prediction_logits = prediction_output
             
-            # モデル出力の検証（NaN/Infチェック）
-            if th.isnan(prediction_logits).any() or th.isinf(prediction_logits).any():
+            # モデル出力の検証（NaN/Infチェック）。既定では skip。
+            # 出力 NaN→重みNaN化の安全網は backward 後に二重に存在する:
+            #   AMP経路   = scaler.unscale_()/step() が Inf/NaN grad を検出して step をスキップ
+            #   非AMP経路 = _NAN_SKIP_STEP(:3276) が th.isfinite(_gnorm) で step をスキップ
+            # ゆえに本ブロック(巨大な診断 print 群 + 早期 return skip)は安全網が重複するので
+            # _UPDATE_NANCHECK gate で囲み既定スキップ（クリーンrunでは未到達＝bit 一致, .any() 同期を除去）。
+            if _UPDATE_NANCHECK and (th.isnan(prediction_logits).any() or th.isinf(prediction_logits).any()):
                 print(f"[PCN] 警告: モデル出力にNaN/Infが含まれています")
                 print(f"  NaN: {th.isnan(prediction_logits).any()}, Inf: {th.isinf(prediction_logits).any()}")
                 print(f"  prediction_logits範囲: min={prediction_logits.min()}, max={prediction_logits.max()}")
                 print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
                 print(f"  desired_return統計: min={desired_return.min()}, max={desired_return.max()}, mean={desired_return.mean()}")
                 print(f"  desired_horizon統計: min={desired_horizon.min()}, max={desired_horizon.max()}, mean={desired_horizon.mean()}")
-                
+
                 # モデルの重みを確認
                 if self.use_enhanced_model:
                     for name, param in self.network.named_parameters():
@@ -3132,7 +3163,7 @@ class PCN(MOAgent, MOPolicy):
                 l = th.tensor(0.0, device=self.device, requires_grad=False)
                 # 勾配を計算しないため、最適化をスキップ
                 return l, {}
-            
+
             if self.continuous_action:
                 l = F.mse_loss(actions.float(), prediction_logits)
             else:

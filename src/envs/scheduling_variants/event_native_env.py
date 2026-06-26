@@ -25,6 +25,38 @@ _FAST_ENV = os.environ.get("PCN_FAST_ENV", "1") == "1"
 # イベントが少ない間は候補ループ(fused)の方が速いので閾値で切替（どちらでも結果は同一）。0 で旧挙動。
 _FAST_ENV_SWEEP = _FAST_ENV and os.environ.get("PCN_FAST_ENV_SWEEP", "1") == "1"
 _SWEEP_MIN_EVENTS = int(os.environ.get("PCN_SWEEP_MIN_EVENTS", "48"))
+# sweep の per-node 重なりカウント（Python list の range(n_nodes) 走査）を numpy 配列の
+# ベクトル演算に置換し、ENTER/EXIT の `for k in e["nodes"]` と pick の連続 run 探索から
+# Python ループを排除する。占有集合・free run 選択は旧 sweep と同一なので結果はビット一致。
+# 1イベント内のノードは重複しないので count[nodes]+=1 の fancy-index は重なり数を正しく数える。0 で旧 sweep。
+_FAST_ENV_NP = _FAST_ENV_SWEEP and os.environ.get("PCN_FAST_ENV_NP", "1") == "1"
+# urgency 観測のため毎ステップ実行する「先頭ジョブのオンプレ配置クエリ」(_find_event_allocation)を、
+# 直後の step が同じジョブを onprem 配置するとき再利用し、二重実行を 1 回に削減する。
+# get_observation→次step の間に events は変化しないので (position,start) は同一=ビット一致。0 で旧挙動。
+_REUSE_URGENCY_ALLOC = os.environ.get("PCN_REUSE_URGENCY_ALLOC", "1") == "1"
+# _to_queue_job の np.roll(arr,-1) を手書きロール(out[:-1]=arr[1:]; out[-1]=arr[0])に置換する。
+# np.roll は normalize_axis_tuple 等の汎用前処理＋concatenate で重く、毎ステップ呼ぶ 1次元・左1回転には
+# 過剰。手書きは同じ要素配置を float64 のまま生成するのでビット一致。プロファイルで ~7%。0 で旧 np.roll。
+_FAST_QUEUE_ROLL = os.environ.get("PCN_FAST_QUEUE_ROLL", "1") == "1"
+# 注: sweep_np 内の sorted×3/set 構築の numpy(argsort/unique)化は、イベント間引きで events 数が
+# 数百に抑えられる規模では Python の sorted(timsort)+set より遅く（NJ=512 で +6%）撤回した。
+# 配置あたり events 数は間引きで頭打ち=大規模でも好転しない。残る塊(sweep本体60%)は C化(段階2)で攻める。
+# 段階2: sweep 本体を C 実装(scheduling_env_core.event_sweep_alloc)に置換。候補列・占有count・pick・
+# フォールバックを全て C で行い、Python は events から CSR(starts/ends/nodes_flat/node_off)を1度組むだけ。
+# 占有集合・候補順・free run 選択は sweep_np と同一なので結果はビット一致。
+# 検証完了で既定 ON: env単体 bench thash 全一致(NJ512/1024・P=0/0.5/1.0 両分岐)＋実学習で崩壊なし(TRAIN_EXIT=0)
+# ＋greedy eval ohash 一致。速度: eval(推論)が NJ128 1.5×→512 2.9×→1024純env 5.4×と規模で拡大、
+# np 段階比 4〜5×・pure-Python比 26〜36×。分散学習(128J)は NN律速のため不変。0 で sweep_np に復帰。
+# C 拡張が無い環境では import 失敗→自動的に sweep_np へフォールバック(_c_event_sweep_alloc is None)。
+try:
+    from scheduling_env_core import event_sweep_alloc as _c_event_sweep_alloc
+except Exception:
+    _c_event_sweep_alloc = None
+_SWEEP_C = (
+    _FAST_ENV_SWEEP
+    and _c_event_sweep_alloc is not None
+    and os.environ.get("PCN_SWEEP_C", "1") == "1"
+)
 
 
 class SchedulingEnvEventNative(SchedulingEnvEventObs):
@@ -56,6 +88,7 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         self.job_allocated = []
         self._resource_events = {False: [], True: []}
         self._absolute_schedule_records = []
+        self._front_alloc_cache = None  # urgency が計算した先頭ジョブのオンプレ配置を次step で再利用
         # 残りジョブの最小到着時刻（suffix min）。これ未満で終わるイベントは未来の
         # 配置クエリ区間（start >= 未来到着）に重ならないので走査から外せる。
         if _FAST_ENV and len(self.jobs):
@@ -114,7 +147,19 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         self.time = max(self.time, arrival)
 
         use_cloud = bool(action[1])
-        position, start_time = self._find_event_allocation(job, use_cloud, arrival)
+        # 直前の get_observation(urgency) が同じジョブのオンプレ配置を解いていれば再利用（events 不変=同一結果）。
+        cache = getattr(self, "_front_alloc_cache", None)
+        if (
+            _REUSE_URGENCY_ALLOC
+            and not use_cloud
+            and cache is not None
+            and cache[0] == self.index_next_job
+            and cache[1] == arrival
+        ):
+            position, start_time = cache[2], cache[3]
+        else:
+            position, start_time = self._find_event_allocation(job, use_cloud, arrival)
+        self._front_alloc_cache = None  # 配置で events が変化するため 1 回限り
         waiting_time = int(start_time - arrival)
         self.time = int(start_time)
         self._record_event_schedule(job, use_cloud, position, start_time)
@@ -157,7 +202,14 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
             self._suffix_min_arrival = np.append(suffix, np.inf)
 
     def _to_queue_job(self, raw_job: np.ndarray) -> np.ndarray:
-        return np.roll(np.asarray(raw_job, dtype=float), -1)
+        arr = np.asarray(raw_job, dtype=float)
+        if not _FAST_QUEUE_ROLL:
+            return np.roll(arr, -1)
+        # np.roll(arr,-1) と同一: result[i]=arr[(i+1)%n]（左1回転）。汎用前処理を省く。
+        out = np.empty_like(arr)
+        out[:-1] = arr[1:]
+        out[-1] = arr[0]
+        return out
 
     def _refresh_job_queue(self) -> None:
         if _FAST_ENV:
@@ -200,6 +252,14 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
 
         # イベントが多いときだけ sweep-line（O(R log R + R·H)）。少数なら候補ループ(fused)。結果は同一。
         if _FAST_ENV_SWEEP and len(events) >= _SWEEP_MIN_EVENTS:
+            if _SWEEP_C:
+                return self._find_event_allocation_sweep_c(
+                    events, width, height, n_nodes, use_cloud, arrival
+                )
+            if _FAST_ENV_NP:
+                return self._find_event_allocation_sweep_np(
+                    events, width, height, n_nodes, use_cloud, arrival
+                )
             return self._find_event_allocation_sweep(
                 events, width, height, n_nodes, use_cloud, arrival
             )
@@ -334,6 +394,30 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
             return None
         return free_head[:height]
 
+    def _pick_free_from_count_np(self, count, free_count, height, n_nodes, continuous_only):
+        """_pick_free_from_count の numpy 版（free run 探索をベクトル化, 返り値はビット一致）。
+
+        free_count<height の早期 return は高競合時に下の連続 run 探索（配列確保+diff）を丸ごと
+        省くための要の最適化。これを外すと pick が毎回フル実行され全体が大きく遅くなる（実測 1.7x 遅化）。
+        """
+        if free_count < height:
+            return None
+        free = count == 0
+        # 連続 free run の境界を一括検出。padded の diff 非零位置が各 run の開始/終了端。
+        padded = np.empty(n_nodes + 2, dtype=np.int8)
+        padded[0] = 0
+        padded[-1] = 0
+        padded[1:-1] = free
+        bounds = np.flatnonzero(np.diff(padded))
+        starts = bounds[0::2]
+        ok = np.flatnonzero((bounds[1::2] - starts) >= height)
+        if ok.size:
+            s = int(starts[ok[0]])
+            return list(range(s, s + height))
+        if continuous_only:
+            return None
+        return np.flatnonzero(free)[:height].tolist()
+
     def _find_event_allocation_sweep(self, events, width, height, n_nodes, use_cloud, arrival):
         """候補時刻を昇順に sweep し、per-node 重なりカウントを増分維持して最初の feasible を返す。
 
@@ -391,6 +475,93 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         nodes = list(range(height))
         return (nodes[0], 0), start
 
+    def _find_event_allocation_sweep_np(self, events, width, height, n_nodes, use_cloud, arrival):
+        """_find_event_allocation_sweep の numpy 占有カウント版（ENTER/EXIT/pick から Python ループ除去）。
+
+        占有カウント count を np.int32 配列で持ち、各イベントの固定ノード配列 nodes_np で
+        ベクトル加減算する。候補列・訪問順・free run 選択は旧 sweep と同一なのでビット一致。
+        """
+        cand = {int(arrival)}
+        for e in events:
+            if e["end"] >= arrival:
+                cand.add(int(e["end"]))
+        cand_sorted = sorted(cand)
+
+        n = len(events)
+        order_start = sorted(range(n), key=lambda i: events[i]["start"])
+        order_end = sorted(range(n), key=lambda i: events[i]["end"])
+        counted = [False] * n
+        count = np.zeros(n_nodes, dtype=np.int32)
+        free_count = n_nodes
+        i_en = 0
+        i_ex = 0
+
+        for start in cand_sorted:
+            win_end = start + width
+            # ENTER: start_e < win_end かつ生存(end_e > start)のイベントを取り込む。単調前進。
+            while i_en < n and events[order_start[i_en]]["start"] < win_end:
+                idx = order_start[i_en]
+                e = events[idx]
+                if e["end"] > start:
+                    nd = e["nodes_np"]
+                    sub = count[nd]
+                    free_count -= int(np.count_nonzero(sub == 0))
+                    count[nd] = sub + 1
+                    counted[idx] = True
+                i_en += 1
+            # EXIT: end_e <= start のイベントを除去。単調前進。
+            while i_ex < n and events[order_end[i_ex]]["end"] <= start:
+                idx = order_end[i_ex]
+                if counted[idx]:
+                    nd = events[idx]["nodes_np"]
+                    sub = count[nd] - 1
+                    count[nd] = sub
+                    free_count += int(np.count_nonzero(sub == 0))
+                    counted[idx] = False
+                i_ex += 1
+            nodes = self._pick_free_from_count_np(count, free_count, height, n_nodes, use_cloud)
+            if nodes is not None:
+                if self._is_contiguous(nodes):
+                    return (nodes[0], 0), start
+                node_cols = [nodes] * width
+                return (0, 0, node_cols), start
+
+        # すべての既存イベント終了後なら必ず空く（保険; 通常は最大 end の候補で成功）
+        start = max([arrival] + [int(e["end"]) for e in events])
+        nodes = list(range(height))
+        return (nodes[0], 0), start
+
+    def _find_event_allocation_sweep_c(self, events, width, height, n_nodes, use_cloud, arrival):
+        """_find_event_allocation_sweep_np の C 実装版（scheduling_env_core.event_sweep_alloc）。
+
+        Python 側は events から CSR(starts/ends/nodes_flat/node_off)を1度組むだけ。候補列・占有 count・
+        pick・フォールバックは全て C 側で行う。占有集合・訪問順・free run 選択は sweep_np と同一なので
+        返り値 (position, start) はビット一致。
+        """
+        n = len(events)
+        starts = np.fromiter((e["start"] for e in events), dtype=np.int64, count=n)
+        ends = np.fromiter((e["end"] for e in events), dtype=np.int64, count=n)
+        node_lists = [e["nodes_np"] for e in events]
+        node_off = np.empty(n + 1, dtype=np.int32)
+        node_off[0] = 0
+        if n:
+            np.cumsum(
+                np.fromiter((x.shape[0] for x in node_lists), dtype=np.int32, count=n),
+                out=node_off[1:],
+            )
+            nodes_flat = np.concatenate(node_lists).astype(np.int32, copy=False)
+        else:
+            nodes_flat = np.empty(0, dtype=np.int32)
+
+        start, is_contig, nodes = _c_event_sweep_alloc(
+            starts, ends, nodes_flat, node_off,
+            int(width), int(height), int(n_nodes), bool(use_cloud), int(arrival),
+        )
+        if is_contig:
+            return (nodes[0], 0), int(start)
+        node_cols = [nodes] * width
+        return (0, 0, node_cols), int(start)
+
     def _is_contiguous(self, nodes: list[int]) -> bool:
         return all(nodes[i] + 1 == nodes[i + 1] for i in range(len(nodes) - 1))
 
@@ -418,6 +589,8 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
             "start_node": int(start_node),
             "node_cols": node_cols,
             "nodes": nodes,
+            # sweep(np) が占有カウント更新で参照する固定ノード配列（生成時に1回だけ確保）。
+            "nodes_np": np.asarray(nodes, dtype=np.intp),
         }
         self._resource_event_list(use_cloud).append(record)
         self._absolute_schedule_records.append(record)

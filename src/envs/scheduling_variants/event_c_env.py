@@ -198,10 +198,13 @@ class SchedulingEnvEventObs(SchedulingEnvCacheOptimized):
             raw = jobs[j]
             job = self._to_queue_job(raw) if hasattr(self, "_to_queue_job") else raw
             arr = int(raw[0])
-            _, onp = self._find_event_allocation(job, False, arr)
+            pos, onp = self._find_event_allocation(job, False, arr)
+            # 次step が同じジョブを onprem 配置するとき再計算を省くため (position,start) を控える。
+            self._front_alloc_cache = (j, arr, pos, int(onp))
             pw = max(0, int(onp) - arr)
             return float(np.clip(np.log1p(pw) / 16.0, 0.0, 1.0))
         except Exception:
+            self._front_alloc_cache = None
             return 0.0
 
     def _front_job_leverage(self) -> float:

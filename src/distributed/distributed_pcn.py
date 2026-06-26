@@ -220,6 +220,10 @@ _QUICK_MODE = os.environ.get('DISTRIBUTED_PCN_QUICK', '0') == '1'
 _ABLATION_MODE = os.environ.get('DISTRIBUTED_PCN_ABLATION', '0') == '1'
 # Actor-Learner非同期オーバーラップ（Learner(i)とActor(i+1)を並列実行して待ち時間を隠蔽）
 _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
+# Phase3 ロールアウト重み配布を共有ObjectRef化（"1"=ref / "0"=従来 materialize）。
+# Learner actor のメソッドキュー順序(learn→重み取得)は変えず、materialize した state_dict の代わりに
+# 同一中身の ObjectRef を1回putして全Actorで共有受信する（転送量を Actor 数分→1回に削減）。
+_ACTOR_WEIGHTS_REF = os.environ.get('PCN_ACTOR_WEIGHTS_REF', '1') == '1'
 _PHASE3_GPU_CACHE = os.environ.get('DISTRIBUTED_PCN_PHASE3_GPU_CACHE', '1') == '1'
 _PHASE2_IMPORTANCE = os.environ.get('DISTRIBUTED_PCN_PHASE2_IMPORTANCE', '1') == '1'
 _PHASE2_IMPORTANCE_SAMPLES = int(os.environ.get('DISTRIBUTED_PCN_PHASE2_IMPORTANCE_SAMPLES', '1024'))
@@ -914,7 +918,8 @@ class ReplayBuffer:
             "metadata": metadata or {},
             "episodes": self.buffer,
         }
-        with gzip.open(path, "wb") as f:
+        # compresslevel=6: 9→6で保存 ~4倍速・サイズ +2〜3%のみ（展開後の中身は同一）。
+        with gzip.open(path, "wb", compresslevel=6) as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         nbytes = _estimate_episodes_numpy_bytes(self.buffer)
         return {
@@ -1070,8 +1075,12 @@ class Actor:
         progress_interval = max(1, n_episodes // 10)
         
         if not random_actions:
-            weights = ray.get(self.learner.get_weights.remote())
-            self.agent.model.load_state_dict(weights)
+            if _ACTOR_WEIGHTS_REF:
+                # 共有ObjectRef経路: Learner actor キューに get_weights_ref を積む（get_weights と同じ順序点）。
+                # 戻りは update_weights_ref が put した同一 state_dict の ObjectRef。中身は materialize 経路と bit一致。
+                self._load_policy_weights(ray.get(self.learner.get_weights_ref.remote()))
+            else:
+                self.agent.model.load_state_dict(ray.get(self.learner.get_weights.remote()))
         
         for ep in range(n_episodes):
             try:
@@ -3091,7 +3100,8 @@ class Learner:
             "episodes": episodes,
         }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with gzip.open(path, "wb") as f:
+        # compresslevel=6: end-of-run 1回の後処理。9→6で保存 ~4倍速・サイズ +2〜3%のみ（展開後は同一）。
+        with gzip.open(path, "wb", compresslevel=6) as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         nbytes = _estimate_episodes_numpy_bytes(episodes)
         print(

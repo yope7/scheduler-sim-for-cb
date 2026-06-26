@@ -717,5 +717,44 @@ PYBIND11_MODULE(scheduling_env_core, m) {
           py::arg("current_version"),
           py::arg("cache_version"),
           py::arg("window_changed"));
+
+    // event-native sweep 配置探索 (C実装)
+    m.def("event_sweep_alloc",
+          [](py::array_t<int64_t, py::array::c_style | py::array::forcecast> starts,
+             py::array_t<int64_t, py::array::c_style | py::array::forcecast> ends,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> nodes_flat,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_off,
+             int32_t width,
+             int32_t height,
+             int32_t n_nodes,
+             bool continuous_only,
+             int64_t arrival) {
+              auto bs = starts.request();
+              auto be = ends.request();
+              auto bnf = nodes_flat.request();
+              auto bno = node_off.request();
+              int32_t n = static_cast<int32_t>(bs.shape[0]);
+              const int64_t* ps = static_cast<const int64_t*>(bs.ptr);
+              const int64_t* pe = static_cast<const int64_t*>(be.ptr);
+              const int32_t* pnf = static_cast<const int32_t*>(bnf.ptr);
+              const int32_t* pno = static_cast<const int32_t*>(bno.ptr);
+
+              std::vector<int32_t> out_nodes(static_cast<size_t>(height > 0 ? height : 1));
+              int64_t out_start = 0;
+              int32_t out_is_contig = 0;
+              int32_t out_count = 0;
+              event_sweep_alloc(ps, pe, pnf, pno, n, width, height, n_nodes,
+                                continuous_only, arrival,
+                                &out_start, &out_is_contig, out_nodes.data(), &out_count);
+
+              py::list nodes;
+              for (int32_t j = 0; j < out_count; j++) nodes.append(out_nodes[j]);
+              return py::make_tuple(out_start, static_cast<bool>(out_is_contig), nodes);
+          },
+          "event-native sweep 配置探索 (C実装, _find_event_allocation_sweep_np とビット一致)",
+          py::arg("starts"), py::arg("ends"),
+          py::arg("nodes_flat"), py::arg("node_off"),
+          py::arg("width"), py::arg("height"), py::arg("n_nodes"),
+          py::arg("continuous_only"), py::arg("arrival"));
 }
 
