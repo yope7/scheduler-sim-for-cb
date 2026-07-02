@@ -220,6 +220,11 @@ _QUICK_MODE = os.environ.get('DISTRIBUTED_PCN_QUICK', '0') == '1'
 _ABLATION_MODE = os.environ.get('DISTRIBUTED_PCN_ABLATION', '0') == '1'
 # Actor-Learner非同期オーバーラップ（Learner(i)とActor(i+1)を並列実行して待ち時間を隠蔽）
 _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
+# 評価専用 Actor プール(N体追加)。学習中 eval(分散評価64ep + eval_gap格子372cmd)は学習用 actor 8体に
+# 相乗りしており、1024 では eval iter が ~120s(Phase3の半分超)を占める。評価は greedy=決定的・重みは
+# 共有ObjectRef・結果はコマンド順で復元されるため、並列度を上げても値はビット一致。ReplayBuffer には
+# 触らない(evaluate_episode/eval_uniform_grid_batch)ので学習データも不変。0=従来(学習actorのみ)。
+_EVAL_ACTOR_POOL = int(os.environ.get('PCN_EVAL_ACTOR_POOL', '0'))
 # Phase3 ロールアウト重み配布を共有ObjectRef化（"1"=ref / "0"=従来 materialize）。
 # Learner actor のメソッドキュー順序(learn→重み取得)は変えず、materialize した state_dict の代わりに
 # 同一中身の ObjectRef を1回putして全Actorで共有受信する（転送量を Actor 数分→1回に削減）。
@@ -634,8 +639,10 @@ def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_j
         get_non_dominated_inds_minimize,
     )
 
+    _t0 = time.time()
     g = int(os.environ.get("PCN_EVAL_GAP_FEEDBACK_GRID", "12"))
     prep = ray.get(learner.prepare_uniform_grid_prep.remote(n_jobs, g))
+    _t1 = time.time()
     ref_pts = np.asarray(prep.get("ref_pts", []), dtype=np.float64)
     exploration = np.asarray(prep.get("exploration", []), dtype=np.float64)
     commands = [
@@ -643,9 +650,11 @@ def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_j
         for dr, hz in prep.get("commands", [])
     ]
     weights_ref = ray.get(learner.get_eval_weights_ref.remote())
+    _t2 = time.time()
     pts = _run_uniform_grid_commands(
         None, None, commands, actors=actors, weights_ref=weights_ref
     )
+    _t3 = time.time()
     nd = get_non_dominated_inds_minimize(pts)
     eval_pf = pts[nd] if len(nd) else pts
     band_list = gap_bands_from_env()
@@ -660,7 +669,12 @@ def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_j
         archive_pf=ref_pts,
         exploration=exploration,
     )
+    _t4 = time.time()
     ray.get(learner.apply_eval_gap_boosts.remote(boosts))
+    if _PROFILE_MODE:
+        print(f"[PROFILE EVAL_GAP iter={training_iteration}] prep(replay舐め)={_t1-_t0:.2f}s "
+              f"weights_ref={_t2-_t1:.2f}s 格子評価({len(commands)}cmd)={_t3-_t2:.2f}s "
+              f"図+集計={_t4-_t3:.2f}s apply={time.time()-_t4:.2f}s")
     if boosts:
         parts = [f"{lo:.0g}-{hi:.0g}x{mult:.2f}" for lo, hi, mult in boosts]
         print(f"[EVAL_GAP] iter={training_iteration} boost_bands=[{', '.join(parts)}]")
@@ -3710,8 +3724,22 @@ def main():
     learner = LearnerActor.remote(config, buffer, device='cuda')
 
     actors = [Actor.remote(config, learner, buffer, actor_id=i) for i in range(N_ACTORS)]
-    
+
     init_futures = [actor._make_env.remote() for actor in actors]
+
+    # 評価専用 Actor プール(PCN_EVAL_ACTOR_POOL>0 時のみ)。エピソード生成には使わず、
+    # 学習中 eval(分散評価/eval_gap格子/LIVE図)の並列度を上げる。greedy決定的+結果コマンド順
+    # 復元でビット一致。0 なら eval_pool==actors で完全従来動作。
+    if _EVAL_ACTOR_POOL > 0:
+        eval_extra_actors = [
+            Actor.remote(config, learner, buffer, actor_id=1000 + i)
+            for i in range(_EVAL_ACTOR_POOL)
+        ]
+        init_futures += [a._make_env.remote() for a in eval_extra_actors]
+        eval_pool = actors + eval_extra_actors
+        print(f"[EVAL_POOL] 評価専用 Actor +{_EVAL_ACTOR_POOL} 体 (計 {len(eval_pool)} 並列で学習中evalを実行)")
+    else:
+        eval_pool = actors
 
 
     # =========================
@@ -4579,8 +4607,11 @@ def main():
                     _cmd_track_hist.append(_ct_stat)
                 
                 if iteration < N_ITERATIONS - 1:
+                    t_choose_start = time.time()
                     commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
                     commands_batch = _normalize_commands_for_actor_and_log(commands_batch, iteration + 1)
+                    if _PROFILE_MODE:
+                        print(f"[PROFILE Iter {iteration+1}] choose_commands: {time.time()-t_choose_start:.3f}s")
                     learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True)
                     next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
                     loss = loss_pending
@@ -4627,7 +4658,12 @@ def main():
         # Phase3凍結検知: skip率(非有限勾配/スパイクでstep不成立の割合)を毎iteration記録。
         # 警告printは上限20で沈黙するため、ここが唯一の定量ログ。
         try:
+            t_skip_start = time.time()
             _sk, _st = ray.get(learner.get_step_skip_stats.remote())
+            if _PROFILE_MODE:
+                # Learner actor キューは FIFO なので、直前に投げた learn(非同期のはず)の完了を
+                # ここで待たされる=オーバーラップ無効化の疑い。この待ち時間がその証拠になる。
+                print(f"[PROFILE Iter {iteration+1}] STEP_SKIP取得(ray.get): {time.time()-t_skip_start:.3f}s")
             _d_sk, _d_st = _sk - _prev_skip_stats[0], _st - _prev_skip_stats[1]
             _prev_skip_stats = (_sk, _st)
             _tot = _d_sk + _d_st
@@ -4658,15 +4694,19 @@ def main():
         # 定期的に評価を実行（最終 iter は EVAL_INTERVAL の倍数でなくても保存・EvalギャップFB）
         _is_eval_iter = (iteration + 1) % EVAL_INTERVAL == 0 or (iteration + 1) == N_ITERATIONS
         if _is_eval_iter:
+            t_eval_start = time.time()
             if DEBUG:
                 print(f"\n=== イテレーション {iteration + 1} の評価 ===")
                 print("※ 改良された経験によるパレートフロントの改善を確認")
             
             if USE_DISTRIBUTED_EVAL:
                 _eval_n = EVAL_SAMPLES if EVAL_SAMPLES_DISTRIBUTED <= 0 else EVAL_SAMPLES_DISTRIBUTED
+                t_deval_start = time.time()
                 e_returns, e_values, distances, map_fin = _distributed_evaluate_episodes(
-                    learner, actors, _eval_n
+                    learner, eval_pool, _eval_n
                 )
+                if _PROFILE_MODE:
+                    print(f"[PROFILE Iter {iteration+1}] 分散評価({_eval_n}ep): {time.time()-t_deval_start:.3f}s")
                 training_history['last_eval'] = {
                     'iteration': iteration + 1,
                     'e_returns': e_returns,
@@ -4747,9 +4787,10 @@ def main():
             _plot_dir = execution_dir
             if os.environ.get("PCN_EVAL_GAP_FEEDBACK", "0") == "1":
                 try:
+                    t_gapfb_start = time.time()
                     gap_report = _driver_eval_gap_feedback(
                         learner,
-                        actors,
+                        eval_pool,
                         iteration + 1,
                         _plot_dir,
                         int(config["param_env"].get("n_jobs", N_JOBS)),
@@ -4761,19 +4802,26 @@ def main():
                     }
                     if weak:
                         print(f"[EVAL_GAP] iter {iteration + 1} mean_gaps={weak}")
+                    if _PROFILE_MODE:
+                        print(f"[PROFILE Iter {iteration+1}] eval_gapフィードバック(格子評価+図): {time.time()-t_gapfb_start:.3f}s")
                 except Exception as exc:
                     print(f"[EVAL_GAP] 弱点帯域フィードバック失敗: {exc}")
             elif os.environ.get("DISTRIBUTED_PCN_LIVE_UNIFORM_PF", "0") == "1":
                 try:
+                    t_livepf_start = time.time()
                     _driver_live_uniform_pf_plot(
                         learner,
-                        actors,
+                        eval_pool,
                         iteration + 1,
                         _plot_dir,
                         int(config["param_env"].get("n_jobs", N_JOBS)),
                     )
+                    if _PROFILE_MODE:
+                        print(f"[PROFILE Iter {iteration+1}] LIVE_UNIFORM_PF図: {time.time()-t_livepf_start:.3f}s")
                 except Exception as exc:
                     print(f"[LIVE_PF] 均等格子 PF 図の保存失敗: {exc}")
+            if _PROFILE_MODE:
+                print(f"[PROFILE Iter {iteration+1}] eval全体(評価+保存+図): {time.time()-t_eval_start:.3f}s")
         else:
             training_history['pareto_front_sizes'].append(None)
             training_history['distances'].append(None)
