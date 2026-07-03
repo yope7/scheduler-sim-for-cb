@@ -56,16 +56,28 @@ WAIT_OP = float(os.environ.get("WIN_WAIT_ONPREM", "7393.0"))  # 窓 all-onprem �
 WAIT_CL = float(os.environ.get("WIN_WAIT_CLOUD", "717.0"))    # 窓 all-cloud の avg_wait
 
 
+# MODE=fixed: 毎窓同じ命令にリセット(使い残し/使い過ぎは窓境界で捨てる=素朴版)。
+# MODE=carry: 週目標(窓目標×窓数)から累積実績を引き、残り窓数で割って窓命令を再計画
+#             (使い残しは次窓へ・使い過ぎは次窓が絞る=フィードバック制御)。
+MODE = os.environ.get("MODE", "fixed")
+
+
 def rolling_pass(frac: float):
-    """窓スケール命令 frac で週全体を1パス。窓ごとに命令をリセット。"""
+    """窓スケール命令 frac で週全体を1パス。MODE に応じ窓ごとに命令をリセット/再計画。"""
     cost_t = float(frac) * COST_CL
     wait_t = WAIT_OP + float(frac) * (WAIT_CL - WAIT_OP)  # frac↑でwait目標↓
     win_cmd = objectives_to_command(cost_t, wait_t, WINDOW).astype(np.float32)
+    n_win_total = int(np.ceil(NJ / WINDOW))
+    week_cost_target = cost_t * n_win_total          # 週合計コスト目標
+    week_wait_target = wait_t                        # 週平均待ち目標(平均なので窓と同値)
     obs = env.reset()
     done = False
     dr = win_cmd.copy()
     hz = np.float32(WINDOW)
     placed_in_window = 0
+    placed_total = 0
+    spent_cost = 0.0     # 累積実コスト(reward[1]の符号反転)
+    spent_wait = 0.0     # 累積待ち合計
     n_windows = 1
     t0 = time.perf_counter()
     with th.no_grad():
@@ -76,16 +88,30 @@ def rolling_pass(frac: float):
             dr = (dr - reward).astype(np.float32, copy=False)
             hz = np.float32(max(float(hz) - 1.0, 1.0))
             if scheduled:
+                spent_wait += -float(reward[0])   # reward=[-wait, -cost]
+                spent_cost += -float(reward[1])
                 placed_in_window += 1
+                placed_total += 1
                 if placed_in_window >= WINDOW and not done:
-                    dr = win_cmd.copy()   # 窓命令リセット(ストリーミング適用と同型)
+                    n_windows += 1
+                    if MODE == "carry":
+                        n_rem = max(1, n_win_total - (n_windows - 1))
+                        rem_cost = max(0.0, week_cost_target - spent_cost)
+                        cost_next = rem_cost / n_rem
+                        # 待ち: 週平均目標×総ジョブ − 累積待ち を残ジョブに配る(負なら最小値)
+                        rem_jobs = max(1, NJ - placed_total)
+                        rem_wait_budget = week_wait_target * NJ - spent_wait
+                        wait_next = max(WAIT_CL, rem_wait_budget / rem_jobs)
+                        dr = objectives_to_command(cost_next, wait_next, WINDOW).astype(np.float32)
+                    else:
+                        dr = win_cmd.copy()   # fixed: 窓命令リセット
                     hz = np.float32(WINDOW)
                     placed_in_window = 0
-                    n_windows += 1
     cost, _mk, avgwait = env.calc_objective_values()
     dt = time.perf_counter() - t0
     return dict(frac=frac, cost=float(cost), avg_wait=float(avgwait),
-                n_windows=n_windows, pass_sec=round(dt, 1))
+                week_cost_target=week_cost_target, week_wait_target=week_wait_target,
+                mode=MODE, n_windows=n_windows, pass_sec=round(dt, 1))
 
 
 results = []
