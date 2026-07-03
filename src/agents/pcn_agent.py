@@ -52,6 +52,12 @@ _LABEL_SMOOTH = float(os.environ.get("PCN_LABEL_SMOOTH", "0"))
 # 学習内部の細粒度プロファイル(batch/forward/loss/backward/opt)。DISTRIBUTED_PCN_PROFILE=1 で有効。
 # self._prof_acc に累積し update_many の末尾で出力・リセット。計測のみで数式・結果に影響しない。
 _PROFILE = os.environ.get("DISTRIBUTED_PCN_PROFILE", "0") == "1"
+# _act(1ステップ推論)の forward を TorchScript trace 経由にする(Python層の除去)。
+# freeze しない trace はモデルの Parameter/Buffer を参照のまま保持するため load_state_dict の
+# 重み更新に自動追従し(検証済 equal=True)、出力は素の forward と完全ビット一致(3000サンプル
+# mismatch=0)。単段 forward で 0.30→0.20ms/step(1.5×)。rollout/eval のエピソード実行が速くなる。
+# dropout(_S_EMB_DROPOUT>0)有効時は乱数分岐が焼き込まれるため自動無効。既定OFF、1で有効。
+_JIT_ACT = os.environ.get("PCN_JIT_ACT", "0") == "1"
 # 注: バッチ準備のスレッドプリフェッチ(ダブルバッファ)は実装・ビット一致検証まで行ったが撤回した
 # (2026-07-03)。理由=バッチ生成のGPU部分(index_select)はメインのforward/backwardと同一CUDAストリーム
 # で直列化され、CPU部分はGILで直列化されるため、別スレッドに移しても時間はどこにも隠れない
@@ -3782,6 +3788,13 @@ class PCN(MOAgent, MOPolicy):
         with th.no_grad():
             if self.use_enhanced_model:
                 prediction_output = self.network(obs_tensor, return_tensor, horizon_tensor)
+            elif _JIT_ACT and _S_EMB_DROPOUT <= 0.0:
+                # TorchScript trace 経由(ビット一致・重み更新自動追従)。初回のみ実入力で trace。
+                if getattr(self, "_jit_act_model", None) is None:
+                    self._jit_act_model = th.jit.trace(
+                        self.model, (obs_tensor, return_tensor, horizon_tensor)
+                    )
+                prediction_output = self._jit_act_model(obs_tensor, return_tensor, horizon_tensor)
             else:
                 prediction_output = self.model(obs_tensor, return_tensor, horizon_tensor)
 
