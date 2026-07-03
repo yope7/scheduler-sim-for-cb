@@ -49,6 +49,14 @@ _COND_WAIT_K = float(os.environ.get("PCN_COND_WAIT_K", "10.0"))     # |x|<<K は
 # 当該サンプル不在時は勾配ゼロで戻る力が無く、ドリフトが不可逆化する。
 # ②ラベル平滑化: 最適 logit ギャップを有界化し、p→0 の飽和 lock-in を原理的に不可能にする(既定OFF)。
 _LABEL_SMOOTH = float(os.environ.get("PCN_LABEL_SMOOTH", "0"))
+# 学習内部の細粒度プロファイル(batch/forward/loss/backward/opt)。DISTRIBUTED_PCN_PROFILE=1 で有効。
+# self._prof_acc に累積し update_many の末尾で出力・リセット。計測のみで数式・結果に影響しない。
+_PROFILE = os.environ.get("DISTRIBUTED_PCN_PROFILE", "0") == "1"
+# 注: バッチ準備のスレッドプリフェッチ(ダブルバッファ)は実装・ビット一致検証まで行ったが撤回した
+# (2026-07-03)。理由=バッチ生成のGPU部分(index_select)はメインのforward/backwardと同一CUDAストリーム
+# で直列化され、CPU部分はGILで直列化されるため、別スレッドに移しても時間はどこにも隠れない
+# (bench実測: batch計時は0%になるが総時間20.4→20.6ms/updateで不変)。隠すには別streamと
+# event同期が必要だが、CUDA実行時のbatchは18%しかなく上限1.2×で労力に見合わない。
 # ①anchor-KL: 各 learn() 境界で方策スナップショットを凍結し、update 毎に
 # KL(anchor‖online) を罰する=イテレーション内 proximal(政策チャーン抑制, CHAIN流)。
 # anchor は毎イテレーション追従するので長期の学習進行は妨げない(既定OFF)。
@@ -1830,13 +1838,15 @@ class PCN(MOAgent, MOPolicy):
         if padded_cdf is not None and padded_cdf.size:
             ln = lengths[episode_indices]
             u = self.np_random.random(batch_size)
-            rows = padded_cdf[episode_indices]
-            max_len = rows.shape[1]
-            pos = np.arange(max_len, dtype=np.int64)
-            valid = pos < ln[:, None]
-            # パディングは u より大きい CDF にして searchsorted が末尾に落ちないようにする
-            rows_masked = np.where(valid, rows, 1.0)
-            step_indices = (rows_masked < u[:, None]).sum(axis=1) - 1
+            # 旧実装は rows=padded_cdf[episode_indices] ([B,max_len] のコピー＋全要素比較) で
+            # O(B×max_ep_len)。1万ジョブ級ではこれが update 時間の8割を占めた(512×9071≈37MB/更新)。
+            # 同じ量 step = count(cdf_row[:ln] < u) − 1 を行ごとの searchsorted(side='left'=「<u の個数」)
+            # で求める。結果は整数単位で同一・乱数消費も同一=ビット一致、O(B×log ep_len)。
+            step_indices = np.empty(batch_size, dtype=np.int64)
+            for bi in range(batch_size):
+                ep_i = int(episode_indices[bi])
+                n_i = int(ln[bi])
+                step_indices[bi] = np.searchsorted(padded_cdf[ep_i, :n_i], u[bi], side="left") - 1
             step_indices = np.clip(step_indices, 0, np.maximum(ln - 1, 0))
         elif cache.get("flat_step_probs") is not None:
             offsets = cache["episode_offsets"]
@@ -2031,8 +2041,18 @@ class PCN(MOAgent, MOPolicy):
         return True
 
     def _encode_episode_training_block(self, episode) -> Dict[str, np.ndarray]:
-        """1エピソード分の教師 cache ブロックを構築する。"""
+        """1エピソード分の教師 cache ブロックを構築する。
+
+        エピソードは replay 投入後に不変で、この encode は episode と定数(gamma/CLIP)のみに
+        依存する決定的計算。そこで結果を先頭 Transition にメモ化し、cache 全件再構築のたびに
+        全エピソードを encode し直す O(総transition) の Python ループを回避する(1万ジョブ級で
+        再構築が ~50s/iter に達していた主因)。ヒット時も同一入力→同一出力なのでビット一致。
+        """
         episode_length = len(episode)
+        _first = episode[0]
+        _cached = getattr(_first, "_pcn_training_block", None)
+        if _cached is not None and _cached.get("episode_length") == episode_length:
+            return _cached
         obs_shape = episode[0].observation.shape
         reward_shape = episode[0].reward.shape
         observations = np.empty((episode_length,) + obs_shape, dtype=np.float32)
@@ -2066,13 +2086,18 @@ class PCN(MOAgent, MOPolicy):
                 -_DESIRED_RETURN_CLIP,
                 _DESIRED_RETURN_CLIP,
             )
-        return {
+        block = {
             "observations": observations,
             "actions": actions,
             "desired_returns": desired_returns,
             "desired_horizons": desired_horizons,
             "episode_length": int(episode_length),
         }
+        try:
+            _first._pcn_training_block = block  # メモ化(エピソード淘汰でGC、id再利用の誤ヒットなし)
+        except Exception:
+            pass  # __slots__ 等で貼れない場合は従来動作(毎回計算)
+        return block
 
     def _needs_flat_step_weights(self) -> bool:
         return (
@@ -3039,11 +3064,16 @@ class PCN(MOAgent, MOPolicy):
         重み更新はビット一致。update_many が最終 update 以外で False を渡す。
         """
         start_time = time.time()
+        if _PROFILE and not hasattr(self, "_prof_acc"):
+            self._prof_acc = {"batch": 0.0, "fwd": 0.0, "loss": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0}
+        _pt = time.perf_counter() if _PROFILE else 0.0
         original_lr = None
         if learning_rate is not None:
             original_lr = self.opt.param_groups[0]['lr']
             self.opt.param_groups[0]['lr'] = learning_rate
         observations, actions, desired_returns, desired_horizons = self.get_training_batch()
+        if _PROFILE:
+            _now = time.perf_counter(); self._prof_acc["batch"] += _now - _pt; self._prof_acc["n"] += 1; _pt = _now
         if os.environ.get("PCN_DIAG_BATCH") == "1" and getattr(self, "_diag_batch_n", 0) < 3:
             self._diag_batch_n = getattr(self, "_diag_batch_n", 0) + 1
             import torch as _th
@@ -3114,6 +3144,8 @@ class PCN(MOAgent, MOPolicy):
                     prediction_output = self.network(obs, desired_return, desired_horizon)
                 else:
                     prediction_output = self.model(obs, desired_return, desired_horizon)
+                if _PROFILE:
+                    _now = time.perf_counter(); self._prof_acc["fwd"] += _now - _pt; _pt = _now
             except Exception as e:
                 print(f"[PCN] エラー: モデル推論中にエラーが発生しました: {e}")
                 print(f"  観測データ統計: min={obs.min()}, max={obs.max()}, mean={obs.mean()}")
@@ -3298,7 +3330,11 @@ class PCN(MOAgent, MOPolicy):
                         raise
             else:
                 global _nan_skip_count
+                if _PROFILE:
+                    _now = time.perf_counter(); self._prof_acc["loss"] += _now - _pt; _pt = _now
                 l.backward()
+                if _PROFILE:
+                    _now = time.perf_counter(); self._prof_acc["bwd"] += _now - _pt; _pt = _now
                 # 勾配クリッピングを追加（勾配爆発を防ぐ）。total_norm を捕捉して非有限なら step をスキップ。
                 _gnorm = th.nn.utils.clip_grad_norm_(self.network.parameters() if self.use_enhanced_model else self.model.parameters(), max_norm=1.0)
                 _lval = float(l.detach())
@@ -3332,6 +3368,9 @@ class PCN(MOAgent, MOPolicy):
                         _track = min(_lval, self._loss_ema * _LOSS_SPIKE_RATIO)
                         self._loss_ema = 0.9 * self._loss_ema + 0.1 * _track
 
+        if _PROFILE:
+            # backward後〜ここまで(clip+opt.step+ema)を opt に計上。AMP経路でも loss後の残り時間を回収。
+            self._prof_acc["opt"] += time.perf_counter() - _pt
         # 11. メモリクリーンアップ
         del observations, actions, desired_returns, desired_horizons
         if str(self.device).startswith("cuda") and os.environ.get("PCN_EMPTY_CACHE_EVERY_UPDATE", "0") == "1":
@@ -3398,6 +3437,14 @@ class PCN(MOAgent, MOPolicy):
             arr = np.asarray([float(t) for t in loss_tensors], dtype=np.float64)
         arr[~np.isfinite(arr)] = 0.0
         losses = arr.tolist()
+        if _PROFILE and getattr(self, "_prof_acc", None) and self._prof_acc["n"] > 0:
+            a = self._prof_acc; tot = a["batch"] + a["fwd"] + a["loss"] + a["bwd"] + a["opt"]
+            if tot > 0:
+                print(f"[PROFILE update内訳] n={a['n']} 計{tot:.2f}s | "
+                      f"batch {a['batch']/tot*100:.0f}% / forward {a['fwd']/tot*100:.0f}% / "
+                      f"loss {a['loss']/tot*100:.0f}% / backward {a['bwd']/tot*100:.0f}% / opt {a['opt']/tot*100:.0f}% "
+                      f"(1更新 fwd={a['fwd']/a['n']*1000:.2f}ms bwd={a['bwd']/a['n']*1000:.2f}ms opt={a['opt']/a['n']*1000:.2f}ms)", flush=True)
+            self._prof_acc = {"batch": 0.0, "fwd": 0.0, "loss": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0}
         return float(arr.mean()) if len(arr) else 0.0, last_metrics, losses
 
     def _add_episode(self, transitions: List[Transition], max_size: int, step: int) -> None:

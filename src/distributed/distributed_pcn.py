@@ -1334,6 +1334,7 @@ class Actor:
         start_time = time.time()
         step_count = 0
         t_steps_start = time.time()
+        _t_act = 0.0; _t_env = 0.0  # [PROFILE] policy forward vs env.step 分離
         while not done:
             if random_actions:
                 if giant_defer_threshold is not None:
@@ -1377,10 +1378,12 @@ class Actor:
                     print(f"[Actor {self.actor_id}] ステップ {len(transitions)+1}: ランダム行動 = {action}")
             else:
                 # PCN本体の _run_episode と同じく方策からサンプリング。イベント観測は _obs_for_policy で bitmap 次元へ。
+                _ta = time.perf_counter() if _PROFILE_MODE else 0.0
                 policy_obs = self.agent._obs_for_policy(self.env, obs)
                 action = self.agent._act(
                     policy_obs, desired_return, desired_horizon, eval_mode=False
                 )
+                if _PROFILE_MODE: _t_act += time.perf_counter() - _ta
                 
             if _ar is not None:
                 # 方策分岐の action は残差。生成時アンカーとXORして絶対行動を作る。
@@ -1392,7 +1395,9 @@ class Actor:
                     env_action = int(action)
             else:
                 env_action = action
+            _te = time.perf_counter() if _PROFILE_MODE else 0.0
             n_obs, reward, scheduled, wt_step, done = self.env.step(env_action)
+            if _PROFILE_MODE: _t_env += time.perf_counter() - _te
             step_count += 1
             if fixed_actions is not None and scheduled:
                 _fa_idx += 1
@@ -1428,7 +1433,10 @@ class Actor:
         if done:
             t_steps = time.time() - t_steps_start
             if _PROFILE_MODE and step_count > 0:
-                print(f"[PROFILE Actor {self.actor_id}] env.step loop: {t_steps:.3f}s ({step_count} steps, {t_steps/step_count*1000:.1f}ms/step)")
+                _oth = max(0.0, t_steps - _t_act - _t_env)
+                print(f"[PROFILE Actor {self.actor_id}] rollout {t_steps:.3f}s ({step_count}steps {t_steps/step_count*1000:.1f}ms/step) | "
+                      f"env {_t_env/t_steps*100:.0f}% ({_t_env/step_count*1000:.2f}ms) / "
+                      f"policy_forward {_t_act/t_steps*100:.0f}% ({_t_act/max(1,step_count)*1000:.2f}ms) / other {_oth/t_steps*100:.0f}%")
             self.env.finalize_window_history()
             cost, _, avg_waiting_time = self.env.calc_objective_values()
 
