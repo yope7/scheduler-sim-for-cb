@@ -1,0 +1,81 @@
+/* 研究日記 — docs-common.css を前提にした追加スタイル */
+
+/* インデックスのタイムライン */
+.diary-list { list-style: none; margin: 1.5rem 0 0; padding: 0; position: relative; }
+.diary-list::before {
+  content: ""; position: absolute; left: 0.55rem; top: 0.3rem; bottom: 0.3rem;
+  width: 2px; background: linear-gradient(var(--accent), var(--accent2)); opacity: 0.45;
+}
+.diary-item { position: relative; padding: 0 0 1.4rem 2rem; }
+.diary-item::before {
+  content: ""; position: absolute; left: 0.15rem; top: 0.35rem;
+  width: 0.85rem; height: 0.85rem; border-radius: 50%;
+  background: var(--accent2); border: 2px solid var(--bg); box-shadow: 0 0 0 2px var(--accent2);
+}
+.diary-item a.diary-link {
+  display: block; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 1rem 1.2rem; text-decoration: none; color: inherit;
+  transition: border-color .15s, transform .15s, box-shadow .15s;
+}
+.diary-item a.diary-link:hover {
+  border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.diary-item .d-date { font-family: var(--mono); font-size: .8rem; color: var(--accent); font-weight: 500; }
+.diary-item .d-title { font-size: 1.05rem; font-weight: 700; margin: .2rem 0 .3rem; color: var(--text); }
+.diary-item .d-sum { font-size: .88rem; color: var(--muted); margin: 0; }
+.diary-item .d-tags { margin-top: .5rem; display: flex; gap: .35rem; flex-wrap: wrap; }
+.d-tag {
+  font-size: .7rem; padding: .15rem .5rem; border-radius: 4px;
+  background: var(--surface2); color: var(--muted); border: 1px solid var(--border);
+}
+.d-tag.win { background: rgba(94,224,160,.14); color: var(--accent2); border-color: transparent; }
+.d-tag.warn { background: rgba(240,160,80,.14); color: var(--warn); border-color: transparent; }
+
+/* 個別エントリ */
+.entry-head { border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+.entry-head .e-date { font-family: var(--mono); color: var(--accent); font-size: .9rem; }
+.entry-head h1 { margin: .3rem 0 .2rem; font-size: clamp(1.4rem, 3.5vw, 1.9rem); letter-spacing: -.01em; }
+
+.banner {
+  background: linear-gradient(180deg, var(--bg-elevated), var(--surface));
+  border: 1px solid var(--border); border-left: 4px solid var(--accent2);
+  border-radius: 10px; padding: .9rem 1.1rem; margin: 1.2rem 0; font-size: .95rem;
+}
+
+.sec { margin: 1.8rem 0; }
+.sec > h2 {
+  font-size: 1.15rem; margin: 0 0 .6rem; padding-left: .65rem; border-left: 4px solid var(--accent);
+}
+.sec.did > h2 { border-left-color: var(--accent); }
+.sec.found > h2 { border-left-color: var(--accent2); }
+.sec.stuck > h2 { border-left-color: var(--warn); }
+.sec.next > h2 { border-left-color: var(--bad); }
+.sec p, .sec li { font-size: .94rem; }
+.sec ul { margin: .4rem 0; padding-left: 1.3rem; }
+.sec li { margin: .35rem 0; }
+
+.kbox {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: .85rem 1.1rem; margin: .9rem 0;
+}
+.kbox.win { border-left: 4px solid var(--accent2); }
+.kbox.warn { border-left: 4px solid var(--warn); }
+
+figure.diary-fig { margin: 1.2rem 0; }
+figure.diary-fig img {
+  width: 100%; border: 1px solid var(--border); border-radius: 10px; background: #fff;
+}
+figure.diary-fig figcaption { font-size: .82rem; color: var(--muted); margin-top: .5rem; }
+
+.entry-nav { display: flex; justify-content: space-between; gap: 1rem; margin-top: 2.5rem;
+  padding-top: 1.2rem; border-top: 1px solid var(--border); font-size: .88rem; }
+.entry-nav a { color: var(--accent); text-decoration: none; }
+.entry-nav a:hover { text-decoration: underline; }
+
+code { font-family: var(--mono); font-size: .86em; background: var(--surface2);
+  padding: .1rem .35rem; border-radius: 4px; }
+table.diary-tbl { width: 100%; border-collapse: collapse; margin: .9rem 0; font-size: .86rem; }
+table.diary-tbl th, table.diary-tbl td { border: 1px solid var(--border); padding: .4rem .6rem; text-align: center; }
+table.diary-tbl th { background: var(--surface2); color: var(--text); }
+table.diary-tbl td.win { color: var(--accent2); font-weight: 600; }
+table.diary-tbl td.bad { color: var(--bad); font-weight: 600; }

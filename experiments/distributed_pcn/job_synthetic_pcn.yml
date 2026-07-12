@@ -1,0 +1,50 @@
+# 合成ジョブ（job_type=1, JobSimulator デフォルト: 必要ノード1〜256, pt1〜100, 指数到着）。
+# urgency 観測の実験用。n_jobs は DISTRIBUTED_PCN_JOBS で 24 / 1024 を切り替える
+# （合成は env も agent も同じ n_jobs を使うのでクロバー不整合は起きない）。
+# ノード数(256/1024)は 24/1024 ジョブの双方で on-prem 混雑を生む（=緊急度が効く）。
+param_env:
+  n_window: 100
+  n_on_premise_node: 256
+  n_cloud_node: 1024
+  n_job_queue_obs: 5
+  n_job_queue_bck: 5
+  penalty_not_allocate: 0
+  penalty_invalid_action: 0.1
+  n_jobs: 1024          # DISTRIBUTED_PCN_JOBS で上書きされる
+param_agent:
+  weight_wt: 0
+  weight_cost: 1
+param_simulation:
+  nb_steps: 1
+  nb_episodes: 2000
+  nb_max_episode_steps: -1
+  multi_algorithm: true
+  folder_suffix: "result"
+param_algorithm_compare:
+  env_backend: c
+  seed: 0
+  nb_jobs: 1024
+  n_on_premise_node: 256
+  n_cloud_node: 1024
+  job_generation_episodes: 2000
+  distributed_pcn:
+    n_iterations: 100
+    n_actors: 16
+    initial_episodes: 100
+    quick: false
+    profile: false
+    left_tail: false
+    workload_adaptive: true
+    conditioning: true
+    mid_core: true
+    use_event_obs: true
+param_job:
+  max_t: 10
+  job_is_constant: true
+  job_type: 1           # ← 合成ジョブ
+  n_job_per_time: 4
+  max_processing_time: 3
+  max_n_required_nodes: 3
+  max_user_id: 8
+  nb_jobs_per_user: 1
+  user_increment: 1

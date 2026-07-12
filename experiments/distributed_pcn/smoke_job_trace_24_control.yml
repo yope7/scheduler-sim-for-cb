@@ -1,0 +1,45 @@
+param_agent:
+  weight_cost: 1
+  weight_wt: 0
+param_algorithm_compare:
+  distributed_pcn:
+    initial_episodes: 100
+    left_tail: false
+    n_actors: 32
+    n_iterations: 100
+    profile: false
+    quick: false
+    use_event_obs: true
+  env_backend: c
+  job_generation_episodes: 10
+  n_cloud_node: 1024
+  n_on_premise_node: 256
+  nb_jobs: 24
+  seed: 0
+param_env:
+  n_cloud_node: 1024
+  n_job_queue_bck: 5
+  n_job_queue_obs: 5
+  n_jobs: 24
+  n_on_premise_node: 256
+  n_window: 100
+  penalty_invalid_action: 0.1
+  penalty_not_allocate: 0
+param_job:
+  job_is_constant: true
+  job_trace_n_jobs: 24
+  job_trace_path: experiments/distributed_pcn/smoke_job_trace_24_smallest.csv
+  job_type: 2
+  max_n_required_nodes: 3
+  max_processing_time: 3
+  max_t: 10
+  max_user_id: 8
+  n_job_per_time: 4
+  nb_jobs_per_user: 1
+  user_increment: 1
+param_simulation:
+  folder_suffix: result
+  multi_algorithm: true
+  nb_episodes: 10
+  nb_max_episode_steps: -1
+  nb_steps: 1

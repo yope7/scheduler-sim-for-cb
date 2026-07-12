@@ -1,0 +1,1 @@
+AGENT_LOOP_WAKE_trace24_scratch {"prompt":"trace24 scratch 評価完走待ち: trace24_scratch_run.log と最新 pf_score.json を確認。Eval完了なら passed 判定・報告。passed ならループ停止。"}
