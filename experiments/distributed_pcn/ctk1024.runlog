@@ -1,0 +1,14 @@
+[ctk1024] START 11:35:54 NITER=60 (base×3 + ct03×3, serial)
+[ctk1024] seed=1 base 11:35:54
+[ctk1024] ctk1024_base_1 DONE exit=0 sec=1597 12:02:31
+[ctk1024] seed=1 ct03 12:02:31
+[ctk1024] ctk1024_ct03_1 DONE exit=0 sec=1836 12:33:07
+[ctk1024] seed=2 base 12:33:07
+[ctk1024] ctk1024_base_2 DONE exit=0 sec=1771 13:02:38
+[ctk1024] seed=2 ct03 13:02:38
+[ctk1024] ctk1024_ct03_2 DONE exit=0 sec=1801 13:32:39
+[ctk1024] seed=3 base 13:32:39
+[ctk1024] ctk1024_base_3 DONE exit=0 sec=1735 14:01:34
+[ctk1024] seed=3 ct03 14:01:34
+[ctk1024] ctk1024_ct03_3 DONE exit=0 sec=1400 14:24:54
+[ctk1024] ALL DONE 14:24:54

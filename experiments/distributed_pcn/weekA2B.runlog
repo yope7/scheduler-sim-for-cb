@@ -1,0 +1,17 @@
+[weekA2B] 学習5seed完了 23:06:00
+[weekA2B] seed1 較正: cost_cl=79890485 wait_op=76742.6 wait_cl=cl)=76742.6
+[weekA2B] seed1 適用完了
+[weekA2B] seed2 較正: cost_cl=79890485 wait_op=76742.6 wait_cl=cl)=76742.6
+[weekA2B] seed2 適用完了
+[weekA2B] seed3 較正: cost_cl=79890485 wait_op=76742.6 wait_cl=cl)=76742.6
+[weekA2B] seed3 適用完了
+[weekA2B] seed4 較正: cost_cl=79890485 wait_op=76742.6 wait_cl=cl)=76742.6
+[weekA2B] seed4 適用完了
+[weekA2B] seed5 較正: cost_cl=79890485 wait_op=76742.6 wait_cl=cl)=76742.6
+[weekA2B] seed5 適用完了
+seed1: FAIL [Errno 2] No such file or directory: '/tmp/weekA2B_carry_1.json'
+seed2: FAIL [Errno 2] No such file or directory: '/tmp/weekA2B_carry_2.json'
+seed3: FAIL [Errno 2] No such file or directory: '/tmp/weekA2B_carry_3.json'
+seed4: FAIL [Errno 2] No such file or directory: '/tmp/weekA2B_carry_4.json'
+seed5: FAIL [Errno 2] No such file or directory: '/tmp/weekA2B_carry_5.json'
+[weekA2B] ALL DONE 23:06:21

@@ -34,12 +34,36 @@ SEEDS = [int(x) for x in os.environ.get("SEEDS", "1,2").split(",")]
 NCMD = int(os.environ.get("NCMD", "40")); K = int(os.environ.get("KSAMP", "10"))
 NPROC = int(os.environ.get("NPROC", "1"))
 SAMP_SEED_BASE = int(os.environ.get("SAMP_SEED_BASE", "7000"))
+# CG_LIST: 指令 cost 列の明示指定(カンマ区切りfloat)。逆写像較正などで linspace の代わりに
+# 任意の指令列を使う用。指定時は NCMD を無視して cg=CG_LIST とする(wg は従来どおり rp から interp)。
+# 未指定(既定)は完全に従来どおり。
+CG_LIST = os.environ.get("CG_LIST", "")
+# WG_LIST: 指令 wait(平均待ち)列の明示指定(カンマ区切りfloat, CG_LIST と同型・同じ長さ必須)。
+# 指定時は rp 補間の wg を置き換える。未指定(既定)は完全に従来どおり。
+WG_LIST = os.environ.get("WG_LIST", "")
 # NPROC>1(fork並列)では親プロセスで CUDA を初期化しない(fork後にCUDAは使えない)。worker は CPU。
 if NPROC > 1:
     DEVICE = "cpu"
 else:
     DEVICE = os.environ.get("DEVICE", "cuda" if th.cuda.is_available() else "cpu")
 OUT = os.environ.get("OUT", "truepf_x.npz")
+# H1b(スケール転移実験)用: donor checkpoint の指令正規化(center/scale)と scaling_factor を
+# ロード後に上書きする(既定OFF=空。指定しない限り従来と完全一致)。
+OVERRIDE_DR_FROM = os.environ.get("OVERRIDE_DR_FROM", "")
+# DR_AUTO_RENORM(workload実レンジで指令再正規化): sequential は _apply 内、並列は
+# タスクに scale を同梱し worker の _ep で毎回 set する(2026-08-17 並列対応。既定OFF=従来ビット一致)。
+
+
+def _apply_dr_override(tg, ckpt_path):
+    import torch as _th
+    don = _th.load(ckpt_path, map_location="cpu", weights_only=False)
+    dsd = don.get("model_state_dict", don)
+    tg.set_desired_return_normalization(dsd["desired_return_center"].numpy(),
+                                        dsd["desired_return_scale"].numpy())
+    tg.scaling_factor.data.copy_(dsd["scaling_factor"])
+    print(f"[dr-override] from {ckpt_path}: scale={dsd['desired_return_scale'].tolist()} "
+          f"sf={dsd['scaling_factor'].tolist()}", flush=True)
+
 
 # --- worker 側のプロセス内グローバル（spawn 後に _winit で構築）---
 _W = {}
@@ -59,6 +83,8 @@ def _winit(cfg, ckpt_path, nj, seed, use_enh, device):
               use_enhanced_model=use_enh)
     tg = ag.network if ag.use_enhanced_model else ag.model
     tg.load_state_dict(st.get("model_state_dict", st), strict=False); tg.eval()
+    if OVERRIDE_DR_FROM:
+        _apply_dr_override(tg, OVERRIDE_DR_FROM)
     _W["env"] = env; _W["ag"] = ag; _W["mx"] = _np.full(2, _np.inf, dtype=_np.float32); _W["nj"] = nj
 
 
@@ -71,10 +97,15 @@ def _rp_one(p, seed):
     return [tc, tw / max(1, n)]
 
 
-def _ep(dr, eval_mode, seed=None):
+def _ep(dr, eval_mode, seed=None, dr_scale=None):
     if seed is not None:
         th.manual_seed(seed)
     env = _W["env"]; ag = _W["ag"]
+    if dr_scale is not None:
+        # [DR_AUTO_RENORM 並列対応] worker 内モデルへ workload 実レンジの指令正規化を設定(冪等)
+        _tg = ag.network if ag.use_enhanced_model else ag.model
+        _tg.set_desired_return_normalization(np.zeros(2, dtype=np.float32),
+                                             np.asarray(dr_scale, dtype=np.float32))
     r = ag._run_episode(env, np.asarray(dr, dtype=np.float32), np.float32(_W["nj"]), _W["mx"], eval_mode=eval_mode)
     return [float(r[5][0]), float(r[5][1])]
 
@@ -85,9 +116,11 @@ def _task(t):
     if kind == "rp":
         return ("rp", t[1], _rp_one(t[2], t[3]))
     if kind == "greedy":
-        return ("greedy", t[1], _ep(t[2], True))
+        _sc = t[3] if len(t) > 3 else None
+        return ("greedy", t[1], _ep(t[2], True, dr_scale=_sc))
     # samp: seed あり=再現可能(並列), None=共有RNG(逐次後方互換)
-    return ("samp", t[1], t[2], _ep(t[3], False, t[4]))
+    _sc = t[5] if len(t) > 5 else None
+    return ("samp", t[1], t[2], _ep(t[3], False, t[4], dr_scale=_sc))
 
 
 def _build_tasks(cg, wg, parallel):
@@ -117,16 +150,32 @@ def _run_seed_parallel(cfg, seed, use_enh):
     with ctx.Pool(nw, initializer=_winit, initargs=initargs) as pool:
         rp_res = pool.map(_task, rp_tasks, chunksize=2)
         rp = np.array([r[2] for r in sorted(rp_res, key=lambda x: x[1])])
-        cg = np.linspace(float(rp[:, 0].min()), float(rp[:, 0].max()), NCMD)
+        # CG_MAX: 指令 cost 上限の明示指定(既定=rp最大で従来どおり)。学習分布外の指令が
+        # Fourier 命令エンコードの外挿エイリアスで折り返すのを避け、真PF範囲等で公正に評価する用。
+        _cg_hi = float(os.environ.get("CG_MAX", "0")) or float(rp[:, 0].max())
+        cg = np.linspace(float(rp[:, 0].min()), min(_cg_hi, float(rp[:, 0].max())), NCMD)
+        if CG_LIST:
+            cg = np.array([float(x) for x in CG_LIST.split(",")], dtype=np.float64)
         wg = np.interp(cg, np.sort(rp[:, 0]), rp[np.argsort(rp[:, 0]), 1])
+        if WG_LIST:
+            wg = np.array([float(x) for x in WG_LIST.split(",")], dtype=np.float64)
+            assert len(wg) == len(cg), f"WG_LIST length {len(wg)} != cg length {len(cg)}"
+        # [DR_AUTO_RENORM 並列対応] scale は rp 掃引後に決まるが worker は fork 済みのため、
+        # タスクに scale を同梱し _ep 側で毎回 set する(冪等)。逐次(NPROC=1)経路と同じ式。
+        _dr_scale = None
+        if os.environ.get("DR_AUTO_RENORM", "0") == "1":
+            _cmax = max(abs(float(cg.min())), abs(float(cg.max())), 1.0)
+            _wmax = max(abs(float((wg * NJ).min())), abs(float((wg * NJ).max())), 1.0)
+            _dr_scale = [float(_wmax), float(_cmax)]
+            print(f"[DR_AUTO_RENORM] (parallel) scale→[wait*nj={_wmax:.3g}, cost={_cmax:.3g}]", flush=True)
         cmd_tasks = []
         for i, (cc, ww) in enumerate(zip(cg, wg)):
             dr = objectives_to_command(float(cc), float(ww), NJ).astype(np.float32).tolist()
-            cmd_tasks.append(("greedy", i, dr))
+            cmd_tasks.append(("greedy", i, dr, _dr_scale))
             for k in range(K):
-                cmd_tasks.append(("samp", i, k, dr, SAMP_SEED_BASE + i * K + k))
+                cmd_tasks.append(("samp", i, k, dr, SAMP_SEED_BASE + i * K + k, _dr_scale))
         res = pool.map(_task, cmd_tasks, chunksize=2)
-    greedy = [None] * NCMD
+    greedy = [None] * len(cg)
     samp = []
     for r in res:
         if r[0] == "greedy":
@@ -145,6 +194,8 @@ def _run_seed_sequential(seed, use_enh):
              use_enhanced_model=use_enh)
     tg = ag.network if ag.use_enhanced_model else ag.model
     tg.load_state_dict(state.get("model_state_dict", state), strict=False); tg.eval()
+    if OVERRIDE_DR_FROM:
+        _apply_dr_override(tg, OVERRIDE_DR_FROM)
     mx = np.full(2, np.inf, dtype=np.float32)
     rp = []
     for i, p in enumerate(np.linspace(0, 1, 40)):
@@ -154,8 +205,22 @@ def _run_seed_sequential(seed, use_enh):
             r = env.step(a); tw += -float(r[1][0]); tc += -float(r[1][1]); n += 1 if r[2] else 0; done = r[-1]; st += 1
         rp.append([tc, tw / max(1, n)])
     rp = np.array(rp)
-    cg = np.linspace(float(rp[:, 0].min()), float(rp[:, 0].max()), NCMD)
+    _cg_hi = float(os.environ.get("CG_MAX", "0")) or float(rp[:, 0].max())
+    cg = np.linspace(float(rp[:, 0].min()), min(_cg_hi, float(rp[:, 0].max())), NCMD)
+    if CG_LIST:
+        cg = np.array([float(x) for x in CG_LIST.split(",")], dtype=np.float64)
     wg = np.interp(cg, np.sort(rp[:, 0]), rp[np.argsort(rp[:, 0]), 1])
+    if WG_LIST:
+        wg = np.array([float(x) for x in WG_LIST.split(",")], dtype=np.float64)
+        assert len(wg) == len(cg), f"WG_LIST length {len(wg)} != cg length {len(cg)}"
+    # 推論適応: この workload の rp掃引レンジから指令正規化scaleを再設定(center=0固定)。
+    # 学習scaleが別scaleで焼き込まれてると指令が圧縮/OODになり崩壊→workload自身のレンジで正規化し直す。
+    if os.environ.get("DR_AUTO_RENORM", "0") == "1":
+        _cmax = max(abs(float(cg.min())), abs(float(cg.max())), 1.0)
+        _wmax = max(abs(float((wg * NJ).min())), abs(float((wg * NJ).max())), 1.0)
+        tg.set_desired_return_normalization(np.array([0.0, 0.0], dtype=np.float32),
+                                            np.array([_wmax, _cmax], dtype=np.float32))
+        print(f"[DR_AUTO_RENORM] scale→[wait*nj={_wmax:.3g}, cost={_cmax:.3g}] (workload実レンジ)", flush=True)
     greedy, samp = [], []
     for cc, ww in zip(cg, wg):
         dr = objectives_to_command(float(cc), float(ww), NJ).astype(np.float32)

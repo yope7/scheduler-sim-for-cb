@@ -1,0 +1,41 @@
+[AB] START 11:34:31
+[AB] === FAST (新既定 ALL ON) 128/100 ===
+[run_synth] NAME=fast JOBS=128 NITER=100 OUT=experiments/distributed_pcn/run_synth128_fast ALPHA=0.500 START=11:34:31
+DONE NAME=fast JOBS=128 EXEC=experiments/distributed_pcn/run_synth128_fast/20260626_113434 TRAIN_EXIT=0 END=11:44:51
+==== FAST (ALL ON) ====
+フェーズ1: 初期エピソードの収集
+フェーズ1開始時刻: 2026-06-26 11:34:37
+フェーズ1完了: 初期エピソード収集
+フェーズ2: 教師あり学習（初期エピソードを使用）
+フェーズ2開始時刻: 2026-06-26 11:35:05
+フェーズ2完了: 教師あり学習
+フェーズ3: 改良された経験の実現
+フェーズ3開始時刻: 2026-06-26 11:37:35
+フェーズ3完了: 改良された経験の実現
+総経過時間: 614.36秒 (10.24分)
+フェーズ1 (初期エピソード収集): 8.87秒 (1.4%)
+フェーズ2 (教師あり学習): 149.80秒 (24.4%)
+フェーズ3 (改良された経験の実現): 421.18秒 (68.6%)
+DONE NAME=fast JOBS=128 EXEC=experiments/distributed_pcn/run_synth128_fast/20260626_113434 TRAIN_EXIT=0 END=11:44:51
+
+[AB] === LEGACY (ALL OFF) 128/100 ===
+[run_synth] NAME=legacy JOBS=128 NITER=100 OUT=experiments/distributed_pcn/run_synth128_legacy ALPHA=0.500 START=11:44:51
+DONE NAME=legacy JOBS=128 EXEC=experiments/distributed_pcn/run_synth128_legacy/20260626_114454 TRAIN_EXIT=0 END=12:03:33
+==== LEGACY (ALL OFF) ====
+フェーズ1: 初期エピソードの収集
+フェーズ1開始時刻: 2026-06-26 11:44:57
+フェーズ1完了: 初期エピソード収集
+フェーズ2: 教師あり学習（初期エピソードを使用）
+フェーズ2開始時刻: 2026-06-26 11:45:37
+フェーズ2完了: 教師あり学習
+フェーズ3: 改良された経験の実現
+フェーズ3開始時刻: 2026-06-26 11:50:22
+フェーズ3完了: 改良された経験の実現
+総経過時間: 1116.58秒 (18.61分)
+フェーズ1 (初期エピソード収集): 18.85秒 (1.7%)
+フェーズ2 (教師あり学習): 284.69秒 (25.5%)
+フェーズ3 (改良された経験の実現): 777.38秒 (69.6%)
+DONE NAME=legacy JOBS=128 EXEC=experiments/distributed_pcn/run_synth128_legacy/20260626_114454 TRAIN_EXIT=0 END=12:03:33
+
+[AB] DONE 12:03:33
+[AB] summary -> experiments/distributed_pcn/ab_speed_128_100_summary.txt

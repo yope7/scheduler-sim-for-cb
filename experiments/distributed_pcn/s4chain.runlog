@@ -1,0 +1,20 @@
+[S4] 1) ミニNSGA-II (weekB_full) 起動 00:08:23
+[S4] 2) 窓4096 学習 base 3seed (2並列) 00:08:23
+[S4] 学習+NSGA-II 完了 11:35:01
+NSGA-II: NJ=50278 job_seed=0 pop=64 gen=30 mut=1.989e-05 cx=0.9 nproc=24 seed=0
+世代 10 - PF size: 64 evals: 666 elapsed: 12704.9s
+世代 20 - PF size: 64 evals: 1264 elapsed: 27786.8s
+[S4] 3) carry 適用 (フル週50,278) 11:35:01
+[S4] seed1 較正: cost_cl=2375474386 wait_op=17404.4 wait_cl=351.5
+  seed1 OK
+[S4] seed2 較正: cost_cl=2375474386 wait_op=17404.4 wait_cl=351.5
+  seed2 OK
+[S4] seed3 較正: cost_cl=2375474386 wait_op=17404.4 wait_cl=351.5
+  seed3 OK
+[S4] 4) 集計 13:11:59
+参照フロントHV(NSGA∪P掃引) 基準点=[2.25e+10,117485]
+seed1: HV比 100.7%  単調性ρ -0.71  週目標誤差   70%  窓数13
+seed2: HV比  91.3%  単調性ρ -0.04  週目標誤差   56%  窓数13
+seed3: HV比 101.0%  単調性ρ -0.46  週目標誤差   68%  窓数13
+S4まとめ(フル週50,278ジョブ): HV比 97.7±5.5%  ρ -0.40  誤差 64%
+[S4] ALL DONE 13:12:00

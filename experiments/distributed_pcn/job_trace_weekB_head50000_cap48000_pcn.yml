@@ -1,0 +1,56 @@
+# weekB先頭50000ジョブ・正容量版(ρ≈0.70)。
+# 2026-08-17 5万算定: Σ(pt*nodes)=1.9582e10 / 到着span=604,300秒(ほぼフル週)
+#   -> cap=22700(4096窓レシピの流用)だとρ=1.48(過負荷。旧見積もりの誤り原因はこれ)
+#   -> cap=48000/cloud=192000(オンプレ比4倍、4096窓と同じ比率)でρ=0.700(目標0.6〜0.8の中央)
+# job_trace_path は weekB_full と共通(先頭50000+1行だけ読み外れ値1件除外->50000件)。
+param_env:
+  n_window: 100
+  n_on_premise_node: 48000
+  n_cloud_node: 192000
+  n_job_queue_obs: 5
+  n_job_queue_bck: 5
+  penalty_not_allocate: 0
+  penalty_invalid_action: 0.1
+  n_jobs: 50000
+param_agent:
+  weight_wt: 0
+  weight_cost: 1
+param_simulation:
+  nb_steps: 1
+  nb_episodes: 2000
+  nb_max_episode_steps: -1
+  multi_algorithm: true
+  folder_suffix: "result"
+param_algorithm_compare:
+  env_backend: c
+  seed: 0
+  # ★ nb_jobs は必ず n_jobs と一致させる(1024 のまま残すと eval_n_jobs() が 1024 を返し
+  #    学習と評価でジョブ数が食い違う既知バグ = pcn-1024-njobs-clobber-bug と同型)
+  nb_jobs: 50000
+  n_on_premise_node: 48000
+  n_cloud_node: 192000
+  job_generation_episodes: 2000
+  distributed_pcn:
+    n_iterations: 100
+    n_actors: 16
+    initial_episodes: 100
+    quick: false
+    profile: false
+    left_tail: false
+    workload_adaptive: true
+    conditioning: true
+    mid_core: true
+    use_event_obs: true
+param_job:
+  max_t: 10
+  job_is_constant: true
+  job_type: 2
+  job_trace_path: job_trace/FY2024/scacctreq_202412_weekB_full_jobs.csv
+  job_trace_n_jobs: 50000
+  job_trace_exclude_largest_outlier: true
+  n_job_per_time: 4
+  max_processing_time: 3
+  max_n_required_nodes: 3
+  max_user_id: 8
+  nb_jobs_per_user: 1
+  user_increment: 1

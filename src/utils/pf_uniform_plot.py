@@ -140,6 +140,23 @@ def write_uniform_pf_plot(
         latest = out / "uniform_cmd_pf_latest.png"
         shutil.copy2(path, latest)
 
+    # 計装: 到達点の「座標」を npz でも残す（PNG は n_pf しか残さないため、後から
+    # 「途中で出せて最後に消えた点」を数値化できない）。図バイトは不変、追加ファイルのみ。
+    # DISTRIBUTED_PCN_LIVE_UNIFORM_PF_NPZ=0 で無効化。
+    if os.environ.get("DISTRIBUTED_PCN_LIVE_UNIFORM_PF_NPZ", "1") != "0":
+        if iteration is not None:
+            npz_path = out / f"uniform_cmd_pts_iter_{int(iteration):03d}.npz"
+        else:
+            npz_path = out / f"uniform_cmd_pts_{label}.npz"
+        np.savez_compressed(
+            npz_path,
+            achieved=pts,
+            eval_pf=pf,
+            archive_pf=np.asarray(archive_pf, dtype=np.float64),
+            exploration=np.asarray(exploration_pts, dtype=np.float64),
+            iteration=np.int64(-1 if iteration is None else int(iteration)),
+        )
+
     stats: Dict[str, Any] = {
         "label": label,
         "iteration": iteration,

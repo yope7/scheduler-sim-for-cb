@@ -1,6 +1,7 @@
 """Pareto Conditioned Network. Code adapted from https://github.com/mathieu-reymond/pareto-conditioned-networks ."""
 import heapq
 import os
+import re
 from abc import ABC
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Type, Union
@@ -34,6 +35,21 @@ _DESIRED_RETURN_CLIP = float(os.environ.get("PCN_DESIRED_RETURN_CLIP", "1e12"))
 # desired_return 入力スケーリング（数値安定化）
 _DESIRED_RETURN_SCALE = float(os.environ.get("PCN_DESIRED_RETURN_SCALE", "10000"))
 
+# --- PCN_LABEL_G: 教師ラベル二重累積バグの修正フラグ（既定 OFF=現行ビット不変） ---
+# _add_episode() は格納時に reward を in-place で累積化する（episode[t].reward = G_t =
+# Σ_{j>=t} γ^{j-t} r_j）。ところが教師ラベル作成の2経路（get_training_batch 非キャッシュ /
+# _encode_episode_training_block キャッシュ）は格納値を「生報酬」と誤認して再度割引累積し、
+# ラベル = D_t = Σ_{j>=t} γ^{j-t} G_j という別物になっていた（元論文実装は格納済み G_t を
+# そのまま使う）。実行時（evaluate/rollout の desired_return 更新）は G 規約なので、
+# 学習と実行で指令の意味が ~9-100 倍ズレる。PCN_LABEL_G=1 で再累積をやめ、格納値 G_t を
+# そのままラベルに使う。
+# NOTE: このフラグはモジュール import 時に固定されるプロセス定数。_pcn_training_block の
+# エピソード単位メモ化はフラグ値をブロックに記録し、値が一致するときだけヒットさせる
+# （同一プロセス内でフラグが変わることはないが、混入防止の防壁として）。
+_LABEL_G = os.environ.get("PCN_LABEL_G", "0") == "1"
+if _LABEL_G:
+    print("[PCN_LABEL_G] 有効: 教師ラベル=格納済みG_t（二重累積の再計算を廃止）", flush=True)
+
 # --- C2: 条件付け wait 次元の外れ値ロバスト圧縮（崩壊=loss爆発 対策） ---
 # PCN の損失は行動交差エントロピーで、巨大 wait は「条件付け入力 desired_return」経由でのみ
 # 学習に効く。trace の巨大ジョブが作る極端な wait リターンが条件付け入力のダイナミックレンジを
@@ -41,8 +57,14 @@ _DESIRED_RETURN_SCALE = float(os.environ.get("PCN_DESIRED_RETURN_SCALE", "10000"
 # forward / predict_archive_value の両方（=train と eval が同じ変換を通る）に適用するので
 # 自己整合（コマンド空間のミスキャリブレ無し）。reward/achieved-PF/rp baseline は生のまま不変。
 # 既定 off で完全な no-op（ビット一致）。wait 次元 index=0（reward=[-waiting_time,-cost]）。
-_COND_WAIT_ROBUST = os.environ.get("PCN_COND_WAIT_ROBUST", "off")  # off | softlog
+_COND_WAIT_ROBUST = os.environ.get("PCN_COND_WAIT_ROBUST", "off")  # off | softlog | logexpand
 _COND_WAIT_K = float(os.environ.get("PCN_COND_WAIT_K", "10.0"))     # |x|<<K は線形, |x|>>K で圧縮
+# [logexpand] 正規化後z空間で低wait帯を対数で「広げる」(softlogの逆向きの用途)。
+# 背景: 5万jobsでwait正規化scaleが全オンプレ外れ値基準になり、勝負どころの0-30秒が
+# z<0.013 に潰れて網に読めない(v9 wait不感・armA2の<30s全クラウド縮退の一因)。
+# y = sign(z)·log1p(|z|/z0)/log1p(1/z0): 単調・符号保存・z=1で1。z0=1e-3で30秒(z=0.013)→0.38。
+# lockstep_nn は同一モデルクラスを共有するため、評価側も同じ env を立てれば自動で一致。
+_COND_WAIT_Z0 = float(os.environ.get("PCN_COND_WAIT_Z0", "1e-3"))
 
 # --- 崩壊(複利ドリフト)対策: CE飽和ロックインの構造的封印 ---
 # 崩壊runの CE 爆発 0.7→69 は log p(archive行動)≈-69 ＝ softmax 飽和(p≈1e-30)。一度飽和すると
@@ -74,17 +96,61 @@ def _robust_cond_wait(desired_return):
     y = sign(x)*K*log1p(|x|/K): |x|<<K で≈x（順序・小値を保存）, |x|>>K で K*log に圧縮。"""
     if _COND_WAIT_ROBUST in ("off", "", "0") or desired_return.shape[-1] < 1:
         return desired_return
-    K = _COND_WAIT_K
     dr = desired_return.clone()
     w = dr[..., 0]
-    dr[..., 0] = th.sign(w) * K * th.log1p(th.abs(w) / K)
+    if _COND_WAIT_ROBUST == "logexpand":
+        z0 = _COND_WAIT_Z0
+        denom = float(np.log1p(1.0 / z0))
+        dr[..., 0] = th.sign(w) * th.log1p(th.abs(w) / z0) / denom
+    else:
+        K = _COND_WAIT_K
+        dr[..., 0] = th.sign(w) * K * th.log1p(th.abs(w) / K)
     return dr
 # choose_commands の改善量スケール（1.0=原著実装相当、既定は大規模報酬向けに控えめ）
 _COMMAND_ALPHA = float(os.environ.get("PCN_COMMAND_ALPHA", "0.2"))
+# [PCN_CMD_LOCAL_STEP] 注文の改善幅を「前線の隣接点間隔」基準の局所ステップにする(オプトイン)。
+# 論文式 U(0, 0.2σ)(σ=非支配前線全体の標準偏差=前線の幅)は、点が多く間隔が不均等な前線では
+# 一歩が密な区間で数百点ぶん飛ぶ(実測: 間隔中央値の159-461倍)。ON時の作り方:
+#   土台=前線から一様に1点 → 改善方向の隣接点 p_{i±1} へ α~U(0.5,1.5) で両軸内挿/外挿。
+#   端点は確率 PCN_CMD_LOCAL_EDGE_FRAC(既定0.2) で内側隣接間隔と同じ幅だけ外側へ(前線を伸ばす役割)。
+#   クランプ=達成済みレンジ±端の隣接間隔。レジーム標識(episode_regime_scale)があればレジーム別前線。
+# 既定OFF=従来とビット一致。
+_CMD_LOCAL_STEP = os.environ.get("PCN_CMD_LOCAL_STEP", "0") == "1"
+_CMD_LOCAL_EDGE_FRAC = float(os.environ.get("PCN_CMD_LOCAL_EDGE_FRAC", "0.2"))
+# [PCN_CMD_REACH_CLAMP] 局所ステップの端外挿を「到達済み端 × 係数」で頭打ちにする(既定OFF=0)。
+# 背景: 既存クランプ上限は c_max + d_hi(端の隣接間隔)。実行可能集合が巨大ジョブで島状に分断
+# されている([[attainable-set-islands]])と端の隣接間隔そのものが巨大になり、上限が達成済み端の
+# 2倍近くまで開く。実測(weekA4096)では注文が真PF上限の1.7-1.9倍まで飛び、そこは実現不能なので
+# 達成が頭打ち→注文と達成のズレ(L2)だけが増える。値 f>1 を指定すると cost 上端を c_max*f、
+# wait 上端を w_max*f、wait 下端を w_min/f に制限する(到達幅は残しつつ外挿だけ抑える)。
+# 0 または未設定なら従来と完全にビット一致。
+_CMD_REACH_CLAMP = float(os.environ.get("PCN_CMD_REACH_CLAMP", "0") or 0.0)
 # Anchored command pool: archive PF が崩壊しても command 分布が cost 全域を張るよう、
 # workload calibration の (全OP, 全CL) 端点間を線形補間した固定 anchor を毎回 pool に混ぜる。
 # 0 で無効（既定）。崩壊フィードバックループ（archive収縮→command収縮→探索収縮）を断ち切る。
 _PF_COMMAND_ANCHORS = int(os.environ.get("PCN_PF_COMMAND_ANCHORS", "0"))
+# MPFT型 端→内側掃引の command 生成 (survey_stream_pf.html: MPFT 2025 の PCN 翻訳)。
+# 「まず端の方策を杭として固定し、端から内側へ PF をなぞる」。paper モードの
+# 中間ナッジ(生成の96%が中間へ集中=端消失の機序)を端起点に反転する。0 で無効（既定・ビット一致）。
+_MPFT_SWEEP = os.environ.get("PCN_MPFT_SWEEP", "0") == "1"
+_MPFT_START_FRAC = float(os.environ.get("PCN_MPFT_START_FRAC", "0.15"))   # 掃引の初期到達率(各端から)
+_MPFT_FULL_ITER = float(os.environ.get("PCN_MPFT_FULL_ITER", "40"))       # この iteration で全域到達(r=0.5)
+_MPFT_ENDPOINT_QUOTA = float(os.environ.get("PCN_MPFT_ENDPOINT_QUOTA", "0.25"))  # 両端の杭に固定する命令割合
+_MPFT_IMPROVE = float(os.environ.get("PCN_MPFT_IMPROVE", "0.02"))         # 掃引命令の Pareto 方向ナッジ(wait↓)
+# 達成ゲート型 MPFT（単調に良くなる構造）。reach を時計(it/FULL_ITER)でなく「今の前線帯を
+# 一発再現できたら1段広げる」達成ベースで進める。マスターするまで離れない=獲得点を忘れない=単調。
+_MPFT_GATED = os.environ.get("PCN_MPFT_GATED", "0") == "1"
+_MPFT_GATE_EPS = float(os.environ.get("PCN_MPFT_GATE_EPS", "0.15"))   # 前線帯の正規化再現gapがこれ未満=マスター
+_MPFT_GATE_STEP = float(os.environ.get("PCN_MPFT_GATE_STEP", "0.05")) # マスター毎に reach を広げる幅
+_MPFT_GATE_PATIENCE = int(os.environ.get("PCN_MPFT_GATE_PATIENCE", "1"))  # 連続何回マスターで前進
+# 改善が起きている時に学習量(n_updates)を増やす適応制御。「改善する行動を促して改善が
+# 起こった時、もっと多く学習を回す」= productive な局面に計算を厚く張る。ゲートが改善を
+# 検知して倍率を上げ(learn() が読む)、伸び悩んだら1.0へ減衰。既定OFF=倍率1.0でビット一致。
+_MPFT_VOL_ADAPT = os.environ.get("PCN_MPFT_VOL_ADAPT", "0") == "1"
+_MPFT_VOL_RAMP = float(os.environ.get("PCN_MPFT_VOL_RAMP", "1.5"))    # 改善時に倍率を掛ける係数
+_MPFT_VOL_MAX = float(os.environ.get("PCN_MPFT_VOL_MAX", "4.0"))      # 倍率上限
+_MPFT_VOL_DECAY = float(os.environ.get("PCN_MPFT_VOL_DECAY", "0.7"))  # 非改善時に倍率を戻す係数
+_MPFT_VOL_IMPROVE_EPS = float(os.environ.get("PCN_MPFT_VOL_IMPROVE_EPS", "0.02"))  # gap低下がこれ以上で改善判定
 # 観測の符号付き log 圧縮。1024ジョブ等で時刻特徴が ~1e6 桁になり s_emb(Sigmoid)を
 # 飽和させ conditioning を埋もれさせる対策。0 で無効（既定、24J 等の小規模は不要）。
 _OBS_LOG_COMPRESS = os.environ.get("PCN_OBS_LOG", "0") == "1"
@@ -148,8 +214,6 @@ _LOW_BAND_COND_MODE = os.environ.get("PCN_LOW_BAND_COND_MODE", "arc").strip().lo
 _LOW_BAND_COND_MIN_R1_SEP_FRAC = float(os.environ.get("PCN_LOW_BAND_COND_MIN_R1_SEP_FRAC", "0.002"))
 # dual モード: r1_sweep と arc の損失配分（既定 0.5 / 0.5）
 _LOW_BAND_DUAL_R1_FRAC = float(os.environ.get("PCN_LOW_BAND_DUAL_R1_FRAC", "0.5"))
-# Eval 均等格子 PF の弱点帯域 → 次回 cache の step replay 重みを増幅
-_EVAL_GAP_FEEDBACK = os.environ.get("PCN_EVAL_GAP_FEEDBACK", "0") == "1"
 # 巨大ジョブ決定ステップ重み(本来の筋・裾濃度への直接処方): 各ステップの cost 報酬の大きさ
 # (=desired_returnsのr1階差)で「巨大ジョブをどこに置くか」の高レバレッジ決定を特定し学習を集中させる。
 # 裾の重いワークロード(256)では少数の巨大ジョブの二択がPFを支配するのに、何百の小ジョブに埋もれて
@@ -160,6 +224,12 @@ _TRAIN_GIANT_FRAC = float(os.environ.get("PCN_TRAIN_GIANT_FRAC", "0.06"))  # 上
 _TRAIN_MID_STEP_WEIGHT = float(os.environ.get("PCN_TRAIN_MID_STEP_WEIGHT", "0"))
 _TRAIN_EVALIKE_STEP_WEIGHT = float(os.environ.get("PCN_TRAIN_EVALIKE_STEP_WEIGHT", "0"))
 _TRAIN_EVALIKE_STEP_FRAC = float(os.environ.get("PCN_TRAIN_EVALIKE_STEP_FRAC", "0.12"))
+# [PCN_TRAIN_HEAD_STEP_WEIGHT] 学習は各エピソードのステップを一様に引くため、条件(残りリターン)は
+# 「途中の小さい値」に偏る(18J実測: 52%が先頭値の半分以下)。一方、注文・評価は必ず先頭条件 G_0 を使う。
+# 先頭条件が学習で見られる割合は 1/T(18Jで5.6%, 4096Jでは0.02%)しかなく、これが「注文どおりに出せない」
+# 分布ずれの主因候補。ON時は各エピソード先頭 FRAC 区間のステップ重みを ×WEIGHT する。既定1.0=OFFで不変。
+_TRAIN_HEAD_STEP_WEIGHT = float(os.environ.get("PCN_TRAIN_HEAD_STEP_WEIGHT", "1.0"))
+_TRAIN_HEAD_STEP_FRAC = float(os.environ.get("PCN_TRAIN_HEAD_STEP_FRAC", "0.1"))
 # Archive 中域 PF 上で r1 固定・r0(wait) を振ったとき方策が分岐するよう促す（評価グリッドの弱点）
 _MID_BAND_COND_WEIGHT = float(os.environ.get("PCN_MID_BAND_COND_WEIGHT", "0"))
 _MID_BAND_COND_WAIT_LEVELS = int(os.environ.get("PCN_MID_BAND_COND_WAIT_LEVELS", "5"))
@@ -173,11 +243,24 @@ _MID_BAND_COND_FOCUS_HALF_WIDTH_FRAC = float(
 )
 # 正規化後の command 各次元が c_emb へ同等に効くようバランス（cost 一方通行を緩和）
 _COMMAND_BALANCE = os.environ.get("PCN_COMMAND_BALANCE", "0") == "1"
+# 命令balance の強度: 適用値 = command_balance ** power。0=無効([1,1])、1=full、0.5=中間。
+# full balance は速い端を出すが左/中央を過補正で犠牲にするため、部分balanceで両立を狙う。
+_COMMAND_BALANCE_POWER = float(os.environ.get("PCN_COMMAND_BALANCE_POWER", "1.0"))
+# balance power を front の左右非対称に適応して自己調整(既定OFF)。手動 power を消す。
+# 到達PFの「左半分(安)の点割合」が target を超えたら power↑(速い命令を強め右へ引く)、下回れば power↓。
+_COMMAND_BALANCE_ADAPT = os.environ.get("PCN_COMMAND_BALANCE_ADAPT", "0") == "1"
+_COMMAND_BALANCE_STEP = float(os.environ.get("PCN_COMMAND_BALANCE_STEP", "0.08"))      # 1回の power 調整幅
+_COMMAND_BALANCE_PMAX = float(os.environ.get("PCN_COMMAND_BALANCE_PMAX", "1.0"))       # power 上限
 # frozen-PF cloning: best-ever 非支配エピソードを凍結保持し、phase-3 教師に常時含める。
 # 自己強化崩壊（劣化した自身の rollout を模倣→loss上昇→command無視）を断ち、
 # 「劣化しない良いフロント」を behavior-clone してEvalで再現させる。
 _FROZEN_PF_CLONE = os.environ.get("PCN_FROZEN_PF_CLONE", "0") == "1"
 _FROZEN_PF_MAX = int(os.environ.get("PCN_FROZEN_PF_MAX", "256"))
+# [PCN_TEACH_FRONT_ONLY] 教師データを凍結アーカイブ(非支配フロント)だけに絞る統制実験用フラグ。
+# PCN_FROZEN_PF_CLONE=1 が前提。既定(0)は従来どおり replay 全件 + frozen の和集合(ビット不変)。
+# 1 のときは replay 全件を捨て、_frozen_pf_entries（非支配点のみ・PCN_FROZEN_PF_MAX で間引き量を
+# 制御）だけを教師にする＝「データの組成」（希釈データ由来のダウンか）を単離するための片翼。
+_TEACH_FRONT_ONLY = os.environ.get("PCN_TEACH_FRONT_ONLY", "0") == "1"
 # モデル重みEMA(Polyak averaging): 続学習が効率方策を壊すのを eval/save 重みで平滑化する。
 # rollout(探索) は online 重みのまま、eval と save のときだけ EMA 重みへ swap する。0=OFF。
 _EMA_DECAY = float(os.environ.get("PCN_EMA_DECAY", "0"))  # 0.99(時定数~100step)/0.999(~1000step)推奨
@@ -189,6 +272,31 @@ _RETURN_NORM_MIN_SCALE = float(os.environ.get("PCN_RETURN_NORM_MIN_SCALE", "1e-6
 _TRAINING_CACHE_INCREMENTAL = os.environ.get("PCN_TRAINING_CACHE_INCREMENTAL", "1") == "1"
 # Phase1 action-sweep エピソードの学習重み（1.0=無効、0.2=5倍薄める）
 _PHASE1_SWEEP_TRAIN_WEIGHT = float(os.environ.get("PCN_PHASE1_SWEEP_TRAIN_WEIGHT", "1.0"))
+# NSGA種まきエピソードの学習サンプリング優先倍率(頻度戦争対策)。既定1=完全従来。
+_SEED_EPISODE_WEIGHT = float(os.environ.get("PCN_SEED_EPISODE_WEIGHT", "1"))
+# [PCN_DEDUP_TRAIN_WEIGHT] 同じ達成点(cost, 平均待ち)を持つエピソードが重複していると、
+# 一様抽選では「その1点」に学習機会が集中する(18Jで最頻点=全オンプレ1通りが2128本中709本=33%を占有し、
+# 前線1点あたりの機会1.1%に対し30倍の偏り)。ON時は同一達成点グループの重みを 1/本数 にして
+# 「点ごとに均等」にする(データは捨てない)。既定OFF=従来どおりビット不変。
+_DEDUP_TRAIN_WEIGHT = os.environ.get("PCN_DEDUP_TRAIN_WEIGHT", "0") == "1"
+_DEDUP_TRAIN_DECIMALS = int(os.environ.get("PCN_DEDUP_TRAIN_DECIMALS", "2"))
+# [PCN_ADV_WEIGHT] 帯内相対成績による重み(良し悪しの勾配)。
+# 目的: 一様模倣は「多数派の平均的な振る舞い」に丸まり、前線に載る鋭い選択が薄まる
+# (18J実測: 前線に載る試行が54%→12%へ低下)。同じコスト帯の仲間と比べて待ちが短い経験ほど
+# 強く写すことで、外から「良い基準」を注入せずデータ内の相対比較だけで鋭さを保つ。
+#   帯: コスト軸を BANDS 分位で分割(帯ごとに比較=前線が1点に潰れるのを防ぐ)
+#   重み: exp( (帯中央値 - 自分の待ち) / (帯の待ちのばらつき) / TEMP ) を [1/CLIP, CLIP] にクリップ
+# 既定0=OFFでビット不変。
+_ADV_WEIGHT = float(os.environ.get("PCN_ADV_WEIGHT", "0"))
+_ADV_BANDS = int(os.environ.get("PCN_ADV_BANDS", "8"))
+_ADV_CLIP = float(os.environ.get("PCN_ADV_CLIP", "8"))
+# [PCN_REPLAY_REGIME_FAIR] replay淘汰のレジーム公平化(オプトイン)。PCN_MIX_REGIMES学習で
+# PF-crowding淘汰がレジーム盲目に働くと、(cost,wait)座標で見かけ優秀な最空きレジームが
+# バッファを占拠し、評価レジームのNSGA種リプレイ(真PF水準の見本)が全滅する(4環診断)。
+# 1= ①淘汰をレジーム別クォータ制(最超過レジームから追い出し) ②_nlargestのヒープ優先度を
+# レジーム内ND/crowdingで計算 ③種エピソード(_pcn_seed_episode)は同レジームに非種が残る限り保護。
+# 既定0=完全従来(ビット不変)。コマンド生成用の選抜(_nlargest返り値)は両モードで不変。
+_REPLAY_REGIME_FAIR = os.environ.get("PCN_REPLAY_REGIME_FAIR", "0") == "1"
 # 学習時のみ s_emb へ dropout（条件 c を使わざるを得なくする）
 _S_EMB_DROPOUT = float(os.environ.get("PCN_S_EMB_DROPOUT", "0"))
 # 同じ obs で desired_return を変えたときの方策差を KL で促す（0=無効）
@@ -212,6 +320,13 @@ _FILM = os.environ.get("PCN_FILM", "0") == "1"
 # 周波数は 2^[0..L-1]（既定 L=4 → [1,2,4,8]）。z-score間隔~0.15 を分離できる控えめな範囲。
 _FOURIER_CMD = os.environ.get("PCN_FOURIER_CMD", "0") == "1"
 _FOURIER_BANDS = int(os.environ.get("PCN_FOURIER_BANDS", "4"))
+# [per-channel bands] cost指令チャネル(指令ベクトル第2成分=index1; c=[wait*nj, cost, horizon])の
+# バンド数を個別指定。診断: 共通バンドの最高周波数成分が cost 写像に「さざ波」を作り、密掃引の
+# 凹み位置(正規化0.205/0.41)が最高周波の半周期/全周期と一致(wait側は健全)。cost側だけ高周波を
+# 落として写像を平滑化する。未設定(空)なら従来=PCN_FOURIER_BANDS と同一でビット不変。
+_FOURIER_BANDS_COST_RAW = os.environ.get("PCN_FOURIER_BANDS_COST", "")
+_FOURIER_BANDS_COST = int(_FOURIER_BANDS_COST_RAW) if _FOURIER_BANDS_COST_RAW != "" else None
+_FOURIER_COST_CH = 1  # cost チャネル index（objectives_to_command: dr=[-wait*nj, -cost]）
 # Fourier 周波数モード（生 c は常に連結＝NNが必要な周波数を学習で選ぶ）:
 #   geometric(既定): 2^[0..L-1]=[1,2,4,8] NeRF式。高周波が急増→小規模で過剰=崩壊しやすい。
 #   linear         : (k+1)*base=[1,2,3,4]*base。2π,4π,6π… の古典フーリエ倍音。高周波が急増せず小規模で滑らか。
@@ -230,6 +345,16 @@ _VALUE_COST_SCALE = float(os.environ.get("PCN_VALUE_COST_SCALE", "100000.0"))
 _CMD_TRACK_WEIGHT = float(os.environ.get("PCN_CMD_TRACK_WEIGHT", "0"))
 _CMD_TRACK_ANCHOR_WEIGHT = float(os.environ.get("PCN_CMD_TRACK_ANCHOR_WEIGHT", "1.0"))
 _CMD_TRACK_MAX_EPISODES = int(os.environ.get("PCN_CMD_TRACK_MAX_EPISODES", "48"))
+# [v10: 両側の距離罰] wait側の片側罰 relu(v̂_wait − 指令wait)²。cost側(v9で追従形成の実績)の対称版。
+# 実効重みが PCN_CMD_TRACK_WAIT_WEIGHT になるよう、関数内では (WAIT_W/COST_W) 倍で track に合算する
+# (外側で COST_W が掛かるため)。既定0=ビット一致。PCN_CMD_TRACK_WEIGHT>0 が前提(0だと関数ごと不発)。
+_CMD_TRACK_WAIT_WEIGHT = float(os.environ.get("PCN_CMD_TRACK_WAIT_WEIGHT", "0"))
+# [critic対応: サーキットブレーカ] cmd_track損失がこの閾値を超えたら「その更新では加算しない」
+# (armA3でcold+凍結教材時に総損失~100へ暴走した前科。夜間無人運転の安全弁)。0で無効。
+_CMD_TRACK_BREAKER = float(os.environ.get("PCN_CMD_TRACK_BREAKER", "10"))
+# waitヒンジの対数空間z0。入力側(_COND_WAIT_Z0)とは空間が違う(こちらはbalance前のavg-wait正規化、
+# v_wait_n=avg/2286s級)ので独立の定数。1e-3で10秒→0.24, 30秒→0.38(狙い帯に勾配が立つ)。
+_CMD_TRACK_WAIT_Z0 = float(os.environ.get("PCN_CMD_TRACK_WAIT_Z0", "1e-3"))
 # [anti-ration] cost成分の desired_return を decrement せず初期目標で一定保持。既定0=従来(ビット一致)。
 # trace の高cost端飽和の真因 = return-to-go rationing(残予算が減ると終盤の巨大ジョブをcloudに出せず飽和,
 # corr(残予算,P_cloud)=+0.78)。cost目標を一定に保つと巨大cloudを継続でき expensive端へ届く(eval検証 ×2.46)。
@@ -238,6 +363,10 @@ _COST_HOLD = os.environ.get("PCN_COST_HOLD", "0") == "1"
 # weight decay (L2正則化)。既定0=従来(正則化なし=学習で重み膨張→logit飽和→条件付け死)。
 # 学習を続けても条件付けを維持するための根本手当て候補。Adam の weight_decay に渡す。
 _WEIGHT_DECAY = float(os.environ.get("PCN_WEIGHT_DECAY", "0"))
+# 重みノルム天井(max-norm制約)。壁1(重み膨張2.5-4×→logit飽和→命令無視→一点collapse)を、L2の
+# 一律縮小(反証済)でなく「Phase3で各重み行列のノルムが基準比 FACTOR 倍を超えたら物理的に縮める」で
+# 直接止める。基準=Phase3最初の更新時ノルム。既定0=無効(ビット一致)。例1.5=1.5倍で頭打ち。
+_WEIGHT_MAXNORM_FACTOR = float(os.environ.get("PCN_WEIGHT_MAXNORM_FACTOR", "0"))
 # 非有限な勾配のときに optimizer.step() をスキップする（既定 ON）。
 # 損失が有限でも勾配が NaN/Inf になり得る（巨大 logit の log_softmax 等）。clip_grad_norm_ は
 # total_norm=NaN を coef=NaN にしてしまい全重みを NaN 化→nan_to_num=0→constant出力→command無視で
@@ -365,7 +494,6 @@ def setup_linux_fonts():
 
 from numba import njit
 
-from morl_baselines.common.evaluation import log_all_multi_policy_metrics
 from morl_baselines.common.morl_algorithm import MOAgent, MOPolicy
 from morl_baselines.common.performance_indicators import hypervolume
 from src.utils.map_visualizer import visualize_map
@@ -469,6 +597,43 @@ def crowding_distance(points):
     return _crowding_distance_numba(pts)
 
 
+# [PCN_REPLAY_REGIME_FAIR] uid 中のレジーム標識 ":r{scale}" (gpu_factory._mix_groups 由来)
+_REGIME_UID_RE = re.compile(r":r([0-9]+(?:\.[0-9]+)?)(?::|$)")
+
+
+def episode_regime_scale(transitions) -> float:
+    """エピソードの到着スケール(レジーム標識)を返す。標識が取れないものは 1.0(基準)扱い。
+
+    経路別の標識:
+      - GPU工場(FactoryArrayEpisode): episodeオブジェクトの uid 末尾 ":r{scale}"
+      - CPU actor(通常/種/heuristic全て): transitions[0]._pcn_arrival_scale (_run_episode で付与)
+      - どちらも無い(単一レジーム学習・旧run由来など): 1.0
+    """
+    uid = getattr(transitions, "uid", None)  # FactoryArrayEpisode の配列エピソード
+    if uid is None and len(transitions) > 0:
+        first = transitions[0]
+        scale = getattr(first, "_pcn_arrival_scale", None)
+        if scale is not None:
+            try:
+                return float(scale)
+            except (TypeError, ValueError):
+                return 1.0
+        uid = getattr(first, "_pcn_episode_uid", None)
+    if isinstance(uid, str):
+        m = _REGIME_UID_RE.search(uid)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return 1.0
+    return 1.0
+
+
+def episode_is_seed(transitions) -> bool:
+    """NSGA種まき由来エピソードか（淘汰保護・種生存カウント用）。"""
+    return bool(len(transitions) > 0 and getattr(transitions[0], "_pcn_seed_episode", False))
+
+
 @dataclass
 class Transition:
     """Transition dataclass."""
@@ -478,6 +643,22 @@ class Transition:
     reward: np.ndarray
     next_observation: np.ndarray
     terminal: bool
+
+def _make_fourier_freqs(n_bands: int) -> th.Tensor:
+    """Fourier 周波数列（_FOURIER_MODE 準拠）を n_bands 本生成。
+
+    従来 __init__ 内の生成と同一演算（geometric/linear は式なので任意 n で prefix 整合。
+    gaussian は seed 固定 randn なので同 seed から先頭 n 本＝長い列の prefix と一致）。"""
+    if _FOURIER_MODE == "linear":
+        # 線形倍音 (k+1)*base = 2π,4π,6π… の古典フーリエ級数。高周波が急増しないので小規模で崩壊しにくい。
+        return th.tensor([float(k + 1) for k in range(n_bands)], dtype=th.float32) * _FOURIER_BASE
+    elif _FOURIER_MODE == "gaussian":
+        # RFF (Tancik 2020): |N(0,1)|*scale。scale が周波数帯域を支配。seed固定で全モデル同一周波数。
+        _g = th.Generator().manual_seed(_FOURIER_SEED)
+        return th.abs(th.randn(n_bands, generator=_g)) * _FOURIER_SCALE
+    else:  # geometric (既定, NeRF式 2^k)
+        return th.tensor([2.0 ** k for k in range(n_bands)], dtype=th.float32)
+
 
 class BasePCNModel(nn.Module, ABC):
     """Base Model for the PCN."""
@@ -496,17 +677,21 @@ class BasePCNModel(nn.Module, ABC):
         # b2: 条件線形層の入力次元。Fourier ON なら c[D] -> [c, sin(fk c), cos(fk c)] = D*(1+2L)。
         self._cmd_raw_dim = reward_dim + 1
         if _FOURIER_CMD:
-            if _FOURIER_MODE == "linear":
-                # 線形倍音 (k+1)*base = 2π,4π,6π… の古典フーリエ級数。高周波が急増しないので小規模で崩壊しにくい。
-                _ff = th.tensor([float(k + 1) for k in range(_FOURIER_BANDS)], dtype=th.float32) * _FOURIER_BASE
-            elif _FOURIER_MODE == "gaussian":
-                # RFF (Tancik 2020): |N(0,1)|*scale。scale が周波数帯域を支配。seed固定で全モデル同一周波数。
-                _g = th.Generator().manual_seed(_FOURIER_SEED)
-                _ff = th.abs(th.randn(_FOURIER_BANDS, generator=_g)) * _FOURIER_SCALE
-            else:  # geometric (既定, NeRF式 2^k)
-                _ff = th.tensor([2.0 ** k for k in range(_FOURIER_BANDS)], dtype=th.float32)
-            self.register_buffer("fourier_freqs", _ff)
-            self.cmd_in_dim = self._cmd_raw_dim * (1 + 2 * _FOURIER_BANDS)
+            self.register_buffer("fourier_freqs", _make_fourier_freqs(_FOURIER_BANDS))
+            if _FOURIER_BANDS_COST is not None and _FOURIER_BANDS_COST != _FOURIER_BANDS:
+                # [per-channel bands] cost チャネルだけ別バンド数（同モードの先頭 L_cost 周波数）。
+                # 入力次元 = 生c(D) + 非costチャネル(D-1)*2L + costチャネル 2L_cost。
+                self.register_buffer(
+                    "fourier_freqs_cost", _make_fourier_freqs(_FOURIER_BANDS_COST)
+                )
+                self.cmd_in_dim = (
+                    self._cmd_raw_dim
+                    + 2 * _FOURIER_BANDS * (self._cmd_raw_dim - 1)
+                    + 2 * _FOURIER_BANDS_COST
+                )
+            else:
+                # 未設定/同値なら従来と同一（buffer 構成・次元ともビット不変）。
+                self.cmd_in_dim = self._cmd_raw_dim * (1 + 2 * _FOURIER_BANDS)
         else:
             self.cmd_in_dim = self._cmd_raw_dim
         self.value_head = nn.Sequential(
@@ -559,16 +744,27 @@ class BasePCNModel(nn.Module, ABC):
     def _balance_desired_return(self, desired_return: th.Tensor) -> th.Tensor:
         if not _COMMAND_BALANCE:
             return desired_return
+        # command_balance バッファに power は焼き込み済み(_command_balance_vector)。バッファ同期で actor にも伝わる。
         return desired_return * self.command_balance
 
     def _encode_cmd(self, c: th.Tensor) -> th.Tensor:
         """b2: Fourier command encoding。c[B,D] -> [c, sin(fk·c), cos(fk·c)] = [B, D*(1+2L)]。
-        OFF時は c をそのまま返す。生 c を先頭に連結するので、学習で高周波を使う/捨てるを選べる。"""
+        OFF時は c をそのまま返す。生 c を先頭に連結するので、学習で高周波を使う/捨てるを選べる。
+        [per-channel bands] fourier_freqs_cost buffer がある時のみ cost チャネル(index1)だけ
+        別周波数集合で展開（レイアウトは従来と同じ D-major: [c, d0ブロック, d1ブロック, ...]、
+        各ブロック=[sin(L_d), cos(L_d)]。L_d のみチャネル別）。buffer 無し=従来コードと同一。"""
         if not _FOURIER_CMD:
             return c
-        proj = c.unsqueeze(-1) * self.fourier_freqs            # [B, D, L]
-        feats = th.cat([th.sin(proj), th.cos(proj)], dim=-1)   # [B, D, 2L]
-        return th.cat([c, feats.flatten(start_dim=1)], dim=-1)  # [B, D*(1+2L)]
+        if getattr(self, "fourier_freqs_cost", None) is None:
+            proj = c.unsqueeze(-1) * self.fourier_freqs            # [B, D, L]
+            feats = th.cat([th.sin(proj), th.cos(proj)], dim=-1)   # [B, D, 2L]
+            return th.cat([c, feats.flatten(start_dim=1)], dim=-1)  # [B, D*(1+2L)]
+        parts = [c]
+        for d in range(c.shape[-1]):
+            ff = self.fourier_freqs_cost if d == _FOURIER_COST_CH else self.fourier_freqs
+            proj = c[..., d : d + 1] * ff                          # [B, L_d]
+            parts.append(th.cat([th.sin(proj), th.cos(proj)], dim=-1))
+        return th.cat(parts, dim=-1)
 
     def forward(self, state, desired_return, desired_horizon):
         """Return log-probabilities of actions or return action directly in case of continuous action space."""
@@ -702,86 +898,115 @@ class ContinuousActionsDefaultModel(BasePCNModel):
         )
 
 
-class CNN1D(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256):
-        super(CNN1D, self).__init__()
-        
-        # 1次元CNNレイヤー
-        self.cnn = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=5, stride=1, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=5, stride=1, padding=2),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Flatten()
+class _AttnStateEncoder(nn.Module):
+    """PCN_ARCH=attn 用の状態エンコーダ（従来 s_emb の代替）。
+
+    観測 flatten を分解してトークン列として自己注意で符号化する:
+      state[:, :180]    -> イベント30トークン×6特徴（占有中ジョブ: 開始/終了/長さ/cloud/開始ノード/高さ）
+      state[:, 180:220] -> ジョブキュー5トークン×8特徴（index0=現ジョブ）
+      state[:, 220:]    -> グローバル特徴（urgency等, 次元は state_dim-220 で可変, 0 も可）
+    flatten で失われる「現ジョブ×隙間」の関係構造を attention で復元するのが狙い。
+    出力の値域整合は Sigmoid でなく LayerNorm で取る。
+    BasePCNModel.forward が呼ぶ self.s_emb(state) と同じ [B, state_dim]->[B, hidden_dim] 契約。
+    """
+
+    N_EVENT_TOKENS = 30
+    EVENT_FEAT = 6
+    N_QUEUE_TOKENS = 5
+    QUEUE_FEAT = 8
+    MIN_STATE_DIM = N_EVENT_TOKENS * EVENT_FEAT + N_QUEUE_TOKENS * QUEUE_FEAT  # 220
+
+    def __init__(self, state_dim: int, hidden_dim: int, d_model: int = 64, n_layers: int = 2, n_heads: int = 4):
+        super().__init__()
+        self.event_dim = self.N_EVENT_TOKENS * self.EVENT_FEAT   # 180
+        self.queue_dim = self.N_QUEUE_TOKENS * self.QUEUE_FEAT   # 40
+        self.global_dim = int(state_dim) - self.MIN_STATE_DIM    # 可変(weekA=1: urgency)
+        assert self.global_dim >= 0, f"state_dim={state_dim} < {self.MIN_STATE_DIM} は AttnStateEncoder 不可"
+        self.d_model = d_model
+        self.event_proj = nn.Linear(self.EVENT_FEAT, d_model)
+        self.queue_proj = nn.Linear(self.QUEUE_FEAT, d_model)
+        # 種別埋め込み: 0=イベント, 1=現ジョブ(キューindex0), 2=キュー(index1..4)。現ジョブを識別。
+        self.type_emb = nn.Parameter(th.zeros(3, d_model))
+        nn.init.normal_(self.type_emb, std=0.02)
+        # TransformerEncoder風(pre-LN + 残差, FFN=2d)を n_layers 積む
+        self.layers = nn.ModuleList(
+            nn.ModuleDict({
+                "ln1": nn.LayerNorm(d_model),
+                "attn": nn.MultiheadAttention(d_model, n_heads, batch_first=True),
+                "ln2": nn.LayerNorm(d_model),
+                "ffn": nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.ReLU(), nn.Linear(2 * d_model, d_model)),
+            })
+            for _ in range(n_layers)
         )
-        
-        # 全結合層
-        cnn_output_size = 32 * (input_dim // 2)
-        self.fc = nn.Sequential(
-            nn.Linear(cnn_output_size, hidden_dim),
-            nn.ReLU()
-        )
-    
-    def forward(self, x):
-        # 入力を [batch_size, 1, input_dim] の形に変形
-        x = x.unsqueeze(1)
-        x = self.cnn(x)
-        x = self.fc(x)
-        return x
+        # プーリング: 現ジョブトークン出力 + 全トークンmean の concat -> hidden_dim
+        self.pool_proj = nn.Linear(2 * d_model, hidden_dim)
+        # グローバル特徴(urgency等)を s_emb 相当ベクトルに concat して hidden_dim へ戻す
+        self.global_fuse = nn.Linear(hidden_dim + self.global_dim, hidden_dim) if self.global_dim > 0 else None
+        self.out_ln = nn.LayerNorm(hidden_dim)
+
+    def reset_parameters(self):
+        """reinit_network()(凍結run再試行)対応: reset_parameters を持たない部品をここで再初期化。
+        子モジュール(Linear/LayerNorm)は呼び出し側の modules() 走査でも再初期化される(重複は無害)。"""
+        nn.init.normal_(self.type_emb, std=0.02)
+        for lyr in self.layers:
+            if hasattr(lyr["attn"], "_reset_parameters"):
+                lyr["attn"]._reset_parameters()
+
+    def forward(self, state):
+        state = state.reshape(-1, state.shape[-1])
+        ev = state[:, : self.event_dim].reshape(-1, self.N_EVENT_TOKENS, self.EVENT_FEAT)
+        qu = state[:, self.event_dim : self.event_dim + self.queue_dim].reshape(-1, self.N_QUEUE_TOKENS, self.QUEUE_FEAT)
+        tok_ev = self.event_proj(ev) + self.type_emb[0]
+        type_qu = th.cat(
+            [self.type_emb[1:2], self.type_emb[2:3].expand(self.N_QUEUE_TOKENS - 1, -1)], dim=0
+        )  # [5, d]: index0=現ジョブ種別, 1..4=キュー種別
+        tok_qu = self.queue_proj(qu) + type_qu
+        x = th.cat([tok_ev, tok_qu], dim=1)  # [B, 35, d]
+        for lyr in self.layers:
+            h = lyr["ln1"](x)
+            a, _ = lyr["attn"](h, h, h, need_weights=False)
+            x = x + a
+            x = x + lyr["ffn"](lyr["ln2"](x))
+        cur = x[:, self.N_EVENT_TOKENS, :]  # 現ジョブトークン(キューindex0 = トークン列の30番)
+        pooled = th.cat([cur, x.mean(dim=1)], dim=-1)  # [B, 2d]
+        h = self.pool_proj(pooled)
+        if self.global_fuse is not None:
+            g = state[:, self.event_dim + self.queue_dim :]
+            h = self.global_fuse(th.cat([h, g], dim=-1))
+        return self.out_ln(h)
 
 
-class CNNBackedPCN(nn.Module):
-    def __init__(self, n_premise_nodes, n_cloud_nodes, window_size, job_feature_dim, hidden_dim=256):
-        super(CNNBackedPCN, self).__init__()
-        
-        # リソースマップ用CNN
-        self.map_cnn = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        
-        # CNNの出力サイズを計算
-        cnn_output_size = 32 * min(n_premise_nodes, n_cloud_nodes) * window_size
-        
-        # ジョブ特徴エンコーダー
-        self.job_encoder = nn.Sequential(
-            nn.Linear(job_feature_dim, 128),
-            nn.ReLU()
-        )
-        
-        # 特徴結合層
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(cnn_output_size + 128, hidden_dim),
-            nn.ReLU()
-        )
-        
-        # 多目的出力レイヤー
-        self.output_layer = nn.Linear(hidden_dim, 2)  # [待ち時間, コスト]
-    
-    def forward(self, obs_dict, lam=None):
-        # リソースマップ処理
-        on_premise = obs_dict['on_premise_map'].unsqueeze(1)  # [B, 1, H, W]
-        cloud = obs_dict['cloud_map'].unsqueeze(1)             # [B, 1, H, W]
-        maps = th.cat([on_premise, cloud], dim=1)          # [B, 2, H, W]
-        
-        # CNN特徴抽出
-        map_features = self.map_cnn(maps)
-        
-        # ジョブキュー処理
-        job_features = self.job_encoder(obs_dict['job_queue'])
-        
-        # 特徴統合
-        combined = th.cat([map_features, job_features], dim=1)
-        features = self.fusion_layer(combined)
-        
-        # 出力生成
-        output = self.output_layer(features)
-        
-        return output
+class AttnActionsModel(BasePCNModel):
+    """イベント集合attention版PCNモデル（オプトイン: PCN_ARCH=attn）。
+
+    s_emb を _AttnStateEncoder（トークン化+自己注意, Sigmoid無し/LayerNorm整合）に置き換える以外は
+    DiscreteActionsDefaultModel と同一構造（c_emb / FILM / Fourier / fc / LogSoftmax /
+    desired_return 正規化バッファは BasePCNModel + 本クラスで同じに構築）。
+    forward / predict_archive_value は BasePCNModel のものをそのまま使う（s_emb 契約が同じため）。
+    """
+
+    MIN_STATE_DIM = _AttnStateEncoder.MIN_STATE_DIM  # 220
+
+    def __init__(self, state_dim: int, action_dim: int, reward_dim: int, scaling_factor: np.ndarray, hidden_dim: int):
+        super().__init__(state_dim, action_dim, reward_dim, scaling_factor, hidden_dim)
+        self.state_dim = state_dim
+        _d = int(os.environ.get("PCN_ATTN_DIM", "64"))
+        _nl = int(os.environ.get("PCN_ATTN_LAYERS", "2"))
+        _nh = int(os.environ.get("PCN_ATTN_HEADS", "4"))
+        self.s_emb = _AttnStateEncoder(state_dim, self.hidden_dim, d_model=_d, n_layers=_nl, n_heads=_nh)
+        self.c_emb = nn.Sequential(nn.Linear(self.cmd_in_dim, self.hidden_dim), nn.Sigmoid())
+        if _FILM:
+            # DiscreteActionsDefaultModel と同じ zero-init FiLM（開始時 s*1+0=s の安全スタート）
+            self.film_gamma = nn.Linear(self.cmd_in_dim, self.hidden_dim)
+            self.film_beta = nn.Linear(self.cmd_in_dim, self.hidden_dim)
+            for _l in (self.film_gamma, self.film_beta):
+                nn.init.zeros_(_l.weight); nn.init.zeros_(_l.bias)
+        _fc_depth = int(os.environ.get("PCN_FC_DEPTH", "2"))
+        _fc_layers = []
+        for _ in range(max(1, _fc_depth - 1)):
+            _fc_layers += [nn.Linear(self.hidden_dim, self.hidden_dim), nn.ReLU()]
+        _fc_layers += [nn.Linear(self.hidden_dim, self.action_dim), nn.LogSoftmax(dim=1)]
+        self.fc = nn.Sequential(*_fc_layers)
 
 
 class EnhancedPCNModel(nn.Module):
@@ -1284,7 +1509,17 @@ class PCN(MOAgent, MOPolicy):
                     model_class = ContinuousActionsDefaultModel
                 else:
                     model_class = DiscreteActionsDefaultModel
-            
+                    # オプトイン: PCN_ARCH=attn でイベント集合attentionモデル(未設定=完全従来でビット不変)
+                    if os.environ.get("PCN_ARCH", "") == "attn":
+                        if self.observation_dim >= AttnActionsModel.MIN_STATE_DIM:
+                            model_class = AttnActionsModel
+                        else:
+                            print(
+                                f"[PCN] 警告: PCN_ARCH=attn だが state_dim={self.observation_dim} < "
+                                f"{AttnActionsModel.MIN_STATE_DIM}(イベント180+キュー40)。旧環境の観測形式のため "
+                                f"従来モデル(DiscreteActionsDefaultModel)にフォールバックします。"
+                            )
+
             # [主犯特定インフラ] NN初期化seed固定。PCN_INIT_SEED 設定時のみ(空=従来=ランダム=ビット一致)。
             # 確率的崩壊(seed依存)を排除し、同一初期化のまま変更を1つずつ振って主犯を切り分けるため。
             _init_seed = os.environ.get("PCN_INIT_SEED", "")
@@ -1369,8 +1604,33 @@ class PCN(MOAgent, MOPolicy):
         self._ema_backup = None
         return True
 
+    def _apply_weight_maxnorm(self):
+        """重みノルム天井: 各重み行列のノルムが基準(初回更新時)比 FACTOR 倍を超えたら縮める。
+        壁1の重み膨張を物理的に止め、後半の一点collapseを防ぐ。step 成功直後に呼ぶ。"""
+        f = _WEIGHT_MAXNORM_FACTOR
+        if f <= 0:
+            return
+        mod = self._policy_module()
+        base = getattr(self, "_weight_norm_base", None)
+        if base is None:
+            base = {}
+            self._weight_norm_base = base
+        with th.no_grad():
+            for n, p in mod.named_parameters():
+                if p.ndim < 2:  # 重み行列のみ(bias等1Dは対象外)
+                    continue
+                cur = float(p.norm())
+                b = base.get(n)
+                if b is None or b <= 0:
+                    base[n] = cur  # 初回=基準として記録
+                    continue
+                cap = b * f
+                if cur > cap:
+                    p.mul_(cap / cur)
+
     def _ema_update(self):
         """optimizer.step 成功直後に呼ぶ: shadow = decay*shadow + (1-decay)*online (in-place, 追加メモリ0)。"""
+        self._apply_weight_maxnorm()
         if not _EMA_ENABLED or self._ema_shadow is None:
             return
         with th.no_grad():
@@ -1425,6 +1685,29 @@ class PCN(MOAgent, MOPolicy):
         n_jobs = int(getattr(env, "n_jobs", 0) or 0)
         if n_jobs <= 0 and hasattr(env, "unwrapped"):
             n_jobs = int(getattr(env.unwrapped, "n_jobs", 0) or 0)
+        if n_jobs <= 0:
+            try:
+                n_jobs = int(len(env.jobs))
+            except Exception:
+                n_jobs = 0
+        if n_jobs <= 1:
+            # [2026-08-27 バグ修正] Learner の env は n_jobs を持たない/1 を名乗るため、ここが 1 に
+            # 退化していた。→ 注文の wait 成分(-avg_wait×nj)が「平均値のまま」になり、総待ちスケールの
+            # 正規化(5万で~1.1e8)に対して実質0 = 全rollout注文のwait軸が無信号(v9/v10予行のbuffer実測で
+            # 数値一致確認)。真値は構築時に明示で渡される scaling_factor[2]=1/n_jobs から導出する。
+            try:
+                sf = np.asarray(self.scaling_factor, dtype=np.float64).reshape(-1)
+                if sf.size >= 3 and 0.0 < float(sf[2]) <= 1.0:
+                    derived = int(round(1.0 / float(sf[2])))
+                    if derived > n_jobs:
+                        if not getattr(self, "_njobs_fallback_logged", False):
+                            self._njobs_fallback_logged = True
+                            print(f"[POLICY_NJOBS] env由来n_jobs={n_jobs} → "
+                                  f"scaling_factorから{derived}を導出して使用 "
+                                  "(旧挙動=1: 注文waitがほぼ0になるバグ)", flush=True)
+                        n_jobs = derived
+            except Exception:
+                pass
         return max(1, n_jobs)
 
     @staticmethod
@@ -1511,14 +1794,6 @@ class PCN(MOAgent, MOPolicy):
             cache[key] = res
         return res
 
-    def _cond_focus_cost_band_limits(self, points: np.ndarray) -> tuple:
-        if _MID_BAND_COND_FOCUS_FRAC <= 0:
-            return self._mid_cost_band_limits(points)
-        half = max(_MID_BAND_COND_FOCUS_HALF_WIDTH_FRAC, 1e-6)
-        lo_f = max(0.0, _MID_BAND_COND_FOCUS_FRAC - half)
-        hi_f = _MID_BAND_COND_FOCUS_FRAC + half
-        return self._cost_frac_band_limits(points, lo_f, hi_f)
-
     def _command_cost_in_mid_band(self, cost_command: float, cost_lo: float, cost_hi: float) -> bool:
         """desired_return[1] は -cost 累積なので、中域 cost は r1 が [-hi, -lo]。"""
         if cost_hi <= cost_lo:
@@ -1580,6 +1855,10 @@ class PCN(MOAgent, MOPolicy):
         ep_len = int(block["episode_length"])
         dr = block["desired_returns"]
         w = np.ones(ep_len, dtype=np.float64)
+        # [PCN_TRAIN_HEAD_STEP_WEIGHT] 全エピソードの先頭区間(=評価で使う G_0 に近い条件)を重くする。
+        if _TRAIN_HEAD_STEP_WEIGHT > 1.0:
+            n_head = max(1, int(np.ceil(_TRAIN_HEAD_STEP_FRAC * ep_len)))
+            w[:n_head] = np.maximum(w[:n_head], _TRAIN_HEAD_STEP_WEIGHT)
         if _TRAIN_EVALIKE_STEP_WEIGHT > 1.0 and ep_i in ep_mid:
             n_early = max(1, int(np.ceil(_TRAIN_EVALIKE_STEP_FRAC * ep_len)))
             w[:n_early] = np.maximum(w[:n_early], _TRAIN_EVALIKE_STEP_WEIGHT)
@@ -1628,9 +1907,6 @@ class PCN(MOAgent, MOPolicy):
             ]
         else:
             self._eval_gap_band_boosts = None
-
-    def clear_eval_gap_band_boosts(self) -> None:
-        self._eval_gap_band_boosts = None
 
     def _training_flat_step_weights(self, valid_entries, blocks) -> Optional[np.ndarray]:
         """エピソード内ステップの replay 重み（中域 command / eval 相当序盤を厚く）。"""
@@ -1682,6 +1958,10 @@ class PCN(MOAgent, MOPolicy):
         scale = np.maximum(self.return_norm_scale.astype(np.float64), _RETURN_NORM_MIN_SCALE)
         geo = float(np.sqrt(scale[0] * scale[1]))
         balance = geo / scale
+        # power を焼き込む(<1で緩め, 適応時は _bal_power_cur が動的に変わる)。geo/scale=full=power1。
+        p = float(getattr(self, "_bal_power_cur", _COMMAND_BALANCE_POWER))
+        if p != 1.0:
+            balance = np.maximum(balance, 1e-6) ** p
         return balance.astype(np.float32)
 
     @staticmethod
@@ -1933,12 +2213,22 @@ class PCN(MOAgent, MOPolicy):
             observations[i] = obs_data
             actions[i] = transition.action
             
-            # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i（ベクトル化）
-            n_remaining = episode_length - t
-            rewards_slice = np.array([episode[j].reward for j in range(t, episode_length)], dtype=np.float32)
-            rewards_slice = np.nan_to_num(rewards_slice, nan=0.0, posinf=0.0, neginf=0.0)
-            discounts = np.power(self.gamma, np.arange(n_remaining, dtype=np.float32))
-            remaining_return = np.dot(discounts, rewards_slice)
+            if _LABEL_G:
+                # [PCN_LABEL_G] 格納値は _add_episode で既に累積化済み（episode[t].reward = G_t）。
+                # 再累積せずそのままラベルに使う（元論文実装と同じ・実行時の G 規約と整合）。
+                remaining_return = np.nan_to_num(
+                    np.asarray(episode[t].reward, dtype=np.float32),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+            else:
+                # 論文に厳密に従った累積報酬計算: R_t = Σ_{i=t}^T γ^i r_i（ベクトル化）
+                # NOTE: 既知バグ（既定挙動として温存）: episode[j].reward は格納時に累積化済み
+                # (=G_j) なので、これは二重累積 D_t = Σ_j γ^{j-t} G_j になる。修正は PCN_LABEL_G=1。
+                n_remaining = episode_length - t
+                rewards_slice = np.array([episode[j].reward for j in range(t, episode_length)], dtype=np.float32)
+                rewards_slice = np.nan_to_num(rewards_slice, nan=0.0, posinf=0.0, neginf=0.0)
+                discounts = np.power(self.gamma, np.arange(n_remaining, dtype=np.float32))
+                remaining_return = np.dot(discounts, rewards_slice)
             
             # NaN/Infチェックと値のクリッピング
             if np.any(np.isnan(remaining_return)) or np.any(np.isinf(remaining_return)):
@@ -1982,6 +2272,9 @@ class PCN(MOAgent, MOPolicy):
         base = [entry for entry in self.experience_replay if len(entry[2]) > 0]
         if not _FROZEN_PF_CLONE or not self._frozen_pf_entries:
             return base
+        if _TEACH_FRONT_ONLY:
+            # 教師=凍結アーカイブ(非支配点)のみ。replay 全件(希釈データ)は使わない。
+            return [e for e in self._frozen_pf_entries if len(e[2]) > 0]
         # 凍結 best-ever フロントを常時含める（replay から evict されていても再投入）
         seen = {entry[1][1] for entry in base}
         extra = [e for e in self._frozen_pf_entries if len(e[2]) > 0 and e[1][1] not in seen]
@@ -2042,7 +2335,7 @@ class PCN(MOAgent, MOPolicy):
         except Exception:
             pass
         # 教師 cache を作り直して frozen を確実に反映
-        if changed or True:
+        if changed:  # [修正] `or True` で無条件staleだった(毎iter全件再構築を強制)
             self.mark_training_batch_cache_stale()
         return True
 
@@ -2057,7 +2350,11 @@ class PCN(MOAgent, MOPolicy):
         episode_length = len(episode)
         _first = episode[0]
         _cached = getattr(_first, "_pcn_training_block", None)
-        if _cached is not None and _cached.get("episode_length") == episode_length:
+        if (
+            _cached is not None
+            and _cached.get("episode_length") == episode_length
+            and _cached.get("label_g", False) == _LABEL_G
+        ):
             return _cached
         obs_shape = episode[0].observation.shape
         reward_shape = episode[0].reward.shape
@@ -2080,10 +2377,16 @@ class PCN(MOAgent, MOPolicy):
                 neginf=0.0,
             )
 
-        running_return = np.zeros(reward_shape, dtype=np.float32)
-        for step_i in range(episode_length - 1, -1, -1):
-            running_return = rewards[step_i] + self.gamma * running_return
-            desired_returns[step_i] = running_return
+        if _LABEL_G:
+            # [PCN_LABEL_G] 格納値は既に累積化済み（rewards[step_i] = G_t）。再累積しない。
+            desired_returns[:] = rewards
+        else:
+            # NOTE: 既知バグ（既定挙動として温存）: rewards は格納時に累積化済み(=G)なので
+            # これは二重累積。修正は PCN_LABEL_G=1（非キャッシュ経路 get_training_batch と対）。
+            running_return = np.zeros(reward_shape, dtype=np.float32)
+            for step_i in range(episode_length - 1, -1, -1):
+                running_return = rewards[step_i] + self.gamma * running_return
+                desired_returns[step_i] = running_return
 
         desired_horizons[:] = np.arange(episode_length, 0, -1, dtype=np.float32)
         if _DESIRED_RETURN_CLIP > 0:
@@ -2098,6 +2401,7 @@ class PCN(MOAgent, MOPolicy):
             "desired_returns": desired_returns,
             "desired_horizons": desired_horizons,
             "episode_length": int(episode_length),
+            "label_g": _LABEL_G,  # メモ化キー: フラグ違いのブロック混入防止
         }
         try:
             _first._pcn_training_block = block  # メモ化(エピソード淘汰でGC、id再利用の誤ヒットなし)
@@ -2112,6 +2416,7 @@ class PCN(MOAgent, MOPolicy):
             or _TRAIN_KNEE_STEP_WEIGHT > 1.0
             or _TRAIN_LOW_SLOPE_STEP_WEIGHT > 1.0
             or _TRAIN_GIANT_STEP_WEIGHT > 1.0
+            or _TRAIN_HEAD_STEP_WEIGHT > 1.0
         )
 
     def _compute_flat_step_probs(
@@ -2234,6 +2539,16 @@ class PCN(MOAgent, MOPolicy):
             ),
         }
         if on_device and str(self.device).startswith("cuda"):
+            # [メモリ] 旧 cache の GPU テンソルを先に解放してからで確保する。
+            # 解放しないと「旧 + 新」でピークが最終サイズの2倍になり、
+            # 長期学習(累積エピソード数に比例)で OOM の主因になる。
+            _old = getattr(self, "_training_batch_cache", None)  # 初回は未作成
+            if isinstance(_old, dict) and _old.get("on_device"):
+                for _k in ("observations", "actions", "desired_returns", "desired_horizons"):
+                    _old.pop(_k, None)
+                self._training_batch_cache = None
+                if th.cuda.is_available():
+                    th.cuda.empty_cache()
             try:
                 cache["observations"] = th.as_tensor(observations, dtype=th.float32, device=self.device)
                 cache["actions"] = th.as_tensor(actions, dtype=th.long, device=self.device)
@@ -2438,6 +2753,73 @@ class PCN(MOAgent, MOPolicy):
         if _PHASE1_SWEEP_TRAIN_WEIGHT != 1.0:
             for i, episode in enumerate(episodes):
                 weights[i] *= self._phase1_sweep_episode_weight(episode)
+        if _SEED_EPISODE_WEIGHT != 1.0:
+            _n_seed = 0
+            for i, episode in enumerate(episodes):
+                if episode and getattr(episode[0], "_pcn_seed_episode", False):
+                    weights[i] *= _SEED_EPISODE_WEIGHT
+                    _n_seed += 1
+            if _n_seed and not getattr(self, "_seed_w_logged", False):
+                self._seed_w_logged = True
+                print(f"[SEED_EP_WEIGHT] 種エピソード{_n_seed}本に×{_SEED_EPISODE_WEIGHT}の学習重み適用")
+        # [PCN_DEDUP_TRAIN_WEIGHT] 同一達成点の重複は 1/本数 に薄める(点ごとに均等な学習機会)。
+        if _DEDUP_TRAIN_WEIGHT and n_episodes > 0:
+            keys = []
+            for episode in episodes:
+                first = episode[0]
+                obj = getattr(first, "objective_values", None)
+                if obj is not None:
+                    k = (round(float(obj[0]), _DEDUP_TRAIN_DECIMALS),
+                         round(float(obj[2]), _DEDUP_TRAIN_DECIMALS))
+                else:
+                    r = np.asarray(first.reward, dtype=np.float64)
+                    k = (round(float(r[1]), _DEDUP_TRAIN_DECIMALS),
+                         round(float(r[0]), _DEDUP_TRAIN_DECIMALS))
+                keys.append(k)
+            counts: Dict[Any, int] = {}
+            for k in keys:
+                counts[k] = counts.get(k, 0) + 1
+            for i, k in enumerate(keys):
+                weights[i] /= float(counts[k])
+
+        # [PCN_ADV_WEIGHT] 帯内相対成績で重み付け(良し悪しの勾配)。
+        if _ADV_WEIGHT > 0.0 and n_episodes > 1:
+            cw = np.empty((n_episodes, 2), dtype=np.float64)
+            for i, episode in enumerate(episodes):
+                first = episode[0]
+                obj = getattr(first, "objective_values", None)
+                if obj is not None:
+                    cw[i] = (float(obj[0]), float(obj[2]))
+                else:
+                    r = np.asarray(first.reward, dtype=np.float64)
+                    cw[i] = (-float(r[1]), -float(r[0]))
+            edges = np.quantile(cw[:, 0], np.linspace(0.0, 1.0, _ADV_BANDS + 1))
+            edges[-1] = np.inf
+            band = np.clip(np.searchsorted(edges[1:], cw[:, 0], side="left"), 0, _ADV_BANDS - 1)
+            adv = np.zeros(n_episodes, dtype=np.float64)
+            for b in range(_ADV_BANDS):
+                idx = np.where(band == b)[0]
+                if len(idx) < 2:
+                    continue
+                w_b = cw[idx, 1]
+                med = float(np.median(w_b))
+                scale = float(np.std(w_b))
+                if scale <= 0.0 or not np.isfinite(scale):
+                    continue
+                adv[idx] = (med - w_b) / scale  # 待ちが短いほど正
+            mult = np.exp(np.clip(adv * _ADV_WEIGHT, -np.log(_ADV_CLIP), np.log(_ADV_CLIP)))
+            weights *= mult
+            if not getattr(self, "_adv_w_logged", False):
+                self._adv_w_logged = True
+                print(f"[ADV_WEIGHT] 帯内相対成績で重み付け: 係数{_ADV_WEIGHT} 帯{_ADV_BANDS} "
+                      f"倍率レンジ[{mult.min():.2f}, {mult.max():.2f}] 中央{np.median(mult):.2f}")
+            if not getattr(self, "_dedup_w_logged", False):
+                self._dedup_w_logged = True
+                _dup = sum(1 for c in counts.values() if c > 1)
+                _mx = max(counts.values()) if counts else 0
+                print(f"[DEDUP_TRAIN_WEIGHT] ユニーク達成点{len(counts)}/{n_episodes}本 "
+                      f"(重複点{_dup}件・最頻{_mx}本) を点ごと均等重みに補正")
+
         pf_count = 0
         endpoint_count = 0
         recent_count = 0
@@ -2446,7 +2828,9 @@ class PCN(MOAgent, MOPolicy):
         mid_pf_count = 0
         low_wait_pf_count = 0
         if n_episodes == 0 or (
-            _PHASE1_SWEEP_TRAIN_WEIGHT == 1.0
+            not _DEDUP_TRAIN_WEIGHT
+            and _ADV_WEIGHT <= 0.0
+            and _PHASE1_SWEEP_TRAIN_WEIGHT == 1.0
             and _TRAIN_PF_WEIGHT <= 1.0
             and _TRAIN_ENDPOINT_WEIGHT <= 1.0
             and _TRAIN_RECENT_WEIGHT <= 1.0
@@ -3036,14 +3420,13 @@ class PCN(MOAgent, MOPolicy):
         # 固定 _VALUE_COST_SCALE(1e5) では trace256(cost~2.25億)を [-1,0] に正規化できず loss が桁外れになる
         # （他項を支配・崩壊）。学習データから自動追従する desired_return_scale を使い O(1) に揃える。
         _drs = model.desired_return_scale.detach().to(th.float32)
-        _nj = max(1, int(getattr(getattr(self, "env", None), "n_jobs", 0) or 0))
-        if _nj <= 1:
-            try:
-                _nj = max(1, len(self.env.jobs))
-            except Exception:
-                _nj = 1
+        # [2026-08-27 単位統一] wait系は全て「総待ちスケール drs[0] を1とする分数」で扱う。
+        # 価値ヘッドのwait出力は _VALUE_WAIT_SCALE(=workload較正で総待ちスケール)で校正されるため、
+        # 平均待ちスケール(drs[0]/nj)で割ると nj倍(5万)の不整合が anchor に化けて暴走する
+        # (smoke20bで実測: anchor~6000。v9はnj=1バグが偶然これを隠していた)。
+        _nj = self._policy_n_jobs()
         cs = max(float(_drs[1].item()), 1.0)        # cost scale（~5.56e8 for trace256）
-        ws = max(float(_drs[0].item()) / _nj, 1.0)  # avg_wait scale =(wait*nj scale)/nj
+        ws = max(float(_drs[0].item()), 1.0)        # 総待ちスケール（v̂/ach/cmd を同一単位に）
         # fp32 で計算（AMP fp16 の cost~1e5 overflow を回避。MEMORY の log2 stuck と同根を予防）。
         with th.cuda.amp.autocast(enabled=False):
             v_hat = model.predict_archive_value(obs_t.float(), dr_t.float(), hz_t.float(), detach_repr=True)  # [B,2] objスケール
@@ -3051,16 +3434,88 @@ class PCN(MOAgent, MOPolicy):
             v_wait_n = v_hat[:, 1] / ws
             cmd_cost_n = cmd_cost_t / cs
             ach_cost_n = ach_t[:, 0] / cs
-            ach_wait_n = ach_t[:, 1] / ws
+            ach_wait_n = (ach_t[:, 1] * float(_nj)) / ws  # 達成avg_wait→総待ち→分数
             # 片側ヒンジ: 予測達成cost が指令cost を「上回る=届かない」側だけ二乗罰（cost は小さいほど良い）
             miss = th.relu(v_cost_n - cmd_cost_n)
             track = (miss ** 2).mean()
+            # [v10] wait側の片側ヒンジ: 予測達成waitが指令waitを上回る側だけ罰。
+            # 指令wait(正規化) = (-command_return[0]) / drs[0]（cr[0]=-avg_wait*nj, drs[0]=wait*njのscale）。
+            if _CMD_TRACK_WAIT_WEIGHT > 0:
+                cmd_wait_n = th.tensor(
+                    np.array([float(-c[0]) for c in dr_list], dtype=np.float32),
+                    device=self.device) / max(float(_drs[0].item()), 1.0)
+                if _COND_WAIT_ROBUST == "logexpand":
+                    # [critic C1対応] ヒンジを対数空間で取る。線形zのままだと目標帯(0-30秒,
+                    # v_wait_n<0.013)で miss² が 1e-4 級に潰れ、罰が数値的に不在になる。
+                    # z0はヒンジ専用(_CMD_TRACK_WAIT_Z0)。入力側の_COND_WAIT_Z0とは空間が別。
+                    _z0 = _CMD_TRACK_WAIT_Z0
+                    _den = float(np.log1p(1.0 / _z0))
+                    _yv = th.log1p(th.clamp(v_wait_n, min=0.0) / _z0) / _den
+                    _yc = th.log1p(th.clamp(cmd_wait_n, min=0.0) / _z0) / _den
+                    miss_w = th.relu(_yv - _yc)
+                else:
+                    miss_w = th.relu(v_wait_n - cmd_wait_n)
+                track = track + (_CMD_TRACK_WAIT_WEIGHT / max(_CMD_TRACK_WEIGHT, 1e-12)) \
+                    * (miss_w ** 2).mean()
+                try:
+                    self._cmd_track_parts = {
+                        "cost_miss2": float((miss ** 2).mean().detach().item()),
+                        "wait_miss2": float((miss_w ** 2).mean().detach().item()),
+                    }
+                except Exception:
+                    pass
             # 回帰アンカー: v̂ を実達成に固定（両成分）。v̂ が嘘をつくのを防ぐ。
             anchor = F.smooth_l1_loss(v_cost_n, ach_cost_n) + F.smooth_l1_loss(v_wait_n, ach_wait_n)
             loss = track + _CMD_TRACK_ANCHOR_WEIGHT * anchor
+        # [breaker分離用] 遮断時もアンカー(校正)だけは学習に通すため、部品を保持する。
+        # アンカーまで遮断すると「未校正→大損失→遮断→未校正」のデッドロックになる(smoke20cで実測)。
+        self._cmd_track_split = (track, anchor)
         if not th.isfinite(loss):
             return None
         return loss
+
+    def probe_wait_sensitivity(self, n: int = 64) -> Optional[dict]:
+        """[v10計装] 同一obs・同一cost指令でwait指令だけ変えた行動分布のTV距離平均。
+        学習不介入(no_grad, 一時eval=dropoutのRNG消費なし)。v9で「wait死を検知する信号が
+        無かった」の再発防止。0なら網はwait指令を完全無視している。"""
+        cache = getattr(self, "_training_batch_cache", None)
+        if not cache or "observations" not in cache:
+            return None
+        obs = cache["observations"][:n]
+        obs_t = (obs.to(self.device).float() if th.is_tensor(obs)
+                 else th.tensor(np.asarray(obs), device=self.device, dtype=th.float32))
+        model = self.network if self.use_enhanced_model else self.model
+        drs = model.desired_return_scale.detach()
+        B = int(obs_t.shape[0])
+        if B == 0:
+            return None
+        cost_cmd = -0.5 * float(drs[1].item())
+        # 3水準(z相当 0 / 0.02 / 0.2)で単調性まで見る(critic対応: 2水準tvは未学習網でも
+        # 非ゼロが出る弱い計器。P(cloud)の単調応答が本命の観察量)。
+        levels = (0.0, 0.02, 0.2)
+        nj = self._policy_n_jobs()
+        hz = th.full((B, 1), float(nj), device=self.device, dtype=th.float32)
+        was_training = model.training
+        model.eval()
+        try:
+            pcs = []
+            probs = []
+            with th.no_grad():
+                for lv in levels:
+                    dr = th.tensor([[-lv * float(drs[0].item()), cost_cmd]],
+                                   device=self.device, dtype=th.float32).repeat(B, 1)
+                    o = model(obs_t, dr, hz)
+                    if isinstance(o, tuple):
+                        o = o[0]
+                    p = th.exp(F.log_softmax(o, dim=-1))
+                    probs.append(p)
+                    pcs.append(float(p[:, 1].mean().item()) if p.shape[-1] > 1 else 0.0)
+                tv01 = float((0.5 * (probs[0] - probs[1]).abs().sum(-1).mean()).item())
+                tv12 = float((0.5 * (probs[1] - probs[2]).abs().sum(-1).mean()).item())
+            return {"tv01": tv01, "tv12": tv12,
+                    "pc": [round(x, 4) for x in pcs]}
+        finally:
+            model.train(was_training)
 
     def update(self, learning_rate=None, compute_metrics: bool = True):
         """Update PCN model - 最適化版
@@ -3271,9 +3726,22 @@ class PCN(MOAgent, MOPolicy):
                 if _CMD_TRACK_WEIGHT > 0.0 and not self.use_enhanced_model:
                     cmd_track_loss = self._command_track_loss_from_replay()
                     if cmd_track_loss is not None and th.isfinite(cmd_track_loss):
-                        l = l + _CMD_TRACK_WEIGHT * cmd_track_loss
+                        _ct_val = float(cmd_track_loss.detach().item())
+                        if _CMD_TRACK_BREAKER > 0 and _ct_val > _CMD_TRACK_BREAKER:
+                            # 暴走時はヒンジ(track)のみ遮断し、アンカー(価値ヘッド校正)は通す。
+                            # 全遮断だとヘッドが永遠に校正されないデッドロック(smoke20c実測)。
+                            self._cmd_track_tripped = getattr(self, "_cmd_track_tripped", 0) + 1
+                            _split = getattr(self, "_cmd_track_split", None)
+                            if _split is not None and th.isfinite(_split[1]):
+                                l = l + _CMD_TRACK_WEIGHT * _CMD_TRACK_ANCHOR_WEIGHT * _split[1]
+                            if self._cmd_track_tripped <= 5 or self._cmd_track_tripped % 200 == 0:
+                                print(f"[CMD_TRACK_BREAKER] loss={_ct_val:.2f}>"
+                                      f"{_CMD_TRACK_BREAKER:g} → ヒンジ不加算・アンカーのみ "
+                                      f"(累計{self._cmd_track_tripped}回)", flush=True)
+                        else:
+                            l = l + _CMD_TRACK_WEIGHT * cmd_track_loss
                         if compute_metrics:
-                            metrics["cmd_track_loss"] = float(cmd_track_loss.detach().item())
+                            metrics["cmd_track_loss"] = _ct_val
                 if compute_metrics:
                     predicted_actions = th.argmax(pred_probs, dim=-1)
                     metrics.update({
@@ -3312,8 +3780,17 @@ class PCN(MOAgent, MOPolicy):
                     # 勾配クリッピングを追加（勾配爆発を防ぐ）
                     th.nn.utils.clip_grad_norm_(self.network.parameters() if self.use_enhanced_model else self.model.parameters(), max_norm=1.0)
                     # unscale_()が成功した場合、必ずstep()を呼ぶ必要がある
+                    # [凍結検知] GradScaler は inf/nan 勾配のとき step を無言でスキップし、
+                    # そのとき scale を下げる。scale の低下で skip を判定して計上する
+                    # (非AMP経路と同じ _nan_skip_total/_opt_step_total を埋め、
+                    #  driver の [STEP_SKIP] 診断を AMP でも機能させる)。
+                    _scale_before = float(self.scaler.get_scale())
                     self.scaler.step(self.opt)
                     self.scaler.update()
+                    if float(self.scaler.get_scale()) < _scale_before:
+                        self._nan_skip_total += 1
+                    else:
+                        self._opt_step_total += 1
                     self._ema_update()
                 except RuntimeError as e:
                     # unscale_()が既に呼ばれている場合、またはその他のエラーの場合
@@ -3461,10 +3938,115 @@ class PCN(MOAgent, MOPolicy):
         # heap is sorted by negative distance, (updated in nlargest)
         # put positive number to ensure that new item stays in the heap
         unique_step = (step, id(transitions))
-        if len(self.experience_replay) == max_size:
-            heapq.heappushpop(self.experience_replay, (1, unique_step, transitions))
-        else:
-            heapq.heappush(self.experience_replay, (1, unique_step, transitions))
+        self._replay_push((1, unique_step, transitions), max_size)
+
+    def _replay_push(self, entry, max_size: int) -> bool:
+        """experience_replay へ entry=(priority, unique_step, transitions) を追加する唯一の入口。
+
+        満杯時の淘汰は既定 heappushpop（従来と完全ビット一致）。PCN_REPLAY_REGIME_FAIR=1 の
+        ときのみレジーム公平淘汰(_replay_push_regime_fair)へ切替。戻り値: entry がバッファに残ったか。
+        """
+        if len(self.experience_replay) >= max_size:  # [修正] ==だとmax_sizeが揺れた時に淘汰が永久に発火しない
+            if _REPLAY_REGIME_FAIR:
+                return self._replay_push_regime_fair(entry)
+            popped = heapq.heappushpop(self.experience_replay, entry)
+            return popped is not entry
+        heapq.heappush(self.experience_replay, entry)
+        return True
+
+    def _replay_push_regime_fair(self, entry) -> bool:
+        """[PCN_REPLAY_REGIME_FAIR] レジーム別クォータ淘汰（満杯時のみ呼ばれる）。
+
+        グローバル heappushpop はレジーム盲目（(cost,wait)で見かけ優秀な最空きレジームが
+        バッファを占拠）なので、①クォータ=(バッファ+新規1)/観測レジーム数の均等割、
+        ②最もクォータ超過したレジームから追い出す、③レジーム内の追い出し順は
+        「非種優先 → priority昇順(_nlargestがレジーム内crowdingで更新) → 古い順」、
+        ④新規エピソード自身も自レジームが対象なら淘汰候補(=従来 heappushpop と同じ意味論)。
+        種エピソードは同レジームに非種が残る限り保護（全滅ケースでは種も淘汰=デッドロックなし）。
+        """
+        buf = self.experience_replay
+        regimes = [episode_regime_scale(e[2]) for e in buf]
+        new_regime = episode_regime_scale(entry[2])
+        counts: Dict[float, int] = {}
+        for r in regimes:
+            counts[r] = counts.get(r, 0) + 1
+        counts[new_regime] = counts.get(new_regime, 0) + 1
+        quota = (len(buf) + 1) / max(1, len(counts))
+        new_is_seed = episode_is_seed(entry[2])
+        # 超過が大きいレジーム順（同率はスケール値昇順で決定的に）
+        for scale, cnt in sorted(counts.items(), key=lambda kv: (-(kv[1] - quota), kv[0])):
+            cand = [i for i, r in enumerate(regimes) if r == scale]
+            include_new = scale == new_regime
+            non_seed = [i for i in cand if not episode_is_seed(buf[i][2])]
+            if non_seed or (include_new and not new_is_seed):
+                # 種保護: 非種の候補が存在する限り種は追い出さない
+                cand = non_seed
+                include_new = include_new and not new_is_seed
+            if not cand and not include_new:
+                continue
+            evict_i = min(cand, key=lambda i: (buf[i][0], buf[i][1])) if cand else None
+            if include_new and (
+                evict_i is None or (entry[0], entry[1]) < (buf[evict_i][0], buf[evict_i][1])
+            ):
+                return False  # 新規自身が最弱: 従来 heappushpop と同じく「入れない」
+            buf[evict_i] = entry
+            heapq.heapify(buf)
+            return True
+        # 理論上到達しない全滅ケース: 従来淘汰へフォールバック
+        popped = heapq.heappushpop(buf, entry)
+        return popped is not entry
+
+    def refresh_replay_priorities(self) -> int:
+        """[2026-08-26] replay ヒープの優先度を「非支配 + crowding distance」で更新する。
+
+        なぜ必要か: 淘汰(_replay_push の heappushpop)は優先度の最小を捨てる。ところが
+        _add_episode は priority=1 の固定値で push しており、優先度を実際に書き戻すのは
+        _nlargest だけである。本番の指令選択は PCN_CHOOSE_COMMANDS_MODE=pf_mixed のとき
+        _choose_commands_batch_from_pf で早期 return するため **_nlargest に到達せず**、
+        全エントリの優先度が 1 のまま=淘汰が unique_step 順(=古い順の FIFO)になる。
+
+        FIFO 淘汰は Phase1 のランダム掃引(p=0..1、PF の両端を含む)から先に捨てるため、
+        反復を重ねるほどアーカイブが「現在の方策の周辺」に凝縮する。これは原論文 §4.4 が
+        明示的に警告している失敗モード(「カバレッジ集合だけに絞ると、似た軌跡ばかりを
+        集めて少数の方策に凝縮し学習が壊れる」)そのものである。
+
+        本メソッドは _nlargest と同じ規則で優先度だけを更新する(非支配点は
+        crowding distance + 1.0、被支配点は 0)。戻り値=非支配点の数。
+        """
+        if len(self.experience_replay) == 0:
+            return 0
+        valid_indices = [i for i, e in enumerate(self.experience_replay) if len(e[2]) > 0]
+        if not valid_indices:
+            return 0
+        valid_returns = np.array(
+            [self.experience_replay[i][2][0].reward for i in valid_indices])
+        non_dominated_i = get_non_dominated_inds(valid_returns)
+        if len(non_dominated_i) == 0:
+            return 0
+        _lo = valid_returns.min(axis=0)
+        _span = np.maximum(valid_returns.max(axis=0) - _lo, 1e-12)
+        valid_returns_norm = (valid_returns - _lo) / _span
+        # [論文 Eq.6-7 忠実] I_l2,i = -min_j ||p_i - p_j||, p_j ∈ 非支配集合(正規化座標)。
+        #  - 非支配かつ疎(CD>0.2): I_ds = I_l2 = 0(最高=最後まで残る)
+        #  - 非支配だが密集/重複(CD≤0.2): I_ds = 2(I_l2 - c) = -2c(僅かに負=降格)
+        #  - 被支配: I_ds = I_l2 = -距離(フロントに近いほど 0 に近い=多様性として残る)
+        # 前版の「非支配=CD+1.0 / 被支配=一律0」は、被支配の中の淘汰が FIFO になり
+        # 「フロント近傍の多様性を残す」という §4.4 の意図(too few V-values の回避)を
+        # 半分しか実現していなかったため、論文式に置き換えた。
+        _c = 1e-5
+        nd_pts = valid_returns_norm[non_dominated_i]
+        d2 = ((valid_returns_norm[:, None, :] - nd_pts[None, :, :]) ** 2).sum(-1)
+        min_dist = np.sqrt(d2.min(axis=1))                      # 各点→最近傍ND距離
+        priorities = -min_dist                                   # 被支配: I_l2(負)
+        cd = crowding_distance(nd_pts)
+        nd_arr = np.asarray(non_dominated_i)
+        priorities[nd_arr[cd > 0.2]] = 0.0                       # 疎なND: 0
+        priorities[nd_arr[cd <= 0.2]] = -2.0 * _c                # 密集ND: 降格
+        for local_i, global_i in enumerate(valid_indices):
+            _, step, episode = self.experience_replay[global_i]
+            self.experience_replay[global_i] = (priorities[local_i], step, episode)
+        heapq.heapify(self.experience_replay)
+        return int(len(non_dominated_i))
 
     def _nlargest(self, n, threshold=0.2):
         """PF上の疎な点を優先して上位n個を選別する。
@@ -3523,15 +4105,159 @@ class PCN(MOAgent, MOPolicy):
 
         # ヒープ優先度を更新: PF上の疎な点ほど残りやすくする。
         priorities = np.zeros(len(valid_returns), dtype=np.float64)
-        priorities[non_dominated_i] = nd_distances + 1.0
+        if _REPLAY_REGIME_FAIR:
+            # [PCN_REPLAY_REGIME_FAIR] 優先度をレジーム内で計算する。グローバル(cost,wait)座標の
+            # ND/crowding は最空きレジームが独占し、評価レジームのPF見本が優先度0で淘汰される
+            # (レジーム盲目)。各レジーム内のND点に「レジーム内crowding+1」を与え、レジームごとの
+            # フロント構造を保護する。返り値(コマンド生成用の選抜)は従来どおりグローバル基準のまま。
+            ep_scales = np.array(
+                [episode_regime_scale(self.experience_replay[i][2]) for i in valid_indices]
+            )
+            for _scale in np.unique(ep_scales):
+                g = np.where(ep_scales == _scale)[0]
+                g_nd = get_non_dominated_inds(valid_returns[g])
+                if len(g_nd) == 0:
+                    continue
+                g_cd = crowding_distance(valid_returns_norm[g][g_nd])
+                priorities[g[g_nd]] = g_cd + 1.0
+        else:
+            priorities[non_dominated_i] = nd_distances + 1.0
         for local_i, global_i in enumerate(valid_indices):
             _, step, episode = self.experience_replay[global_i]
             self.experience_replay[global_i] = (priorities[local_i], step, episode)
         heapq.heapify(self.experience_replay)
         return largest
 
+    def _local_step_pick(self, front: np.ndarray):
+        """[PCN_CMD_LOCAL_STEP] cost昇順の前線 front (K×2, (cost,wait)) から局所ステップ注文を1つ作る。
+
+        返り値: ((cost, wait), base_index)。
+        - 内側ステップ: 土台 p_i 一様 → 隣接点 p_{i±1} 方向へ α~U(0.5,1.5) の両軸内挿/外挿
+        - 端ステップ(確率 _CMD_LOCAL_EDGE_FRAC): 端点から内側隣接間隔と同じ幅で外側へ(前線を伸ばす)
+        - クランプ: 達成済みレンジ±端の隣接間隔、かつ非負
+        """
+        front = np.asarray(front, dtype=np.float64)
+        K = len(front)
+        if K == 1:
+            return (float(front[0, 0]), float(front[0, 1])), 0
+        rng = self.np_random
+        if rng.uniform() < _CMD_LOCAL_EDGE_FRAC:
+            # 端点の外側への一歩: 内側の隣接点から遠ざかる方向(幅は内側間隔×U(0.5,1.5))
+            i = 0 if int(rng.integers(0, 2)) == 0 else K - 1
+            j = 1 if i == 0 else K - 2
+            alpha = -float(rng.uniform(0.5, 1.5))
+        else:
+            i = int(rng.integers(0, K))
+            if i == 0:
+                j = 1
+            elif i == K - 1:
+                j = K - 2
+            else:
+                j = i + 1 if int(rng.integers(0, 2)) == 0 else i - 1
+            alpha = float(rng.uniform(0.5, 1.5))
+        p = front[i] + alpha * (front[j] - front[i])
+        # クランプ: 各軸とも達成済みレンジを「その端の隣接間隔」以上は超えない
+        d_lo = np.abs(front[1] - front[0])    # cost下端(=wait上端)側の隣接間隔
+        d_hi = np.abs(front[-1] - front[-2])  # cost上端(=wait下端)側の隣接間隔
+        c_min, c_max = float(front[0, 0]), float(front[-1, 0])
+        w_min, w_max = float(front[:, 1].min()), float(front[:, 1].max())
+        lo = np.array([c_min - d_lo[0], w_min - d_hi[1]])
+        hi = np.array([c_max + d_hi[0], w_max + d_lo[1]])
+        if _CMD_REACH_CLAMP > 1.0:
+            # [PCN_CMD_REACH_CLAMP] 到達済み端×係数で外挿を頭打ちに(島ギャップ由来の暴走を防ぐ)
+            f = _CMD_REACH_CLAMP
+            hi[0] = min(hi[0], c_max * f)
+            hi[1] = min(hi[1], w_max * f)
+            lo[1] = max(lo[1], w_min / f)
+        p = np.minimum(np.maximum(p, lo), hi)
+        p = np.maximum(p, 0.0)
+        return (float(p[0]), float(p[1])), int(i)
+
+    def _local_step_choose_group(self, groups):
+        """[PCN_CMD_LOCAL_STEP] 前線グループを点数比例で1つ選ぶ(=全点の一様選択と等価)。"""
+        if len(groups) == 1:
+            return 0
+        sizes = np.array([len(g[0]) for g in groups], dtype=np.float64)
+        return int(self.np_random.choice(len(groups), p=sizes / sizes.sum()))
+
+    def _choose_commands_local_step(self, num_episodes: int, n_commands: int):
+        """[PCN_CMD_LOCAL_STEP] 論文式(_choose_commands系)の代替: 局所ステップ注文をn個作る。
+
+        replay の非支配前線を(レジーム標識があればレジーム別に)cost昇順に並べ、
+        _local_step_pick で隣接間隔ベースの注文を作る。horizon は土台エピソードの
+        horizon-2(現行と同じ規約)。返り値: [(desired_return, desired_horizon, base_return), ...]
+        エピソードが無ければ None(呼び出し側で従来のデフォルト処理へ)。
+        """
+        episodes = self._nlargest(num_episodes)
+        if len(episodes) == 0:
+            return None
+        returns = np.array([e[2][0].reward for e in episodes], dtype=np.float64)
+        horizons = np.array([len(e[2]) for e in episodes], dtype=np.float64)
+        regimes = np.array([episode_regime_scale(e[2]) for e in episodes], dtype=np.float64)
+        groups = []  # (front K×2 (cost,total_wait) cost昇順, horizons K)
+        for scale in np.unique(regimes):
+            m = regimes == scale
+            nd = get_non_dominated_inds(returns[m])
+            if len(nd) == 0:
+                continue
+            r = returns[m][nd]
+            h = horizons[m][nd]
+            # (cost, total_wait) = (-r1, -r0) に変換
+            pts = np.column_stack([-r[:, 1], -r[:, 0]])
+            # 重複点を除去して cost 昇順へ(np.unique(axis=0)=辞書式ソート=cost昇順)。
+            # 全オンプレ端などの同一達成点が複数あると隣接間隔=0になり、局所ステップが
+            # 「土台と同一の注文」に退化+端を伸ばす一歩も0幅化するため(2026-08-06 実測)。
+            _, ui = np.unique(np.round(pts, decimals=6), axis=0, return_index=True)
+            groups.append((pts[ui], h[ui]))
+        if not groups:
+            return None
+        results = []
+        for _ in range(n_commands):
+            front, hz = groups[self._local_step_choose_group(groups)]
+            (c, w), bi = self._local_step_pick(front)
+            desired_return = np.array([-w, -c], dtype=np.float32)
+            desired_horizon = np.float32(hz[bi] - 2)
+            base_return = np.array([-front[bi, 1], -front[bi, 0]], dtype=np.float32)
+            results.append((desired_return, desired_horizon, base_return))
+        return results
+
+    def _local_step_picks_from_pf(self, pf_pool: np.ndarray, n_commands: int):
+        """[PCN_CMD_LOCAL_STEP] 本番系(_choose_commands_batch_from_pf)の代替pick生成。
+
+        レジーム標識が複数あれば archive をレジーム別 PF に分けて局所ステップ
+        (ref_pf/anchor 混合済みの pf_pool はレジーム不明のため追加グループとして保持)。
+        単一レジームなら pf_pool そのものを前線として使う。返り値: [(cost, wait), ...]
+        """
+        groups = []
+        entries = self._valid_replay_entries()
+        if entries:
+            regimes = np.array([episode_regime_scale(e[2]) for e in entries])
+            uniq = np.unique(regimes)
+            if len(uniq) > 1:
+                for scale in uniq:
+                    sub = [e for e, r_ in zip(entries, regimes) if r_ == scale]
+                    pf = self._archive_pf_objective_points(sub)
+                    if pf.size:
+                        o = np.argsort(pf[:, 0], kind="stable")
+                        groups.append((pf[o], None))
+        if not groups:
+            pool = np.asarray(pf_pool, dtype=np.float64)
+            pool = np.unique(np.round(pool, decimals=9), axis=0)
+            o = np.argsort(pool[:, 0], kind="stable")
+            groups.append((pool[o], None))
+        picks = []
+        for _ in range(n_commands):
+            front, _ = groups[self._local_step_choose_group(groups)]
+            (c, w), _bi = self._local_step_pick(front)
+            picks.append((c, w))
+        return picks
+
     def _choose_commands(self, num_episodes: int):
         """論文実装準拠のコマンド選択。"""
+        if _CMD_LOCAL_STEP:
+            cmds = self._choose_commands_local_step(num_episodes, 1)
+            if cmds is not None:
+                return cmds[0][0], cmds[0][1]
         episodes = self._nlargest(num_episodes)
         if len(episodes) == 0:
             print("警告: コマンド選択用のエピソードが見つかりませんでした。デフォルト値を返します。")
@@ -3565,6 +4291,43 @@ class PCN(MOAgent, MOPolicy):
             return np.empty((0, 2), dtype=np.float64)
         pf = pts[pf_i]
         return np.unique(np.round(pf, decimals=3), axis=0)
+
+    def _ref_pf_scale_guard(self, ref_pf: np.ndarray, ref_path: str):
+        """[REF_PF] スケール不整合ガード: 参照前線の cost/wait レンジが自分の達成レンジと
+        桁違い(中央値比 > PCN_REF_PF_GUARD_RATIO, 既定10x)なら警告してスキップする。
+
+        別ワークロード(例: trace24)の桁違いに小さい前線が非支配比較で自分の達成点を
+        押し出し、注文プールを乗っ取る事故(2026-08-06 確定バグ)の再発防止。
+        自分の達成点(archive PF)が未形成の間は比較不能のためガードは保留する。
+        PCN_REF_PF_GUARD_RATIO=0 でガード無効(旧挙動退避)。"""
+        try:
+            ratio_max = float(os.environ.get("PCN_REF_PF_GUARD_RATIO", "10") or "0")
+        except ValueError:
+            ratio_max = 10.0
+        if ratio_max <= 0 or ref_pf is None or len(ref_pf) == 0:
+            return ref_pf
+        own = self._archive_pf_objective_points()
+        if own is None or own.size == 0:
+            return ref_pf
+        eps = 1e-9
+        bad_axes = []
+        for ax, name in ((0, "cost"), (1, "wait")):
+            m_own = max(float(np.median(own[:, ax])), eps)
+            m_ref = max(float(np.median(np.asarray(ref_pf)[:, ax])), eps)
+            r = max(m_own / m_ref, m_ref / m_own)
+            if r > ratio_max:
+                bad_axes.append(f"{name} 中央値比 {r:.1f}x (own={m_own:.3g} ref={m_ref:.3g})")
+        if not bad_axes:
+            return ref_pf
+        if not getattr(self, "_ref_pf_guard_warned", False):
+            self._ref_pf_guard_warned = True
+            print(
+                f"[REF_PF] スケール不整合ガード発動: {ref_path} をスキップ "
+                f"({'; '.join(bad_axes)} > {ratio_max:g}x)。参照前線は command pool へ"
+                "混ぜません(PCN_REF_PF_GUARD_RATIO=0 で無効化可)。",
+                flush=True,
+            )
+        return None
 
     def _pf_command_horizon(self, cost: float, wait: float, entries=None) -> np.float32:
         """PF 点に近い archive エピソード長を horizon に使う。"""
@@ -3651,9 +4414,21 @@ class PCN(MOAgent, MOPolicy):
                 ref_pf = load_ref_pf(Path(ref_path))
             except Exception as e:
                 print(f"警告: PCN_REF_PF_NPZ 読み込み失敗 ({ref_path}): {e}")
+        if ref_pf is not None and not getattr(self, "_ref_pf_logged", False):
+            # [REF_PF] オプトイン使用の明示ログ(起動後の初回のみ)。既定では REF_PF は
+            # 未設定=混入なし(2026-08-06 バグ修正: workload profile の既定セットを廃止)。
+            self._ref_pf_logged = True
+            print(
+                f"[REF_PF] 使用: {ref_path} 点数={len(ref_pf)} "
+                f"cost=[{ref_pf[:, 0].min():.3g}, {ref_pf[:, 0].max():.3g}] "
+                f"wait=[{ref_pf[:, 1].min():.3g}, {ref_pf[:, 1].max():.3g}]",
+                flush=True,
+            )
+        if ref_pf is not None:
+            ref_pf = self._ref_pf_scale_guard(ref_pf, ref_path)
         if mode == "pf_ref":
             pools = [ref_pf] if ref_pf is not None else []
-        elif mode in ("pf_mixed", "pf_stratified", "pf_archive", "gap"):
+        elif mode in ("pf_mixed", "pf_stratified", "pf_archive", "gap", "coverage"):
             pools = [self._archive_pf_objective_points()]
             if ref_pf is not None:
                 pools.append(ref_pf)
@@ -3668,8 +4443,16 @@ class PCN(MOAgent, MOPolicy):
             print("警告: PF command pool が空です。デフォルト command を返します。")
             return [default_cmd] * n_commands
 
-        if mode == "gap":
+        if _CMD_LOCAL_STEP:
+            # [PCN_CMD_LOCAL_STEP] pick生成を隣接間隔ベースの局所ステップへ置換(他は従来どおり)
+            picks = self._local_step_picks_from_pf(pf_pool, n_commands)
+        elif mode == "gap":
             picks = self._gap_directed_sample(pf_pool, n_commands)
+        elif mode == "coverage":
+            picks = self._coverage_directed_sample(
+                pf_pool, n_commands,
+                low_wait_frac=low_wait_frac, low_wait_quota=low_wait_quota,
+                low_wait_max=low_wait_max, include_extremes=include_extremes)
         else:
             picks = stratified_sample_pf(
                 pf_pool,
@@ -3680,6 +4463,30 @@ class PCN(MOAgent, MOPolicy):
                 low_wait_max=low_wait_max,
                 include_extremes=include_extremes,
             )
+        # [PCN_CMD_REACH_CLAMP] 注文を「到達済み(archive PF)の端 × 係数」で頭打ちにする(既定OFF)。
+        # anchor(全クラウド端=真PF上限の2.3倍)や端外挿が実現不能域の注文を作ると、達成は頭打ちに
+        # なるので注文と達成のズレだけが増える。到達幅(archive の端)は残したまま外側だけ削る。
+        if _CMD_REACH_CLAMP > 1.0 and picks:
+            _ach = np.asarray(pools[0], dtype=np.float64) if pools and pools[0] is not None else None
+            if _ach is not None and _ach.size:
+                _cmax = float(_ach[:, 0].max()) * _CMD_REACH_CLAMP
+                _wmax = float(_ach[:, 1].max()) * _CMD_REACH_CLAMP
+                if not getattr(self, "_reach_clamp_logged", False):
+                    self._reach_clamp_logged = True
+                    print(f"[CMD_REACH_CLAMP] x{_CMD_REACH_CLAMP:g} 注文上限 cost<={_cmax:.4g} "
+                          f"wait<={_wmax:.4g} (到達済みarchive端基準)", flush=True)
+                picks = [(min(float(c), _cmax), min(float(w), _wmax)) for c, w in picks]
+        # [PCN_CMD_WAIT_ZERO] 廃止(2026-08-28・ユーザ指示)。注文の wait 成分を 0 にしていたが、
+        # 待ち0は物理的に到達不能な注文なので方策がクラウド極へ倒れたまま戻らない。
+        # 実証: main100 は100 iter すべてで誤差の100%が「達成>注文」の片側(飽和の署名)、
+        # 正規化HVも 0.571 と v9(0.737)・fast100(0.778)に劣後した。
+        # 経緯(残す): この挙動は n_jobs バグ修正(2026-08-27)以前の事実上の既定で、v9/main100 は
+        # これで回っている。両runのログを読むときは「注文のwaitは常に0だった」前提で解釈すること。
+        # 環境変数を立てても無視するが、黙って挙動が変わると事故なので警告を出す。
+        if os.environ.get("PCN_CMD_WAIT_ZERO") == "1" and not getattr(self, "_cmd_wait_zero_warned", False):
+            self._cmd_wait_zero_warned = True
+            print("[PCN_CMD_WAIT_ZERO] 廃止済みのため無視する(待ち0は到達不能な注文)。"
+                  "過去runの再現が目的ならこのコミットより前を使うこと。", flush=True)
         results = []
         for cost, wait in picks:
             c, w = float(cost), float(wait)
@@ -3693,6 +4500,97 @@ class PCN(MOAgent, MOPolicy):
             base = np.array([-w * nj, -c], dtype=np.float32)
             results.append((np.float32(dr), hz, np.float32(base)))
         return results
+
+    def _coverage_directed_sample(self, pf_pool, n_commands, *, low_wait_frac=0.0,
+                                  low_wait_quota=0, low_wait_max=0.0,
+                                  include_extremes=True):
+        """[PCN_CHOOSE_COMMANDS_MODE=coverage] カバレッジ駆動の注文選択。
+
+        動機(2026-08-08 実測): 改善ループの replay は 2128 本のうち 439 本が「真の前線に
+        一致するエピソード」だが、指している前線点は 4/76 種類しかない(同じ数点を数百回コピー)。
+        一方 76 点を別々に持つ理想教師なら 66/76 ヒット・同コスト超過待ち 0 秒に到達する。
+        つまり足りないのは表現力ではなく「まだ触っていない領域を注文すること」。
+
+        方式:
+          (a) 達成済み点(archive 全点, 重複除去)を cost 軸の格子に落として区画ごとの占有数を数える。
+              格子は既定 log スケール(PCN_COVERAGE_SCALE=log|linear): 真の前線は安い側に密集する
+              (18J では 76 点中 28 点が全 cost レンジの最初の 1/32)ので、線形格子だと安い側が
+              1 区画に潰れて分解できない。
+          (b) 空き/薄い区画ほど高い確率で選び(重み = 1/(1+占有数)^PCN_COVERAGE_ALPHA)、
+              その区画内の cost を注文にする。wait は「今の到達前線を内挿した値 × (1-改善ナッジ)」。
+              cost は到達済みレンジ [front_min, front_max] にクリップ = 外挿しすぎない。
+          (c) PCN_COVERAGE_LEGACY_FRAC (既定 0.25) の割合は従来の stratified_sample_pf を混ぜ、
+              既に取れている良い点の維持(安定性)を保つ。
+
+        ノブ: PCN_COVERAGE_BINS(既定32) / PCN_COVERAGE_ALPHA(既定1.0) /
+              PCN_COVERAGE_LEGACY_FRAC(既定0.25) / PCN_COVERAGE_IMPROVE(既定0.04) /
+              PCN_COVERAGE_SCALE(既定log)。
+        """
+        from src.utils.pf_command_eval import stratified_sample_pf
+
+        def _legacy(n):
+            if n <= 0:
+                return []
+            return list(stratified_sample_pf(
+                pf_pool, n, rng=self.np_random, low_wait_frac=low_wait_frac,
+                low_wait_quota=low_wait_quota, low_wait_max=low_wait_max,
+                include_extremes=include_extremes))
+
+        pts = np.asarray(pf_pool, dtype=np.float64)
+        if pts.shape[0] < 2:
+            return _legacy(n_commands) or [(0.0, 0.0)]
+        pts = pts[np.argsort(pts[:, 0])]
+        c, w = pts[:, 0], pts[:, 1]
+        lo, hi = float(c[0]), float(c[-1])
+        nbins = max(2, int(os.environ.get("PCN_COVERAGE_BINS", "32")))
+        alpha = max(0.0, float(os.environ.get("PCN_COVERAGE_ALPHA", "1.0")))
+        legacy_frac = float(np.clip(float(os.environ.get("PCN_COVERAGE_LEGACY_FRAC", "0.25")), 0.0, 1.0))
+        improve = float(os.environ.get("PCN_COVERAGE_IMPROVE", "0.04"))
+        use_log = os.environ.get("PCN_COVERAGE_SCALE", "log").strip().lower() != "linear"
+        if not (hi > lo):
+            return _legacy(n_commands)
+
+        def fwd(x):
+            x = np.maximum(np.asarray(x, dtype=np.float64), 0.0)
+            return np.log1p(x) if use_log else x
+
+        def inv(y):
+            return np.expm1(y) if use_log else y
+
+        edges = np.linspace(float(fwd(lo)), float(fwd(hi)), nbins + 1)
+        try:
+            occ = self._archive_objective_points()
+        except Exception:
+            occ = np.empty((0, 2), dtype=np.float64)
+        cnt = np.zeros(nbins, dtype=np.float64)
+        if occ is not None and np.asarray(occ).size:
+            uniq = np.unique(np.round(np.asarray(occ, dtype=np.float64), decimals=3), axis=0)
+            b = np.clip(np.digitize(fwd(uniq[:, 0]), edges) - 1, 0, nbins - 1)
+            cnt = np.bincount(b, minlength=nbins).astype(np.float64)
+        wts = 1.0 / np.power(1.0 + cnt, alpha)
+        s = float(wts.sum())
+        wts = (wts / s) if (np.isfinite(s) and s > 0) else np.full(nbins, 1.0 / nbins)
+
+        n_cov = int(round(n_commands * (1.0 - legacy_frac)))
+        picks = []
+        if n_cov > 0:
+            alloc = self.np_random.multinomial(n_cov, wts)
+            for bi, k in enumerate(alloc):
+                for _ in range(int(k)):
+                    t = float(self.np_random.uniform(0.0, 1.0))
+                    cc = float(inv(edges[bi] + t * (edges[bi + 1] - edges[bi])))
+                    cc = float(np.clip(cc, lo, hi))
+                    ww = float(np.interp(cc, c, w)) * (1.0 - improve)
+                    picks.append((max(0.0, cc), max(0.0, ww)))
+        picks.extend(_legacy(n_commands - len(picks)))
+        if not getattr(self, "_coverage_logged", False):
+            self._coverage_logged = True
+            print(f"[COVERAGE] カバレッジ駆動の注文を有効化: bins={nbins} "
+                  f"scale={'log' if use_log else 'linear'} alpha={alpha:g} "
+                  f"legacy_frac={legacy_frac:g} improve={improve:g} / "
+                  f"到達cost=[{lo:.4g}, {hi:.4g}] 空き区画={int((cnt == 0).sum())}/{nbins}",
+                  flush=True)
+        return picks[:n_commands]
 
     def _gap_directed_sample(self, pf_pool, n_commands):
         """賢いコマンド選択(gap): PF の疎な帯（大きい cost 間隙＝「足りないところ」）に
@@ -3727,10 +4625,322 @@ class PCN(MOAgent, MOPolicy):
                 picks.append((float(c[i]), float(w[i])))
         return picks
 
-    def _choose_commands_batch(self, num_episodes: int, n_commands: int):
+    def convergence_stats(self) -> dict:
+        """PF収束の観測(原著PCNの自己焼きなましの見える化)。
+
+        命令ナッジは ND 集合の std に比例(U(0, s·α))するため、フロントが改善を
+        止めると std が縮み命令が達成点に漸近=「同じ点を支持し続ける」状態になる。
+        ここでは毎 iteration:
+        - n_nd: archive ND 点数(多様性・数)
+        - n_new: 前回 ND に(正規化距離 eps 内で)存在しなかった新規点数
+        - disp: 現 ND 各点→前回 ND への最近傍距離の平均(正規化)=フロントの動き
+        - nd_std: ND 集合の正規化 std 平均(=ナッジ源の大きさ)
+        を返し、「n_new==0 かつ disp<PCN_CONVERGE_EPS」の連続回数 streak を数える。
+        streak>=PCN_CONVERGE_K で converged=True。
+        """
+        eps = float(os.environ.get("PCN_CONVERGE_EPS", "0.01"))
+        k_need = int(os.environ.get("PCN_CONVERGE_K", "5"))
+        pts = self._archive_pf_objective_points()
+        if pts.size == 0:
+            return {}
+        prev = getattr(self, "_conv_prev_nd", None)
+        lo = pts.min(axis=0)
+        span = np.maximum(pts.max(axis=0) - lo, 1e-9)
+        cur_n = (pts - lo) / span
+        nd_std = float(cur_n.std(axis=0).mean())
+        n_new = pts.shape[0]
+        disp = 1.0
+        if prev is not None and prev.size:
+            prev_n = (prev - lo) / span
+            d = np.linalg.norm(cur_n[:, None, :] - prev_n[None, :, :], axis=-1).min(axis=1)
+            n_new = int((d > eps).sum())
+            disp = float(d.mean())
+        self._conv_prev_nd = pts.copy()
+        stalled = (n_new == 0) and (disp < eps)
+        self._conv_streak = getattr(self, "_conv_streak", 0) + 1 if stalled else 0
+        converged = self._conv_streak >= k_need
+        if converged:
+            self._converged = True
+        return {"n_nd": int(pts.shape[0]), "n_new": n_new, "disp": disp,
+                "nd_std": nd_std, "streak": int(self._conv_streak), "converged": bool(converged)}
+
+    def collapse_diag_stats(self, n_obs: int = 8, n_cmd: int = 5) -> str:
+        """条件付け崩壊の診断(読み取り専用・学習非破壊)。
+
+        1行のログ文字列を返す:
+        - replay組成: episode先頭costの6帯ヒスト(0〜現在max) → データ劣化(H1)の観測
+        - cmd_sens: 固定obs集合×PF両端+中間のn_cmd命令で action分布のペア平均L1/2(全変動)
+                    → 「命令を変えると挙動が変わるか」の挙動レベル感度。崩壊=0に漸近
+        - gamma_dev/beta_mag: FiLM変調量 |γ-1|,|β| の平均 → 命令経路の生死(H2)
+        - wnorm: 全体/命令経路(film/c_emb)/s_emb/fc の重みL2 → ノルム膨張→飽和(H2)
+        """
+        import torch as th
+        entries = self._valid_replay_entries()
+        if not entries:
+            return ""
+        costs = []
+        for e in entries:
+            ov = getattr(e[2][0], "objective_values", None)
+            if ov is not None:
+                costs.append(float(ov[0]))
+        costs = np.asarray(costs, dtype=np.float64)
+        cmax = float(costs.max()) if costs.size else 1.0
+        hist = np.histogram(costs, bins=6, range=(0.0, max(cmax, 1e-9)))[0].tolist() if costs.size else []
+
+        # 命令感度プローブ: obs は replay 先頭 transition から等間隔に n_obs 個
+        step = max(1, len(entries) // n_obs)
+        obs_list = [entries[i][2][0].observation for i in range(0, len(entries), step)][:n_obs]
+        pf = self._archive_pf_objective_points()
+        if pf.size == 0 or len(obs_list) == 0:
+            return f"replay_hist={hist} cmax={cmax:.3g} cmd_sens=NA"
+        pf = pf[np.argsort(pf[:, 0])]
+        nj = self._policy_n_jobs()
+        fr = np.linspace(0.0, 1.0, n_cmd)
+        cmds = []
+        for t in fr:
+            c = pf[0, 0] + t * (pf[-1, 0] - pf[0, 0])
+            w = pf[0, 1] + t * (pf[-1, 1] - pf[0, 1])
+            cmds.append(self._objectives_to_desired_return(c, w, nj))
+        dev = next(self.model.parameters()).device
+        obs_t = th.as_tensor(np.stack(obs_list), dtype=th.float32, device=dev)
+        hz_t = th.full((len(obs_list), 1), float(nj), dtype=th.float32, device=dev)
+        gamma_devs, beta_mags = [], []
+        hooks = []
+        if hasattr(self.model, "film_gamma"):
+            hooks.append(self.model.film_gamma.register_forward_hook(
+                lambda m, i, o: gamma_devs.append(float(o.abs().mean()))))
+            hooks.append(self.model.film_beta.register_forward_hook(
+                lambda m, i, o: beta_mags.append(float(o.abs().mean()))))
+        was_training = self.model.training
+        self.model.eval()
+        probs = []
+        try:
+            with th.no_grad():
+                for dr in cmds:
+                    dr_t = th.as_tensor(np.tile(dr, (len(obs_list), 1)), dtype=th.float32, device=dev)
+                    logp = self.model(obs_t, dr_t, hz_t)
+                    probs.append(th.exp(logp).cpu().numpy())
+        finally:
+            if was_training:
+                self.model.train()
+            for h in hooks:
+                h.remove()
+        P = np.stack(probs)  # [n_cmd, n_obs, n_action]
+        sens = []
+        for i in range(len(cmds)):
+            for j in range(i + 1, len(cmds)):
+                sens.append(np.abs(P[i] - P[j]).sum(axis=-1).mean() / 2.0)
+        cmd_sens = float(np.mean(sens)) if sens else 0.0
+
+        def _wnorm(mods):
+            s = 0.0
+            for m in mods:
+                if m is None:
+                    continue
+                for p in m.parameters():
+                    s += float(p.detach().norm() ** 2)
+            return s ** 0.5
+        w_cmd = _wnorm([getattr(self.model, "film_gamma", None), getattr(self.model, "film_beta", None),
+                        getattr(self.model, "c_emb", None)])
+        w_s = _wnorm([getattr(self.model, "s_emb", None)])
+        w_fc = _wnorm([getattr(self.model, "fc", None)])
+        w_tot = _wnorm([self.model])
+        g = float(np.mean(gamma_devs)) if gamma_devs else float("nan")
+        b = float(np.mean(beta_mags)) if beta_mags else float("nan")
+        return (f"replay_hist={hist} cmax={cmax:.3g} cmd_sens={cmd_sens:.4f} "
+                f"gamma_dev={g:.4f} beta_mag={b:.4f} "
+                f"wnorm_tot={w_tot:.2f} wnorm_cmd={w_cmd:.2f} wnorm_s={w_s:.2f} wnorm_fc={w_fc:.2f}")
+
+    def _choose_commands_mpft(self, n_commands: int, iteration=None):
+        """MPFT型 端→内側掃引の command 生成。
+
+        杭 = 現 archive PF の両端点(+PCN_PF_COMMAND_ANCHORS の calibration 端点)。
+        命令バッチの ENDPOINT_QUOTA を杭そのものに固定し、残りは cost 正規化位置
+        p∈[0,r]∪[1-r,1] の PF 点から一様サンプル。r は iteration とともに
+        START_FRAC→0.5 へ線形拡大＝端から内側へなぞる。掃引命令には Pareto 方向の
+        微小ナッジ(wait×(1-IMPROVE))を掛け、杭は達成値そのまま(達成可能=RCSL安全)。
+        """
+        if iteration is not None:
+            self._mpft_iter = int(iteration)
+        else:
+            self._mpft_iter = int(getattr(self, "_mpft_iter", 0)) + 1
+        it = self._mpft_iter
+
+        pool = self._archive_pf_objective_points()
+        if _PF_COMMAND_ANCHORS > 0:
+            from src.utils.pf_command_eval import merge_pf_pools
+            anchors = self._anchor_command_points(_PF_COMMAND_ANCHORS)
+            if anchors.size:
+                pool = merge_pf_pools(pool, anchors) if pool.size else anchors
+        if pool.size == 0 or pool.shape[0] < 2:
+            # PF が育つ前(初期 iteration)は論文準拠の単発選択で場をつなぐ
+            out = []
+            for _ in range(n_commands):
+                dr, hz = self._choose_commands(50)
+                out.append((dr, hz, np.zeros(self.reward_dim, dtype=np.float32)))
+            return out
+
+        pts = pool[np.argsort(pool[:, 0])]
+        c, w = pts[:, 0], pts[:, 1]
+        span = max(float(c[-1] - c[0]), 1e-9)
+        p = (c - c[0]) / span  # cost 正規化位置 0(安端)〜1(高端)
+
+        if _MPFT_GATED:
+            # 達成ゲート: reach は mpft_gate_update() が「マスターしたら」だけ広げる。
+            reach = float(np.clip(getattr(self, "_mpft_reach", _MPFT_START_FRAC),
+                                  _MPFT_START_FRAC, 0.5))
+        else:
+            reach = float(np.clip(
+                _MPFT_START_FRAC + (0.5 - _MPFT_START_FRAC) * (it / max(_MPFT_FULL_ITER, 1.0)),
+                _MPFT_START_FRAC, 0.5,
+            ))
+        lo_i = np.where(p <= reach)[0]
+        hi_i = np.where(p >= 1.0 - reach)[0]
+        if lo_i.size == 0:
+            lo_i = np.array([0])
+        if hi_i.size == 0:
+            hi_i = np.array([len(pts) - 1])
+
+        n_stake = max(2, int(round(n_commands * _MPFT_ENDPOINT_QUOTA)))
+        picks = []  # (cost, wait, is_stake)
+        for k in range(n_stake):
+            i = 0 if k % 2 == 0 else len(pts) - 1  # 両端の杭を交互に
+            picks.append((float(c[i]), float(w[i]), True))
+        for k in range(n_commands - n_stake):
+            seg = lo_i if k % 2 == 0 else hi_i  # 低cost側/高cost側を交互に掃引
+            i = int(seg[self.np_random.integers(0, len(seg))])
+            picks.append((float(c[i]), float(w[i]), False))
+
+        if it % 10 == 1 or it <= 1:
+            print(f"[MPFT] iter={it} reach={reach:.3f} pool={len(pts)} "
+                  f"帯: 低側{len(lo_i)}点/高側{len(hi_i)}点 杭=({c[0]:.3g},{w[0]:.3g})/({c[-1]:.3g},{w[-1]:.3g}) "
+                  f"命令 {n_commands} (杭{n_stake})", flush=True)
+
+        nj = self._policy_n_jobs()
+        results = []
+        for cost, wait, is_stake in picks:
+            ww = wait if is_stake else max(0.0, wait * (1.0 - _MPFT_IMPROVE))
+            dr = self._objectives_to_desired_return(cost, ww, nj)
+            hz = self._pf_command_horizon(cost, wait)
+            base = np.array([-wait * nj, -cost], dtype=np.float32)
+            results.append((np.float32(dr), hz, np.float32(base)))
+        return results
+
+    def mpft_gate_update(self, eval_pf, ref_pts) -> dict:
+        """達成ゲート: 今の前線帯(cost正規化位置 [0,reach]∪[1-reach,1])を eval PF が
+        archive PF に対しどれだけ一発再現できているか測り、gap<eps でマスター判定。
+        PATIENCE 回連続でマスターしたら reach を STEP 広げる（=単調に前進）。
+
+        driver が毎 eval で (eval_pf=到達非支配, ref_pts=archive PF) を渡す。返り値は診断用。
+        """
+        reach = float(getattr(self, "_mpft_reach", _MPFT_START_FRAC))
+        ep = np.asarray(eval_pf, dtype=np.float64).reshape(-1, 2)
+        rp = np.asarray(ref_pts, dtype=np.float64).reshape(-1, 2)
+        if ep.shape[0] == 0 or rp.shape[0] < 2:
+            return {"reach": reach, "gap": None, "mastered": False, "advanced": False}
+        # cost 正規化位置で前線帯の archive PF 点を抽出
+        cspan = max(float(rp[:, 0].max() - rp[:, 0].min()), 1e-9)
+        wspan = max(float(rp[:, 1].max() - rp[:, 1].min()), 1e-9)
+        p = (rp[:, 0] - rp[:, 0].min()) / cspan
+        front = rp[(p <= reach) | (p >= 1.0 - reach)]
+        if front.shape[0] == 0:
+            front = rp
+        # 各前線 archive 点に対する eval PF 最近傍の正規化距離 = 一発再現gap
+        d = np.sqrt(((front[:, None, 0] - ep[None, :, 0]) / cspan) ** 2
+                    + ((front[:, None, 1] - ep[None, :, 1]) / wspan) ** 2).min(axis=1)
+        gap = float(d.mean())
+        mastered = gap < _MPFT_GATE_EPS
+        npass = int(getattr(self, "_mpft_gate_pass", 0))
+        advanced = False
+        if mastered:
+            npass += 1
+            if npass >= _MPFT_GATE_PATIENCE and reach < 0.5:
+                reach = float(min(0.5, reach + _MPFT_GATE_STEP))
+                npass = 0
+                advanced = True
+        else:
+            npass = 0
+        self._mpft_reach = reach
+        self._mpft_gate_pass = npass
+
+        # 学習量の適応: 改善(=前進 or 同一reachで gap 低下)が起きたら n_updates 倍率を上げ、
+        # 伸び悩んだら 1.0 へ戻す。倍率は learn() が読んで n_updates に掛ける。
+        mult = float(getattr(self, "_mpft_updates_mult", 1.0))
+        if _MPFT_VOL_ADAPT:
+            prev = getattr(self, "_mpft_prev_gap", None)
+            improved = advanced or (prev is not None and (not advanced) and gap < prev - _MPFT_VOL_IMPROVE_EPS)
+            if improved:
+                mult = float(min(_MPFT_VOL_MAX, mult * _MPFT_VOL_RAMP))
+            else:
+                mult = float(max(1.0, mult * _MPFT_VOL_DECAY))
+            self._mpft_updates_mult = mult
+            # reach が進んだ直後は帯が変わり gap がジャンプするので基準をリセット
+            self._mpft_prev_gap = None if advanced else gap
+
+        print(f"[MPFT_GATE] front_gap={gap:.3f} eps={_MPFT_GATE_EPS} "
+              f"mastered={mastered} pass={npass} reach={reach:.3f}"
+              + (f" vol×{mult:.2f}" if _MPFT_VOL_ADAPT else "")
+              + ("  → 前進" if advanced else ""), flush=True)
+        return {"reach": reach, "gap": gap, "mastered": mastered, "advanced": advanced,
+                "updates_mult": mult}
+
+    @staticmethod
+    def _hv2d_min(pf: np.ndarray, ref: np.ndarray) -> float:
+        """2D最小化のhypervolume(ref=最悪角)。フロント品質の単一指標。"""
+        pf = pf[(pf[:, 0] <= ref[0]) & (pf[:, 1] <= ref[1])]
+        if pf.size == 0:
+            return 0.0
+        pf = pf[np.argsort(pf[:, 0])]
+        hv = 0.0
+        pw = float(ref[1])
+        for c, w in pf:
+            hv += (ref[0] - c) * (pw - w)
+            pw = w
+        return float(hv)
+
+    def adapt_balance_power(self, eval_pf, ref_pts=None) -> dict:
+        """command balance power を「到達PFのHVを最大化」する山登りで自己調整。
+        left_frac は power に鈍感だったので、実目的HV(power)の山(≈0.5でピーク)を直接登る。
+        HVが上がる限り同方向へ進み、下がったら反転してstepを半減=頂点に収束。手動powerを消す。
+        nadir は archive(ref_pts, 全域を張り安定)の最悪角に固定 → 高cost到達でのHV水増しを防ぐ。"""
+        if not (_COMMAND_BALANCE and _COMMAND_BALANCE_ADAPT):
+            return {}
+        pf_all = np.asarray(eval_pf, dtype=np.float64).reshape(-1, 2)
+        if pf_all.shape[0] < 3:
+            return {}
+        nd_pf = pf_all[get_non_dominated_inds_minimize(pf_all)]
+        # nadir(最悪角)は archive(ref_pts, 全域・power非依存)に固定 → 高cost到達でのHV水増しを防ぐ。
+        nad = getattr(self, "_bal_nadir", None)
+        rp = np.asarray(ref_pts, dtype=np.float64).reshape(-1, 2) if ref_pts is not None else None
+        if nad is None:
+            nad = (np.array([rp[:, 0].max(), rp[:, 1].max()]) if rp is not None and rp.shape[0] >= 2
+                   else np.array([pf_all[:, 0].max(), pf_all[:, 1].max()], dtype=np.float64))
+            self._bal_nadir = nad
+        hv = self._hv2d_min(nd_pf, nad * 1.02)
+
+        p = float(getattr(self, "_bal_power_cur", _COMMAND_BALANCE_POWER))
+        last_hv = getattr(self, "_bal_last_hv", None)
+        d = float(getattr(self, "_bal_dir", 1.0))
+        step = float(getattr(self, "_bal_step", _COMMAND_BALANCE_STEP))
+        if last_hv is None:
+            p_new = p + d * step
+        elif hv >= last_hv * 0.995:  # 改善→同方向
+            p_new = p + d * step
+        else:                         # 悪化→反転してstep半減(頂点へ収束)
+            d = -d; step = max(step * 0.5, 0.03); p_new = p + d * step
+        p_new = float(min(_COMMAND_BALANCE_PMAX, max(0.0, p_new)))
+        self._bal_last_hv = hv; self._bal_dir = d; self._bal_step = step
+        self._bal_power_cur = p_new
+        self._apply_return_normalization_to_model()
+        print(f"[BAL_ADAPT] hv={hv:.3e} power {p:.2f}->{p_new:.2f} step={step:.2f}", flush=True)
+        return {"hv": hv, "power": p_new}
+
+    def _choose_commands_batch(self, num_episodes: int, n_commands: int, iteration=None):
         """分散実行向け: 論文準拠の単発選択を複数回サンプリングする。"""
+        if _MPFT_SWEEP:
+            return self._choose_commands_mpft(n_commands, iteration)
         mode = os.environ.get("PCN_CHOOSE_COMMANDS_MODE", "paper").strip().lower()
-        if mode in ("pf_archive", "pf_mixed", "pf_stratified", "pf_ref", "gap"):
+        if mode in ("pf_archive", "pf_mixed", "pf_stratified", "pf_ref", "gap", "coverage"):
             return self._choose_commands_batch_from_pf(n_commands)
         # 戻り値要素:
         # (desired_return, desired_horizon, base_return)
@@ -3740,6 +4950,13 @@ class PCN(MOAgent, MOPolicy):
             np.float32(40),
             np.zeros(self.reward_dim, dtype=np.float32),
         )
+        if _CMD_LOCAL_STEP:
+            # [PCN_CMD_LOCAL_STEP] 論文式(σベース上乗せ)を隣接間隔ベースの局所ステップへ置換
+            results = self._choose_commands_local_step(num_episodes, n_commands)
+            if results is not None:
+                return results
+            print("警告: コマンド選択用のエピソードが見つかりませんでした。デフォルト値を返します。")
+            return [default_cmd] * n_commands
         episodes = self._nlargest(num_episodes)
         if len(episodes) == 0:
             print("警告: コマンド選択用のエピソードが見つかりませんでした。デフォルト値を返します。")
@@ -3859,6 +5076,13 @@ class PCN(MOAgent, MOPolicy):
         # print(f"目標: 報酬={desired_return}, ステップ数={desired_horizon}")
 
         _cost_hold_target = float(np.asarray(desired_return, dtype=np.float32)[1]) if _COST_HOLD else None
+        # [SCHEDULER_OBS_BUDGET_RATIO] env が対応していれば、最初の行動選択前にも初期予算を
+        # 反映しておく(既定OFFは _obs_budget_ratio=False のままなので下の分岐を一切通らず
+        # ビット不変)。
+        _obs_budget_ratio = getattr(env, "_obs_budget_ratio", False)
+        if _obs_budget_ratio:
+            env.set_remaining_budget(float(-np.asarray(desired_return, dtype=np.float32)[1]))
+            obs = env.get_observation()
         while not done:
             policy_obs = self._obs_for_policy(env, obs)
             action = self._act(policy_obs, desired_return, desired_horizon, eval_mode)
@@ -3870,7 +5094,23 @@ class PCN(MOAgent, MOPolicy):
             n_obs, reward, scheduled, wt_step, done = env.step(env_action)
             if _ar_gene is not None and scheduled:
                 _ar_job_idx += 1
-            
+
+            wt_sum += wt_step
+            # 学習データ生成（Actor）はクリップなしで残り return を更新する。評価も同じ条件に揃える。
+            desired_return = (desired_return - reward).astype(np.float32, copy=False)
+            if _COST_HOLD:
+                desired_return[1] = _cost_hold_target  # [anti-ration] cost目標を一定保持
+            if not eval_mode and np.all(np.isfinite(max_return)):
+                desired_return = np.clip(desired_return, None, max_return, dtype=np.float32)
+            if _obs_budget_ratio:
+                # [SCHEDULER_OBS_BUDGET_RATIO] n_obs(=次ステップの現ジョブ観測)が「このステップ
+                # 支払い後の残り予算」を反映するよう、Transition構築前にenv側へ反映してから
+                # n_obs を再構築する(get_observationは副作用なしの純関数)。
+                env.set_remaining_budget(float(-desired_return[1]))
+                n_obs = env.get_observation()
+            if scheduled:
+                desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
+
             if done:
                 fin = getattr(env, "finalize_window_history", None)
                 if fin is not None:
@@ -3879,7 +5119,7 @@ class PCN(MOAgent, MOPolicy):
                         fin(build_maps=build_maps)
                     else:
                         fin()
-                
+
             transitions.append(
                 Transition(
                     observation=obs,
@@ -3890,15 +5130,6 @@ class PCN(MOAgent, MOPolicy):
                 )
             )
             obs = n_obs
-            wt_sum += wt_step
-            # 学習データ生成（Actor）はクリップなしで残り return を更新する。評価も同じ条件に揃える。
-            desired_return = (desired_return - reward).astype(np.float32, copy=False)
-            if _COST_HOLD:
-                desired_return[1] = _cost_hold_target  # [anti-ration] cost目標を一定保持
-            if not eval_mode and np.all(np.isfinite(max_return)):
-                desired_return = np.clip(desired_return, None, max_return, dtype=np.float32)
-            if scheduled:
-                desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
         
         # エピソード完了後の結果表示
         # 注意: 累積報酬の計算は_add_episodeメソッドで行われるため、ここでは行わない
@@ -3948,15 +5179,6 @@ class PCN(MOAgent, MOPolicy):
     def eval(self, obs, w=None):
         """Evaluate policy action for a given observation."""
         return self._act(obs, self.desired_return, self.desired_horizon, eval_mode=True)
-    
-    def select_policy_by_certain_objective(self, e_returns, objective_index):
-        """特定の目的関数の値が最大となるようなポリシーを選択する"""
-        best_policy_index = np.argmax(np.array([e[objective_index] for e in e_returns]))
-        return e_returns[best_policy_index]
-    
-    def execute_selected_policy(self, env, best_policy):
-        """選択されたポリシーを実行する"""
-        self.run_episode(env, best_policy, max_return=np.full(np.inf, np.inf, dtype=np.float32), eval_mode=True)
     
     def evaluate_and_execute_selected_policy(self, env, max_return, objective_index, n=10):
         """特定の目的関数の値が最大となるようなポリシーを評価して実行する"""
@@ -4333,16 +5555,6 @@ class PCN(MOAgent, MOPolicy):
         if return_command_outcomes:
             return e_returns, e_values, distances, map_fin, eval_command_outcomes
         return e_returns, e_values, distances, map_fin
-
-    def plot_rewards(self, rewards):
-        waiting_times, cloud_costs = zip(*rewards)
-        plt.figure(figsize=(10, 6))
-        plt.scatter(waiting_times, cloud_costs, c='blue', alpha=0.5)
-        plt.title('Reward Points: Waiting Time vs Cloud Cost')
-        plt.xlabel('Waiting Time')
-        plt.ylabel('Cloud Cost')
-        plt.grid(True)
-        plt.show()
 
     def save(self, filename: str = "PCN_model", savedir: str = "weights"):
         """保存時に一意のファイル名を生成して新規ファイルを作成"""
@@ -4782,15 +5994,6 @@ class PCN(MOAgent, MOPolicy):
         
         return self.e_returns
 
-    def get_e_returns(self):
-        return self.e_returns
-    
-    def get_transitions(self):
-        return self.transitions
-    
-    def get_mapmap(self):
-        return self.mapmap
-
     def visualize_evaluation_history(self, save_dir="evaluation_history"):
         """評価履歴を可視化し、固定ファイル名で上書き保存。
         報酬（最大化目的）と実数値（最小化目的）の両方のグラフを別々に表示する。
@@ -5060,91 +6263,6 @@ class PCN(MOAgent, MOPolicy):
             print(f"ファイルの保存中にエラーが発生しました: {e}")
             return None
 
-    def initialize_buffer_with_heuristics(self, env, num_episodes_per_pattern=5):
-        """事前知識ベースの初期探索のためのバッファ初期化"""
-        print("ヒューリスティックパターンによるバッファ初期化を開始...")
-        
-        # 初期化前にリプレイバッファを空にする
-        self.experience_replay = []
-        
-        # 各パターンの実行比率（0と1の選択確率）
-        patterns = [
-            0.0,   # 常に0を選択（オンプレミス優先）
-            1.0,   # 常に1を選択（クラウド優先）
-            0.25,  # 25%の確率で1を選択
-            0.5,   # 50%の確率で1を選択
-            0.75   # 75%の確率で1を選択
-        ]
-        
-        transitions_collected = 0
-        episodes_collected = 0
-        
-        for p_idx, p in enumerate(patterns):
-            print(f"パターン {p_idx+1}/5: 1の選択確率 = {p:.2f}")
-            
-            for ep in range(num_episodes_per_pattern):
-                transitions = []
-                obs = env.reset()
-                done = False
-                
-                # 各エピソードで異なるシードを使用して多様性を確保
-                # np.random.seed は 0..2**32-1 に収める必要がある
-                _raw = int(time.time() * 1000) + p_idx * 1000 + ep + int(self.global_step)
-                episode_seed = _raw % (2**32)
-                np.random.seed(episode_seed)
-                
-                while not done:
-                    # パターンに基づいて0または1のスカラー値を選択
-                    action = 1 if self.np_random.random() < p else 0
-                    
-                    n_obs, reward, scheduled, wt_step, done = env.step(action)
-                    
-                    if done:
-                        env.finalize_window_history()
-                    
-                    # Transitionオブジェクトを作成して保存
-                    transitions.append(
-                        Transition(
-                            observation=obs,
-                            action=action,
-                            reward=np.float32(reward).copy(),
-                            next_observation=n_obs,
-                            terminal=done
-                        )
-                    )
-                    
-                    obs = n_obs
-                    transitions_collected += 1
-                
-                # 報酬の計算
-                for i in reversed(range(len(transitions) - 1)):
-                    transitions[i].reward += self.gamma * transitions[i + 1].reward
-                
-                # ヒープを使って適切に追加
-                if len(transitions) > 0:
-                    # ヒープに追加するときは priority, step, transitions のタプルを使用
-                    # ここでは優先度を高く（1.0）設定して確実に保持されるようにする
-                    priority = float(1.0 + np.sum(transitions[0].reward) * 0.1)  # 報酬が高いほど優先度も高く
-                    heapq.heappush(self.experience_replay, (priority, self.global_step, transitions))
-                    episodes_collected += 1
-                    
-                    # グローバルステップを更新（学習の進行状況を正確に追跡するため）
-                    self.global_step += len(transitions)
-        
-        # バッファ内のエピソードが十分かチェック
-        if episodes_collected < 5:  # 最低でも5エピソードは必要
-            print(f"警告: ヒューリスティック初期化で収集されたエピソード数が少なすぎます({episodes_collected})。" +
-                  f"num_episodes_per_patternの値を大きくしてください。")
-        
-        print(f"ヒューリスティック初期化完了: {episodes_collected}エピソード、{transitions_collected}ステップのデータを収集")
-        print(f"バッファサイズ: {len(self.experience_replay)}エピソード")
-        
-        # バッファの内容を確認（デバッグ用）
-        if len(self.experience_replay) > 0:
-            returns = [e[2][0].reward for e in self.experience_replay]
-            avg_return = np.mean(returns, axis=0)
-            print(f"バッファ内の平均報酬: {avg_return}")
-
     def extract_env_info(self, env: Optional[gym.Env]) -> None:
         """Extracts all the features of the environment: observation space, action space, ..."""
         if env is not None:
@@ -5224,35 +6342,6 @@ class PCN(MOAgent, MOPolicy):
                 del self.global_steps_at_evaluation
         except:
             pass  # デストラクタでのエラーは無視
-
-    # PCNクラスに追加
-    def check_overfitting(self, test_data_size=100):
-        """同じデータでoverfittingチェック"""
-        if len(self.experience_replay) < test_data_size:
-            return False
-        
-        # 小さな固定データセットで学習
-        test_episodes = self.experience_replay[:test_data_size]
-        
-        # 同じデータで複数回学習
-        losses = []
-        for epoch in range(10):
-            # 同じデータで学習
-            loss, _ = self._update_on_fixed_data(test_episodes)
-            losses.append(loss.item())
-        
-        # 損失が減少するかチェック
-        if losses[-1] < losses[0] * 0.8:  # 20%以上減少
-            print("✓ Overfitting チェック: 学習可能")
-            return True
-        else:
-            print("⚠️  Overfitting チェック: 学習が困難")
-            return False
-
-    def _update_on_fixed_data(self, episodes):
-        """固定データでの学習"""
-        # 既存のupdateメソッドの簡略版
-        # ... 実装 ...
 
     def save_learning_data_to_file(self, filename="learning_data_debug.txt", sample_size=100):
         """学習データの詳細をファイルに書き込む

@@ -51,8 +51,6 @@ def apply_distributed_pcn_cli_env(
             os.environ.setdefault("PCN_TRAIN_MID_PF_WEIGHT", "0")
         os.environ.setdefault("PCN_CONDITIONING_SENS_WAIT_DR_THRESH", "0")
         os.environ.setdefault("DISTRIBUTED_PCN_EVAL_DIAG", "1")
-        os.environ.setdefault("PCN_EVAL_PF_GRID", "64")
-        os.environ.setdefault("PCN_EVAL_STOCHASTIC", "0")
         # value_repro(補助 value head 損失)は Phase3 後半で共有埋め込みを奪い、
         # 方策の command 応答を潰して eval(argmax)を片隅へ崩壊させることが分かったため既定 OFF。
         # （根本修正=正規化 + hinge-KL + cond_add + dropout で安定して全域 PF を獲得できる）

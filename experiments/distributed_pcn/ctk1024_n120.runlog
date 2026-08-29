@@ -1,0 +1,14 @@
+[ctk1024] START 14:53:15 NITER=120 SEEDS='1 2 3' (base + ct03, serial, name suffix _n120)
+[ctk1024] seed=1 base 14:53:15
+[ctk1024] ctk1024_base_1_n120 DONE exit=0 sec=2859 15:40:54
+[ctk1024] seed=1 ct03 15:40:54
+[ctk1024] ctk1024_ct03_1_n120 DONE exit=0 sec=3463 16:38:37
+[ctk1024] seed=2 base 16:38:37
+[ctk1024] ctk1024_base_2_n120 DONE exit=0 sec=3173 17:31:30
+[ctk1024] seed=2 ct03 17:31:30
+[ctk1024] ctk1024_ct03_2_n120 DONE exit=0 sec=2931 18:20:21
+[ctk1024] seed=3 base 18:20:21
+[ctk1024] ctk1024_base_3_n120 DONE exit=0 sec=3654 19:21:15
+[ctk1024] seed=3 ct03 19:21:15
+[ctk1024] ctk1024_ct03_3_n120 DONE exit=0 sec=3215 20:14:50
+[ctk1024] ALL DONE 20:14:50

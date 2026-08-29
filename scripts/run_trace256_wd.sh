@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# trace256 の振動対策A/B: run_trace256_lc.sh に PCN_WEIGHT_DECAY を入れただけ。
+# 重みノルム膨張(190→394)を抑えて追従振動が収まるか/iter100の62%が上がるかを見る。
+# 使い方: scripts/run_trace256_wd.sh [NITER] [WD]  例: scripts/run_trace256_wd.sh 100 1e-4
+set -u
+cd /home/noguchi/scheduler-sim-for-cb
+NITER="${1:-100}"
+WD="${2:-1e-4}"
+CFG=experiments/distributed_pcn/job_trace_256_pcn.yml
+OUT="experiments/distributed_pcn/run_trace256_wd${WD}"
+rm -rf "$OUT"; mkdir -p "$OUT"
+echo "[trace256_wd] NITER=$NITER WD=$WD OUT=$OUT START=$(date +%H:%M:%S)"
+PCN_WEIGHT_DECAY=$WD \
+PCN_FAST_UPDATE=1 \
+PCN_FOURIER_CMD=1 PCN_FOURIER_BANDS=4 PCN_FILM=1 \
+DISTRIBUTED_PCN_CONFIG=$CFG DISTRIBUTED_PCN_JOBS=256 DISTRIBUTED_PCN_OUTPUT_DIR=$OUT \
+SCHEDULER_OBS_URGENCY=1 \
+DISTRIBUTED_PCN_PHASE1_HEURISTIC_THRESHOLDS=0,50,150,500 DISTRIBUTED_PCN_PHASE1_HEURISTIC_EPISODES=8 \
+DISTRIBUTED_PCN_SUPERVISED_EPOCHS=50 DISTRIBUTED_PCN_N_ITERATIONS=$NITER \
+PCN_EVAL_ACTOR_POOL=8 \
+DISTRIBUTED_PCN_INITIAL_EPISODES=32 DISTRIBUTED_PCN_EVAL_INTERVAL=10 DISTRIBUTED_PCN_EVAL_SAMPLES=64 \
+DISTRIBUTED_PCN_REPLAY_TX_BUDGET=1200000 \
+PCN_TRAIN_KNEE_PF_WEIGHT=8 PCN_TRAIN_LOW_SLOPE_PF_WEIGHT=6 \
+PCN_TRAIN_LOW_WAIT_PF_WEIGHT=10 PCN_TRAIN_LOW_WAIT_MAX=0 PCN_TRAIN_LOW_WAIT_FRAC=0.30 \
+PCN_USE_AMP=0 PCN_OBS_LOG=1 \
+PCN_PHASE1_SWEEP_TRAIN_WEIGHT=10 PCN_PF_COMMAND_ANCHORS=16 \
+PCN_CHOOSE_COMMANDS_MODE=pf_archive DISTRIBUTED_PCN_CMD_OUTCOMES=1 \
+PYTHONUNBUFFERED=1 .venv/bin/python -u -m src.distributed.distributed_pcn_event \
+  --conditioning --mid-core --no-viz > "$OUT/train.log" 2>&1
+echo "[trace256_wd] DONE=$(date +%H:%M:%S) exit=$?"
+ls -d "$OUT"/*/iteration_* 2>/dev/null | wc -l

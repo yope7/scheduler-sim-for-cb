@@ -12,8 +12,10 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 COST_REF = 5.8e8   # 共通costグリッド上限(図のxlim 5.8億に一致)
+SEED_COLORS = {1: "#3b82f6", 2: "#f0902f", 3: "#10b981"}  # seed1=青 / seed2=橙 / seed3=緑
 
 
 def nd_front(pf):
@@ -44,9 +46,9 @@ def attain_wait(front, grid):
     return out
 
 
-def cell_surfaces(tag):
-    """そのセルの全seedの達成PF線と、共通グリッド上の50%中央達成面を返す。"""
-    fronts = []
+def cell_fronts(tag):
+    """そのセルの各seedの達成PFフロントを (seed番号, フロント) で返す。"""
+    out = []
     for i in [1, 2, 3]:
         p = f"/tmp/rich48b_{tag}_{i}.json"
         if not os.path.exists(p):
@@ -55,43 +57,30 @@ def cell_surfaces(tag):
             d = json.load(open(p))
             fr = nd_front(d.get("pf", []))
             if fr is not None and len(fr) >= 2:
-                fronts.append(fr)
+                out.append((i, fr))
         except Exception:
             pass
-    if not fronts:
-        return [], None, None
-    cmin = min(fr[:, 0].min() for fr in fronts)
-    grid = np.linspace(cmin, COST_REF, 200)
-    waits = np.vstack([attain_wait(fr, grid) for fr in fronts])  # (nseed, 200)
-    # 各cost水準で「達成しているseedが過半数(>=2/3)」の所だけ中央値→50%達成面
-    med = np.full(len(grid), np.nan)
-    for gi in range(len(grid)):
-        col = waits[:, gi]
-        col = col[~np.isnan(col)]
-        if len(col) >= (waits.shape[0] + 1) // 2:   # 過半数のseedが到達
-            med[gi] = np.median(col)
-    return fronts, grid, med
+    return out
 
 
 FW = [(0, 0), (0, 1), (1, 0), (1, 1)]   # 行: フーリエ, 重みサンプル
 ED = [(0, 0), (0, 1), (1, 0), (1, 1)]   # 列: 探索チューニング, 後回し
 onoff = {0: "-", 1: "ON"}
 fig, axes = plt.subplots(4, 4, figsize=(16, 16))
-nfilled = 0
+nfilled = 0; seen = set()
 for r, (F, W) in enumerate(FW):
     for c, (E, D) in enumerate(ED):
         ax = axes[r][c]
         tag = f"fc{F}{W}{E}{D}"
-        fronts, grid, med = cell_surfaces(tag)
+        fr_list = cell_fronts(tag)
         title = f"F:{onoff[F]} W:{onoff[W]} E:{onoff[E]} D:{onoff[D]}"
-        if fronts:
+        if fr_list:
             nfilled += 1
-            for fr in fronts:   # 薄い線=各seed(ばらつき)
-                ax.plot(fr[:, 0] / 1e8, fr[:, 1] / 1e3, "-", c="gray", lw=0.9, alpha=0.45)
-            ok = ~np.isnan(med)
-            ax.plot(grid[ok] / 1e8, med[ok] / 1e3, "-", c="crimson", lw=2.6,
-                    label="median (50%-attainment)")
-            ax.set_title(f"{title}\n3 seeds -> median front", fontsize=11)
+            for i, fr in fr_list:   # 各seedを色分け(ばらつきを直接見せる)
+                ax.plot(fr[:, 0] / 1e8, fr[:, 1] / 1e3, "-o", c=SEED_COLORS[i],
+                        ms=2.3, lw=1.3, alpha=0.9, label=f"seed{i}")
+                seen.add(i)
+            ax.set_title(f"{title}\n({len(fr_list)} seeds)", fontsize=11)
         else:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", fontsize=13, color="gray",
                     transform=ax.transAxes)
@@ -99,11 +88,12 @@ for r, (F, W) in enumerate(FW):
         ax.set_xlim(0, 5.8); ax.set_ylim(0, 160)
         ax.set_xlabel("Cost (x1e8)", fontsize=8); ax.set_ylabel("Wait (x1e3)", fontsize=8)
         ax.tick_params(labelsize=7); ax.grid(alpha=0.3)
-axes[0][0].legend(fontsize=8, loc="upper right")
-fig.suptitle("2^4 ablation PF grid (50% ATTAINMENT SURFACE)  rows=F(Fourier)/W(Weight-sampling), cols=E(Explore-tune)/D(Defer)\n"
-             "thin gray = each of 3 seeds   thick red = median front across seeds", fontsize=13)
+handles = [Line2D([0], [0], color=SEED_COLORS[i], marker="o", lw=1.3, ms=5, label=f"seed{i}") for i in sorted(seen)]
+fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.995, 0.995), ncol=len(handles), fontsize=11, framealpha=0.9)
+fig.suptitle("2^4 ablation PF grid (each seed color-coded)  rows=F(Fourier)/W(Weight-sampling), cols=E(Explore-tune)/D(Defer)\n"
+             "seed1=blue / seed2=orange / seed3=green", fontsize=13)
 fig.tight_layout(rect=[0, 0, 1, 0.97])
 os.makedirs("docs/figures", exist_ok=True)
 fig.savefig("docs/figures/factorial_pf_grid_attainment.png", dpi=85)
 print("[SAVED] docs/figures/factorial_pf_grid_attainment.png")
-print(f"埋まったマス: {nfilled}/16")
+print(f"埋まったマス: {nfilled}/16  seeds={sorted(seen)}")

@@ -1,0 +1,22 @@
+[weekB] START 15:42:34 6runs NITER=60 MAXJOBS=3
+[weekB] launch base rep=1 15:42:34
+[weekB] launch base rep=2 15:42:34
+[weekB] launch base rep=3 15:42:34
+[weekB] train base_1 exit=0 sec=1324 16:04:38
+[weekB] train base_2 exit=0 sec=1377 16:05:31
+[weekB] train base_3 exit=0 sec=1431 16:06:25
+[weekB] eval base_1 done 16:08:28
+[weekB] launch ct03 rep=1 16:08:35
+[weekB] eval base_2 done 16:09:03
+[weekB] launch ct03 rep=2 16:09:05
+[weekB] eval base_3 done 16:11:06
+[weekB] launch ct03 rep=3 16:11:16
+[weekB] train ct03_1 exit=0 sec=1436 16:32:31
+[weekB] train ct03_3 exit=0 sec=1276 16:32:32
+[weekB] train ct03_2 exit=0 sec=1454 16:33:19
+[weekB] eval ct03_3 done 16:35:16
+[weekB] eval ct03_1 done 16:37:18
+[weekB] eval ct03_2 done 16:38:14
+[weekB] ALL DONE 16:38:14
+base: HV 0.8418±0.0322 追従 0.0636±0.0497 崩壊 0/3 n_pf 64
+ct03: HV 0.8142±0.0506 追従 0.1036±0.0325 崩壊 0/3 n_pf 30

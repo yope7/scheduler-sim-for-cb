@@ -57,6 +57,80 @@ _SWEEP_C = (
     and _c_event_sweep_alloc is not None
     and os.environ.get("PCN_SWEEP_C", "1") == "1"
 )
+# [PCN_EVENT_CSR_CACHE] sweep_c(C実装)に渡す配列(starts/ends/nodes_flat/node_off)は、
+# 従来「イベント表(dict の list)から毎回組み直し」ていた。5万・v9設定の実測では、この
+# 組み直しが env.step の 61.4%(0.832ms/step)で、C 本体(0.298ms)の 2.8 倍を占めていた。
+# イベント追加のたびに末尾へ追記して持ち回れば、この O(生存イベント数) の Python 走査が消える。
+# C へ渡すのは同じ値・同じ順序の配列なので結果はビット一致(PCN_EVENT_CSR_VERIFY=1 で全step照合可)。
+_CSR_CACHE = os.environ.get("PCN_EVENT_CSR_CACHE", "1") == "1"
+_CSR_VERIFY = os.environ.get("PCN_EVENT_CSR_VERIFY", "0") == "1"
+
+
+class _EventCSR:
+    """sweep_c に渡す CSR を増分で保つ入れ物(容量は倍々に伸ばし、C へは使用長の view を渡す)。"""
+
+    __slots__ = ("starts", "ends", "node_off", "nodes_flat", "n", "m")
+
+    def __init__(self, cap_rows: int = 256, cap_nodes: int = 4096):
+        cap_rows = max(16, int(cap_rows))
+        cap_nodes = max(64, int(cap_nodes))
+        self.starts = np.empty(cap_rows, dtype=np.int64)
+        self.ends = np.empty(cap_rows, dtype=np.int64)
+        self.node_off = np.empty(cap_rows + 1, dtype=np.int32)
+        self.node_off[0] = 0
+        self.nodes_flat = np.empty(cap_nodes, dtype=np.int32)
+        self.n = 0   # イベント数
+        self.m = 0   # nodes_flat の使用長
+
+    def _grow_rows(self) -> None:
+        new = 2 * self.starts.shape[0]
+        starts = np.empty(new, dtype=np.int64)
+        starts[: self.n] = self.starts[: self.n]
+        ends = np.empty(new, dtype=np.int64)
+        ends[: self.n] = self.ends[: self.n]
+        off = np.empty(new + 1, dtype=np.int32)
+        off[: self.n + 1] = self.node_off[: self.n + 1]
+        self.starts, self.ends, self.node_off = starts, ends, off
+
+    def _grow_nodes(self, need: int) -> None:
+        new = max(2 * self.nodes_flat.shape[0], self.m + need)
+        flat = np.empty(new, dtype=np.int32)
+        flat[: self.m] = self.nodes_flat[: self.m]
+        self.nodes_flat = flat
+
+    def append(self, start: int, end: int, nodes_np: np.ndarray) -> None:
+        h = int(nodes_np.shape[0])
+        if self.n >= self.starts.shape[0]:
+            self._grow_rows()
+        if self.m + h > self.nodes_flat.shape[0]:
+            self._grow_nodes(h)
+        self.starts[self.n] = start
+        self.ends[self.n] = end
+        self.nodes_flat[self.m : self.m + h] = nodes_np
+        self.m += h
+        self.n += 1
+        self.node_off[self.n] = self.m
+
+
+def _csr_from_events(events) -> "_EventCSR":
+    """イベント表(dict の list)から CSR を1度だけ組む(従来の組み直しと同一の内容・順序)。"""
+    n = len(events)
+    c = _EventCSR(max(256, 2 * n))
+    if n:
+        c.starts[:n] = np.fromiter((e["start"] for e in events), dtype=np.int64, count=n)
+        c.ends[:n] = np.fromiter((e["end"] for e in events), dtype=np.int64, count=n)
+        node_lists = [e["nodes_np"] for e in events]
+        np.cumsum(
+            np.fromiter((x.shape[0] for x in node_lists), dtype=np.int32, count=n),
+            out=c.node_off[1 : n + 1],
+        )
+        m = int(c.node_off[n])
+        if m > c.nodes_flat.shape[0]:
+            c.nodes_flat = np.empty(max(64, m), dtype=np.int32)
+        c.nodes_flat[:m] = np.concatenate(node_lists).astype(np.int32, copy=False)
+        c.m = m
+    c.n = n
+    return c
 
 
 class SchedulingEnvEventNative(SchedulingEnvEventObs):
@@ -87,6 +161,7 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         self.waiting_times = []
         self.job_allocated = []
         self._resource_events = {False: [], True: []}
+        self._event_csr = {False: None, True: None}   # [PCN_EVENT_CSR_CACHE]
         self._absolute_schedule_records = []
         self._front_alloc_cache = None  # urgency が計算した先頭ジョブのオンプレ配置を次step で再利用
         # 残りジョブの最小到着時刻（suffix min）。これ未満で終わるイベントは未来の
@@ -114,6 +189,14 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
 
         self.on_premise_window_history_full = None
         self.cloud_window_history_full = None
+
+        # 報酬無次元化: この workload の達成レンジ[all-onprem待ち, all-cloud cost]を1回測りキャッシュ。
+        if getattr(self, "_dimless_norm", False) and not getattr(self, "_computing_dimless", False):
+            _jid = id(self.jobs)
+            if _jid not in self._dimless_cache:
+                self._dimless_cache[_jid] = self._compute_dimless_scale()
+                return self.reset()  # 計測でepisode消費→クリーンに再reset(jidキャッシュ済で再計算せず)
+            self._dimless_scale = self._dimless_cache[_jid]
 
         return self.get_observation()
 
@@ -170,8 +253,71 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
             wmetric = float(waiting_time) / max(1.0, float(raw_job[1]))
         else:
             wmetric = float(waiting_time)
-        self.waiting_times.append(wmetric)
         cost = self._compute_event_cost(job, use_cloud)
+        # 報酬無次元化(PCN_DIMLESS_NORM): wmetric/cost を達成レンジ[all-onprem待ち, all-cloud cost]で割る。
+        # 累積(total_cost/waiting_times)・目的値(calc_objective_values)・報酬・指令が全て一貫して無次元に。
+        # 計測中(_computing_dimless)は生値。既定OFF(_dimless_scale=None)で不変=ビット一致。
+        if self._dimless_scale is not None and not self._computing_dimless:
+            wmetric = wmetric / float(self._dimless_scale[0])
+            cost = cost / float(self._dimless_scale[1])
+        self.waiting_times.append(wmetric)
+        self.cost += cost
+        self.total_cost = self.cost
+        self.completed_jobs += 1
+        self.jobs_processed_count += 1
+        self.index_next_job += 1
+        self.step_count += 1
+        self._refresh_job_queue()
+
+        done = self.index_next_job >= len(self.jobs)
+        self.done_flag = done
+        rewards = np.array([-wmetric, -cost], dtype=np.float64)  # wmetric/cost は上で無次元化済(dimless時)
+        return self.get_observation(), rewards, True, waiting_time, done
+
+    def step_with_start_hint(self, action_raw, start_time_hint):
+        """開始時刻が既知(GPUカーネル等で事前計算済み)なときの step。
+
+        通常の step() と全く同じ処理を行うが、配置探索(_find_event_allocation の候補時刻
+        ループ)を「start=start_time_hint に対するノード選択1回」に置き換える(_find_event_
+        allocation_at_hint)。配置規則は決定論なので、同じイベント表・同じ start に対しては
+        通常経路と同一のノード選択・同一のイベント表・同一の観測になる(scripts/
+        proto_gpu_sweep/verify_replay_obs.py で全ステップ一致を検証済み)。
+
+        defer(action_raw==2)は対象外(呼び出し側は 0/1 のみ渡す前提。GPU rawカーネルも
+        defer非対応)。start_time_hint が誤っている(その時刻で height 個のノードが空かない)
+        場合は ValueError を送出する(検証で不一致を即座に検出するため)。
+        既存の step() は一切変更していない(この決定論リプレイ専用の新規メソッド)。
+        """
+        if self.index_next_job >= len(self.jobs):
+            self.done_flag = True
+            return self.get_observation(), np.zeros(2, dtype=np.float64), False, 0, True
+
+        action = self.get_converted_action(action_raw)
+        raw_job = self.jobs[self.index_next_job]
+        job = self._to_queue_job(raw_job)
+        arrival = int(raw_job[0])
+        self.time = max(self.time, arrival)
+
+        use_cloud = bool(action[1])
+        position, start_time = self._find_event_allocation_at_hint(
+            job, use_cloud, arrival, start_time_hint
+        )
+        self._front_alloc_cache = None  # 配置で events が変化するため 1 回限り
+        waiting_time = int(start_time - arrival)
+        self.time = int(start_time)
+        self._record_event_schedule(job, use_cloud, position, start_time)
+
+        # 待ち指標: slowdown モードでは待ち÷処理時間(stretch)。step() と同一処理。
+        if self._wait_metric == "slowdown":
+            wmetric = float(waiting_time) / max(1.0, float(raw_job[1]))
+        else:
+            wmetric = float(waiting_time)
+        cost = self._compute_event_cost(job, use_cloud)
+        # 報酬無次元化(PCN_DIMLESS_NORM): step() と同一処理。
+        if self._dimless_scale is not None and not self._computing_dimless:
+            wmetric = wmetric / float(self._dimless_scale[0])
+            cost = cost / float(self._dimless_scale[1])
+        self.waiting_times.append(wmetric)
         self.cost += cost
         self.total_cost = self.cost
         self.completed_jobs += 1
@@ -249,6 +395,10 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
             thr = float(self._suffix_min_arrival[self.index_next_job])
             events[:] = [e for e in events if e["end"] >= thr]
             self._evt_prune_at[use_cloud] = max(64, 2 * len(events) + 32)
+            # [PCN_EVENT_CSR_CACHE] 表が縮んだので持ち回りは破棄(次の探索で1度だけ組み直す)
+            _csr = getattr(self, "_event_csr", None)
+            if _csr is not None:
+                _csr[bool(use_cloud)] = None
 
         # イベントが多いときだけ sweep-line（O(R log R + R·H)）。少数なら候補ループ(fused)。結果は同一。
         if _FAST_ENV_SWEEP and len(events) >= _SWEEP_MIN_EVENTS:
@@ -301,6 +451,30 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         start = max([arrival] + [int(event["end"]) for event in events])
         nodes = list(range(height))
         return (nodes[0], 0), start
+
+    def _find_event_allocation_at_hint(
+        self, job: np.ndarray, use_cloud: bool, arrival: int, start_hint
+    ):
+        """start(開始時刻)が既知のときの配置クエリ(決定論リプレイ用)。
+
+        既存の _find_event_allocation を arrival=start_hint で呼ぶだけ。候補列は
+        {start_hint} ∪ {end >= start_hint} の昇順なので、正しい hint なら先頭候補
+        start_hint が即 feasible となり 1 候補で確定する。占有判定・pick 規則・prune は
+        通常経路と完全に同一実装(C sweep / sweep_np / fused を含む)を通るため、
+        返り値 (position, start) は通常経路とビット一致で、候補時刻ループの反復
+        (通常経路の計算の大半)だけが省かれる。hint が誤り(その時刻に height 個の
+        ノードが空かない)なら、より遅い開始時刻が返るので検出して ValueError
+        (検証で不一致を即座に見つけるための契約)。arrival は待ち時間計算に使う
+        実到着時刻(呼び出し側が持つ)で、ここでは診断メッセージにのみ使う。
+        """
+        position, start_time = self._find_event_allocation(job, use_cloud, int(start_hint))
+        if int(start_time) != int(start_hint):
+            raise ValueError(
+                f"start_time_hint infeasible: hint={int(start_hint)} -> feasible "
+                f"start={int(start_time)} (arrival={int(arrival)}, width={int(job[0])}, "
+                f"height={int(job[1])}, use_cloud={bool(use_cloud)})"
+            )
+        return position, start_time
 
     def _find_nodes_free_for_interval(
         self,
@@ -539,19 +713,40 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         返り値 (position, start) はビット一致。
         """
         n = len(events)
-        starts = np.fromiter((e["start"] for e in events), dtype=np.int64, count=n)
-        ends = np.fromiter((e["end"] for e in events), dtype=np.int64, count=n)
-        node_lists = [e["nodes_np"] for e in events]
-        node_off = np.empty(n + 1, dtype=np.int32)
-        node_off[0] = 0
-        if n:
-            np.cumsum(
-                np.fromiter((x.shape[0] for x in node_lists), dtype=np.int32, count=n),
-                out=node_off[1:],
-            )
-            nodes_flat = np.concatenate(node_lists).astype(np.int32, copy=False)
+        if _CSR_CACHE:
+            # 持ち回りの CSR(追加のたびに末尾へ追記済み)をそのまま使う。行数が食い違ったときだけ
+            # 組み直す(安全弁: 表を触る経路が増えても結果が壊れない)。
+            _csr = getattr(self, "_event_csr", None)
+            if _csr is None:
+                _csr = self._event_csr = {False: None, True: None}
+            c = _csr[bool(use_cloud)]
+            if c is None or c.n != n:
+                c = _csr_from_events(events)
+                _csr[bool(use_cloud)] = c
+            starts = c.starts[:n]
+            ends = c.ends[:n]
+            node_off = c.node_off[: n + 1]
+            nodes_flat = c.nodes_flat[: c.m]
+            if _CSR_VERIFY:
+                ref = _csr_from_events(events)
+                assert np.array_equal(starts, ref.starts[:n]), "CSR starts mismatch"
+                assert np.array_equal(ends, ref.ends[:n]), "CSR ends mismatch"
+                assert np.array_equal(node_off, ref.node_off[: n + 1]), "CSR node_off mismatch"
+                assert np.array_equal(nodes_flat, ref.nodes_flat[: ref.m]), "CSR nodes mismatch"
         else:
-            nodes_flat = np.empty(0, dtype=np.int32)
+            starts = np.fromiter((e["start"] for e in events), dtype=np.int64, count=n)
+            ends = np.fromiter((e["end"] for e in events), dtype=np.int64, count=n)
+            node_lists = [e["nodes_np"] for e in events]
+            node_off = np.empty(n + 1, dtype=np.int32)
+            node_off[0] = 0
+            if n:
+                np.cumsum(
+                    np.fromiter((x.shape[0] for x in node_lists), dtype=np.int32, count=n),
+                    out=node_off[1:],
+                )
+                nodes_flat = np.concatenate(node_lists).astype(np.int32, copy=False)
+            else:
+                nodes_flat = np.empty(0, dtype=np.int32)
 
         start, is_contig, nodes = _c_event_sweep_alloc(
             starts, ends, nodes_flat, node_off,
@@ -594,6 +789,12 @@ class SchedulingEnvEventNative(SchedulingEnvEventObs):
         }
         self._resource_event_list(use_cloud).append(record)
         self._absolute_schedule_records.append(record)
+        # [PCN_EVENT_CSR_CACHE] 持ち回りの CSR にも同じ順序で追記する(未構築なら何もしない)
+        if _CSR_CACHE:
+            _csr = getattr(self, "_event_csr", None)
+            _c = None if _csr is None else _csr[bool(use_cloud)]
+            if _c is not None:
+                _c.append(int(start_time), int(end_time), record["nodes_np"])
 
         if self._event_buf is not None:
             self._event_buf.append(

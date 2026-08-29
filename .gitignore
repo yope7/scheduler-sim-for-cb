@@ -228,6 +228,7 @@ origin_paper/
 *.csv
 *.json
 *.md
+!OVERVIEW.md
 *.MD
 
 dqn_models_32/
@@ -240,3 +241,11 @@ dqn_models_32/
 *.pkl
 *.npy
 *.npz
+
+# CUDA 12.2 nvcc 断片(53MB, tools/setup_nvcc122.sh で再構築可)
+/tools/nvcc122/
+
+# [2026-08-30] push事故防止: プロファイル(8.9GB)・ローカルバックアップ・replay snapshot(1.2GB/個, *.pklに非マッチ)
+nsight_profiles/
+experiments/backups_*/
+*.pkl.gz

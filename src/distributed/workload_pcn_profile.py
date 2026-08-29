@@ -52,8 +52,6 @@ def apply_workload_adaptive_training_env(config: dict) -> Dict[str, Any]:
     os.environ.setdefault("PCN_TRAIN_LOW_WAIT_FRAC", "0.30")
     os.environ.setdefault("PCN_TRAIN_KNEE_STEP_WEIGHT", "5")
     os.environ.setdefault("PCN_TRAIN_LOW_SLOPE_STEP_WEIGHT", "0")
-    os.environ.setdefault("PCN_EVAL_PF_GRID", "16")
-    os.environ.setdefault("PCN_EVAL_STOCHASTIC", "0")
 
     cal = calibrate_from_config(config)
     env_updates = apply_calibration_env(cal)
@@ -66,9 +64,11 @@ def apply_workload_adaptive_training_env(config: dict) -> Dict[str, Any]:
     os.environ.setdefault("PCN_PF_COMMAND_LOW_WAIT_QUOTA", "8")
     os.environ.setdefault("PCN_PF_COMMAND_INCLUDE_EXTREMES", "1")
     os.environ.setdefault("PCN_EVAL_COMMAND_MODE", "pf_ref")
-    os.environ.setdefault(
-        "PCN_REF_PF_NPZ",
-        "experiments/distributed_pcn/trace24_no_outlier_sampled_exhaustive_pf.npz",
-    )
+    # [2026-08-06 バグ修正] PCN_REF_PF_NPZ の既定セット(trace24 前線)を廃止=オプトインのみ。
+    # 旧挙動: trace24(24ジョブ)の桁違いに小さい前線が全ワークロードの command pool へ
+    # 既定で混入し、非支配比較で自分の達成点を押し出して注文の大半が「よそのワーク
+    # ロードの点」になっていた(18ジョブ統制実験で実測)。参照前線を使いたい場合のみ
+    # PCN_REF_PF_NPZ を明示指定する(使用時は pcn_agent が [REF_PF] ログ+スケール
+    # 不整合ガードを適用する)。
     print(format_calibration_log(cal, env_updates))
     return {"calibration": cal, "env": env_updates}

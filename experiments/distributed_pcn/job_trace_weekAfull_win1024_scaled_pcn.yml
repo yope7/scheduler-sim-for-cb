@@ -1,0 +1,54 @@
+# トレース1024（weekAfull先頭1024ジョブ・外れ値除外）— ジョブ粒度実験(J256/J1024/J4096統制)用。
+# 容量は job_trace_weekAfull_win4096_pcn.yml (n_on_premise=22700, n_cloud=90800, 正容量比)を
+# n_jobs比で単純縮約: 22700*1024/4096=5675, 90800*1024/4096=22700。
+# これにより 18J(比≈5.56/22.2)・4096J(比=5.542/22.17)と同じ「正容量」レジームに統一する
+# (256J窓だけは既存configがユーザー指定の別レジーム=過負荷比率1/4のまま踏襲・変更しない)。
+param_env:
+  n_window: 100
+  n_on_premise_node: 5675
+  n_cloud_node: 22700
+  n_job_queue_obs: 5
+  n_job_queue_bck: 5
+  penalty_not_allocate: 0
+  penalty_invalid_action: 0.1
+  n_jobs: 1024
+param_agent:
+  weight_wt: 0
+  weight_cost: 1
+param_simulation:
+  nb_steps: 1
+  nb_episodes: 2000
+  nb_max_episode_steps: -1
+  multi_algorithm: true
+  folder_suffix: "result"
+param_algorithm_compare:
+  env_backend: c
+  seed: 0
+  nb_jobs: 1024
+  n_on_premise_node: 5675
+  n_cloud_node: 22700
+  job_generation_episodes: 2000
+  distributed_pcn:
+    n_iterations: 100
+    n_actors: 16
+    initial_episodes: 100
+    quick: false
+    profile: false
+    left_tail: false
+    workload_adaptive: true
+    conditioning: true
+    mid_core: true
+    use_event_obs: true
+param_job:
+  max_t: 10
+  job_is_constant: true
+  job_type: 2
+  job_trace_path: job_trace/FY2024/scacctreq_202412_weekAfull_win1024_jobs.csv
+  job_trace_n_jobs: 1024
+  job_trace_exclude_largest_outlier: true
+  n_job_per_time: 4
+  max_processing_time: 3
+  max_n_required_nodes: 3
+  max_user_id: 8
+  nb_jobs_per_user: 1
+  user_increment: 1

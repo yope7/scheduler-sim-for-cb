@@ -77,12 +77,19 @@ class JobGenerator:
             _tb = _envcfg("SYNTH_TAIL_BURST", "synth_tail_burst", 0)
             tail_burst = int(float(_tb)) if _tb not in (None, "") else 0
 
+            # 合成ジョブの要求ノード数上限。既定(None)=JobSimulatorの既定256=従来とビット一致。
+            # SYNTH_MAX_NODES / config param_job.synth_max_required_nodes で小ジョブ化(現実的な
+            # クラスタ負荷率<~1)にできる。実SQUIDのジョブは実質1ノード級=大ジョブU[1,256)は非現実的。
+            _mn = _envcfg("SYNTH_MAX_NODES", "synth_max_required_nodes", None)
+            synth_max_nodes = int(float(_mn)) if _mn not in (None, "") else 256
+
             # JobSimulatorのデフォルト設定を使用（過去の実験と一致）
             jobgen = JobSimulator(
                 self.seed,
                 n_jobs=self.n_jobs,
                 n_users=self.n_jobs,
                 lam=self.lam,
+                max_required_nodes=synth_max_nodes,
                 tail_level=tail_level,
                 tail_alpha=tail_alpha,
                 tail_frac=tail_frac,
@@ -100,6 +107,12 @@ class JobGenerator:
                     f"[JobGenerator] SYNTH_TAIL_LEVEL={tail_level} alpha={tail_alpha} frac={tail_frac} "
                     f"→ occupancy max/median={_occ.max()/max(np.median(_occ),1):.1f}x, top10={_top10:.1%}"
                 )
+            # 混雑レジーム制御(既定1.0=ビット一致): 到着時刻(col0)を係数倍し到着スパンを伸縮=稼働率ρを変える。
+            # ρ=drain/到着スパン なので f倍で ρ→ρ/f。synthを引き伸ばして trace並みに空かせる等に使う。
+            _as = float(os.environ.get("SCHEDULER_ARRIVAL_SCALE", "1.0"))
+            if _as != 1.0:
+                jobs = np.array(jobs, dtype=float); jobs[:, 0] = jobs[:, 0] * _as
+                print(f"[JobGenerator] SYNTH arrival scale x{_as} (混雑レジーム制御, ρ→ρ/{_as})")
             for episode in range(self.nb_episodes + 1):
                 self.jobs_set[episode] = jobs
 
@@ -164,6 +177,72 @@ class JobGenerator:
 
             print(f"[JobGenerator] job trace読み込み: {trace_path} (取得件数={len(jobs)} / nrows={read_n})")
             print("[JobGenerator] 先頭5件サンプル:", jobs[:5])
+
+            # --- 因果分離ノブ(既定OFF=ビット一致): 実traceの「到着↔ジョブサイズ相関/giant塊到着」を破壊する。
+            # SCHEDULER_TRACE_SHUFFLE_PAYLOAD=1 で、到着時刻(col0)とjob_id(col5)を固定したまま
+            # payload列(pt1/nodes2/cloud3/user4)を行間で一括置換=各到着スロットへ別ジョブの中身を割当。
+            # 両周辺分布(到着分布・pt/nodes分布)と到着ソート順は完全保持し「どのジョブがいつ来るか」だけ壊す。
+            # trace固有の不安定が到着↔サイズ構造由来かを切り分ける。seedは固定(全runで同一instance)。
+            _shuf = os.environ.get("SCHEDULER_TRACE_SHUFFLE_PAYLOAD", "0")
+            if _shuf not in ("0", "", "off"):
+                _sseed = int(os.environ.get("SCHEDULER_TRACE_SHUFFLE_SEED", "20260715"))
+                _rng = np.random.default_rng(_sseed)
+                _n = len(jobs)
+                _perm = _rng.permutation(_n)
+                _orig = [list(r) for r in jobs]
+                for _i in range(_n):
+                    _src = _orig[_perm[_i]]
+                    for _c in (1, 2, 3, 4):
+                        jobs[_i][_c] = _src[_c]
+                _occ0 = [float(r[1]) * float(r[2]) for r in _orig]
+                _occ1 = [float(r[1]) * float(r[2]) for r in jobs]
+                _st = [float(r[0]) for r in jobs]
+                _c0 = float(np.corrcoef(_st, _occ0)[0, 1]) if np.std(_st) > 0 else 0.0
+                _c1 = float(np.corrcoef(_st, _occ1)[0, 1]) if np.std(_st) > 0 else 0.0
+                print(f"[JobGenerator] TRACE payload shuffle (到着↔サイズ相関を破壊): seed={_sseed} "
+                      f"corr(arrival,occ) {_c0:+.3f}→{_c1:+.3f} (両周辺分布は不変)")
+
+            # --- 因果分離ノブ2(既定OFF=ビット一致): 実traceの「塊/同時到着(バースト的arrival分布)」を破壊。
+            # SCHEDULER_TRACE_ARRIVAL_SPREAD=1 で、到着時刻(col0)を元の総スパンに均等再配置し
+            # 同時到着・微小間隔クラスタを消す(payloadは順序保持=到着ランク↔サイズ関係は温存)。
+            # synth(指数到着でバラける)との差=arrival分布のクラスタ性かを切り分ける。
+            _spr = os.environ.get("SCHEDULER_TRACE_ARRIVAL_SPREAD", "0")
+            if _spr not in ("0", "", "off"):
+                _st0 = [float(r[0]) for r in jobs]
+                _span = max(_st0) - min(_st0)
+                _lo = min(_st0)
+                _n = len(jobs)
+                _ndist0 = len(set(_st0))
+                if _span <= 0:
+                    _span = float(_n)  # 全同時刻の退化ケースの保険
+                for _i in range(_n):
+                    jobs[_i][0] = _lo + _span * _i / max(1, _n - 1)  # 均等スパン再配置(昇順=元順序保持)
+                print(f"[JobGenerator] TRACE arrival spread (塊/同時到着を破壊): "
+                      f"distinct時刻 {_ndist0}/{_n}→{_n}/{_n} span={_span:.0f} 均等間隔={_span/max(1,_n-1):.0f} (payload順序不変)")
+
+            # --- 因果分離ノブ3(既定OFF=ビット一致): 実traceの「ジョブ種の縮退(54%が同一ジョブ)」を破壊。
+            # SCHEDULER_TRACE_JITTER_PT=J で pt に ×(1±U(0,J)) の微小jitterを掛け、完全重複を全て別値に。
+            # (pt,nodes)ペアが全distinct化=各ジョブに固有の観測信号→部分cloud可能に。低多様性が崩壊源かを切り分け。
+            # 分布の形はほぼ不変(±J%)。seed固定=全runで同一instance。
+            _jit = os.environ.get("SCHEDULER_TRACE_JITTER_PT", "0")
+            if _jit not in ("0", "", "off"):
+                _J = float(_jit)
+                _rng = np.random.default_rng(int(os.environ.get("SCHEDULER_TRACE_JITTER_SEED", "20260716")))
+                _n = len(jobs)
+                _u0 = len(set((int(r[1]), int(r[2])) for r in jobs))
+                for _i in range(_n):
+                    _mult = 1.0 + _rng.uniform(-_J, _J)
+                    jobs[_i][1] = max(1, int(round(float(jobs[_i][1]) * _mult)))
+                _u1 = len(set((int(r[1]), int(r[2])) for r in jobs))
+                print(f"[JobGenerator] TRACE pt jitter (ジョブ種の縮退を破壊): J=±{_J:.0%} "
+                      f"ユニーク(pt,nodes) {_u0}→{_u1}/{_n}種 (分布の形はほぼ不変)")
+
+            # 混雑レジーム制御(既定1.0=ビット一致): 到着時刻を係数倍しρを変える(trace圧縮でsynth並みに混ませる等)。
+            _as = float(os.environ.get("SCHEDULER_ARRIVAL_SCALE", "1.0"))
+            if _as != 1.0:
+                for _r in jobs:
+                    _r[0] = float(_r[0]) * _as
+                print(f"[JobGenerator] TRACE arrival scale x{_as} (混雑レジーム制御, ρ→ρ/{_as})")
 
             for episode in range(self.nb_episodes + 1):
                 self.jobs_set[episode] = jobs

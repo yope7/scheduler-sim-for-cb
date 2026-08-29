@@ -1,0 +1,47 @@
+[knee256] START 08:06:49 15runs NITER=60 MAXJOBS=3
+[knee256] launch w01 rep=1 08:06:49
+[knee256] launch w01 rep=2 08:06:49
+[knee256] launch w01 rep=3 08:06:49
+[knee256] train w01_2 exit=0 sec=991 08:23:20
+[knee256] train w01_1 exit=0 sec=997 08:23:26
+[knee256] train w01_3 exit=0 sec=1019 08:23:48
+[knee256] eval w01_1 done 08:24:33
+[knee256] launch w02 rep=1 08:24:39
+[knee256] eval w01_2 done 08:25:17
+[knee256] launch w02 rep=2 08:25:20
+[knee256] eval w01_3 done 08:25:32
+[knee256] launch w02 rep=3 08:25:40
+[knee256] train w02_1 exit=0 sec=1025 08:41:44
+[knee256] train w02_2 exit=0 sec=1001 08:42:01
+[knee256] train w02_3 exit=0 sec=1033 08:42:53
+[knee256] eval w02_1 done 08:42:58
+[knee256] launch w04 rep=1 08:43:00
+[knee256] eval w02_2 done 08:43:26
+[knee256] launch w04 rep=2 08:43:30
+[knee256] eval w02_3 done 08:44:41
+[knee256] launch w04 rep=3 08:44:50
+[knee256] train w04_2 exit=0 sec=964 08:59:34
+[knee256] train w04_1 exit=0 sec=1025 09:00:05
+[knee256] eval w04_2 done 09:00:47
+[knee256] train w04_3 exit=0 sec=959 09:00:49
+[knee256] launch w05 rep=1 09:00:51
+[knee256] eval w04_1 done 09:01:47
+[knee256] launch w05 rep=2 09:01:51
+[knee256] eval w04_3 done 09:01:51
+[knee256] launch w05 rep=3 09:02:01
+[knee256] train w05_1 exit=0 sec=985 09:17:16
+[knee256] eval w05_1 done 09:18:30
+[knee256] launch ctfb2 rep=1 09:18:32
+[knee256] train w05_3 exit=0 sec=994 09:18:35
+[knee256] train w05_2 exit=0 sec=1021 09:18:52
+[knee256] eval w05_3 done 09:20:09
+[knee256] launch ctfb2 rep=2 09:20:12
+[knee256] eval w05_2 done 09:20:36
+[knee256] launch ctfb2 rep=3 09:20:42
+[knee256] train ctfb2_1 exit=0 sec=954 09:34:26
+[knee256] eval ctfb2_1 done 09:35:40
+[knee256] train ctfb2_2 exit=0 sec=930 09:35:42
+[knee256] eval ctfb2_2 done 09:36:26
+[knee256] train ctfb2_3 exit=0 sec=990 09:37:12
+[knee256] eval ctfb2_3 done 09:38:08
+[knee256] ALL DONE 09:38:08

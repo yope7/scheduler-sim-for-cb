@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 300" font-family="Noto Sans JP, sans-serif">
+  <style>
+    .ttl{font-size:17px;font-weight:700;fill:#1e293b}
+    .lbl{font-size:13px;fill:#334155}
+    .sm{font-size:11px;fill:#64748b}
+    .num{font-size:15px;font-weight:700;fill:#1d4ed8}
+    .win{font-size:20px;font-weight:700;fill:#065f46}
+  </style>
+  <text x="20" y="28" class="ttl">規模を段階的に上げても「学習は窓だけ・評価は週全体」は同じ</text>
+
+  <!-- 3段の階段 -->
+  <g>
+    <!-- S1 -->
+    <rect x="40" y="210" width="200" height="50" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+    <text x="140" y="232" text-anchor="middle" class="num">567 ジョブ</text>
+    <text x="140" y="250" text-anchor="middle" class="sm">窓の切替 2回・5試行</text>
+    <text x="140" y="285" text-anchor="middle" class="lbl">カバー率 78.6%</text>
+    <text x="140" y="300" text-anchor="middle" class="sm">応答 0.72</text>
+
+    <!-- S2 -->
+    <rect x="270" y="150" width="200" height="110" rx="6" fill="#bfdbfe" stroke="#3b82f6"/>
+    <text x="370" y="172" text-anchor="middle" class="num">2,267 ジョブ</text>
+    <text x="370" y="190" text-anchor="middle" class="sm">窓の切替 9回・3試行</text>
+    <text x="370" y="285" text-anchor="middle" class="lbl">カバー率 83.0%</text>
+    <text x="370" y="300" text-anchor="middle" class="sm">応答 0.71</text>
+
+    <!-- S4 -->
+    <rect x="500" y="70" width="320" height="190" rx="6" fill="#fecaca" stroke="#ef4444"/>
+    <text x="660" y="94" text-anchor="middle" class="win">50,278 ジョブ（本物のフル週）</text>
+    <text x="660" y="114" text-anchor="middle" class="sm">窓の切替 12回・容量 22,700 ノード</text>
+    <text x="660" y="285" text-anchor="middle" class="lbl">カバー率 100%・応答 1.00</text>
+    <text x="660" y="300" text-anchor="middle" class="sm">※3本中1本・命令0.2〜0.6・基準は甘め</text>
+  </g>
+
+  <!-- 学習窓は常に一定という注記 -->
+  <rect x="40" y="45" width="360" height="18" rx="4" fill="#f0fdf4" stroke="#22c55e" stroke-width="1"/>
+  <text x="48" y="58" class="sm">学習コストはどの段でも同じ（窓＝20分ぶん）。増えるのは評価する週の長さだけ</text>
+</svg>

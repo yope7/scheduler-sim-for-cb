@@ -1,0 +1,2 @@
+[run_synth] NAME=fastgrid_g6clamp JOBS=4096 NITER=100 OUT=experiments/distributed_pcn/run_synth4096_fastgrid_g6clamp ALPHA=1.000 START=21:17:32
+DONE NAME=fastgrid_g6clamp JOBS=4096 EXEC=experiments/distributed_pcn/run_synth4096_fastgrid_g6clamp/20260810_211734 TRAIN_EXIT=0 END=00:59:40

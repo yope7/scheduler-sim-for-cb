@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# weekA4096fairfix の最良レシピ + PCN_EVAL_REGIME=1 (学習中evalの選抜レジームを基準1.0へ揃える)
+# + PCN_EVAL_ACTOR_POOL (評価専用Actorプール=ビット一致の高速化) + PROFILE(printのみ)
+# 使い方: bash scripts/run_weekA4096_evreg.sh NAME [EXTRA_ENV...]
+set -u
+cd /home/noguchi/scheduler-sim-for-cb
+NAME="${1:?usage: run_weekA4096_evreg.sh NAME}"
+shift || true
+
+env \
+  DISTRIBUTED_PCN_CONFIG=experiments/distributed_pcn/job_trace_weekAfull_win4096_pcn.yml \
+  PCN_GPU_FACTORY=1 CUDA_VISIBLE_DEVICES=0,1 PCN_GPU_DEFER_TSCAN_FRAC=1.5 \
+  PCN_FILM=0 PCN_FOURIER_CMD=1 PCN_FOURIER_BANDS=4 PCN_FC_DEPTH=4 \
+  SCHEDULER_ALLOW_DEFER=1 SCHEDULER_DEFER_OFFSET=1 \
+  DISTRIBUTED_PCN_PHASE1_GIANT_DEFER=0.9 SCHEDULER_OBS_URGENCY=1 PCN_FAST_UPDATE=1 \
+  PCN_MIX_REGIMES="0.5,1,2" \
+  PCN_SEED_CHROMOSOMES="${PCN_SEED_CHROMOSOMES:-results/eval_pf/regime_truepf/tp_weekA4096_cap.npz}" \
+  PCN_TRAIN_COST_ENDPOINT_WEIGHT=56 \
+  DISTRIBUTED_PCN_N_UPDATES=200 DISTRIBUTED_PCN_EARLYSTOP=1 PCN_FROZEN_RETRY=1 \
+  DISTRIBUTED_PCN_JOBS=4096 PCN_REPLAY_REGIME_FAIR=1 DISTRIBUTED_PCN_CMD_OUTCOMES_JSONL=1 \
+  PCN_EVAL_REGIME="${PCN_EVAL_REGIME:-1}" \
+  PCN_EVAL_ACTOR_POOL="${PCN_EVAL_ACTOR_POOL:-0}" \
+  DISTRIBUTED_PCN_PROFILE="${DISTRIBUTED_PCN_PROFILE:-1}" \
+  "$@" \
+  bash scripts/run_synthetic_urgency.sh "$NAME" 4096 "${NITER:-100}"

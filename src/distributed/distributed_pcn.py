@@ -5,13 +5,12 @@ from tqdm import tqdm
 import time
 import torch.nn.functional as F
 import gzip
-import heapq
 import json
 import os
 import pickle
 import shutil
 import sys
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional
 
 
 def _apply_cli_env_overrides(argv: List[str]) -> None:
@@ -135,6 +134,40 @@ N_ITERATIONS = 100  # フェーズ3の学習イテレーション数（config.ym
 N_ACTORS = 32      # 並列実行するActorの数
 N_JOBS = 24 # ジョブ数
 
+# [PCN_MIX_JOBS] N混合学習: エピソードごとに n_jobs をこのリストから一様サンプルして学習する
+# (例 "128,256,512")。未設定(既定)なら空リスト=OFF で従来と完全に同一パス(ビット一致)。
+# スケール設計: h_scale・PCN_VALUE_WAIT_SCALE 等の n_jobs 依存定数は「リスト最大N」基準で固定し
+# エピソードごとに変えない(過去の run1024 njfix 事故=スケール定数と実ジョブ数の不整合による崩壊の
+# 構造的防止)。Nの違いは horizon 初期値(=そのエピソードの実ジョブ数)とデータ自身が運ぶ。
+_MIX_JOBS = sorted({
+    int(x) for x in os.environ.get("PCN_MIX_JOBS", "").replace(" ", "").split(",") if x
+})
+
+# [PCN_MIX_REGIMES] レジーム混合学習: エピソードごとに「到着スケール(=混雑度ρの制御)」をこのリストから
+# 一様サンプルして学習する(例 "1,10,100")。基準n_jobsは固定のまま、SCHEDULER_ARRIVAL_SCALE を変えた
+# 複数workloadを起動時にキャッシュ→episode毎に差し替え(MIX_JOBSと同機構)。混雑レジームが無次元PF形の
+# 支配因子なので、これを散らすと多様workloadへの汎化を狙える。未設定(既定)なら空=OFFで従来一致。
+_MIX_REGIMES = [
+    float(x) for x in os.environ.get("PCN_MIX_REGIMES", "").replace(" ", "").split(",") if x
+]
+# [PCN_EVAL_REGIME] 学習中 eval(=best_model 選抜)で使うレジーム。既定は従来どおり _MIX_REGIMES[0]
+# (リスト先頭)だが、"0.5,1,2" のような指定では先頭=0.5=最も混んだレジームで選抜される一方、
+# 外部評価は基準レジーム(1.0)で行うため**選抜と評価の条件が食い違う**。実測でも best と iter100 で
+# HV が ±15pt 振れる主因候補。この env で選抜レジームを評価側に揃えられる(例 PCN_EVAL_REGIME=1)。
+# 未設定なら従来と完全に同じ挙動(ビット不変)。
+_EVAL_REGIME = os.environ.get("PCN_EVAL_REGIME", "")
+_EVAL_REGIME_VAL = float(_EVAL_REGIME) if _EVAL_REGIME else None
+# [PCN_SEED_REGIME] 種まき(PCN_SEED_CHROMOSOMES の固定行動列)の再生レジームを固定する(既定OFF=None)。
+# レジーム混合学習では種も一様サンプルされたレジームで再生されるため、評価レジームに落ちる種は
+# 1/len(_MIX_REGIMES) しかない(実測: weekA256 で 48本中15本=31%)。18ジョブ全列挙の統制実験では
+# 「真の前線のほぼ全点」を入れて初めて効果が出る(20/76点では無効)ので、この 1/3 希釈は種まきの
+# 効果を殺しうる。値を指定すると種エピソードだけそのレジームで再生する。未設定なら完全に従来経路。
+_SEED_REGIME = (
+    float(os.environ["PCN_SEED_REGIME"])
+    if os.environ.get("PCN_SEED_REGIME", "").strip()
+    else None
+)
+
 EVAL_INTERVAL = 5  # 評価を実行する間隔（イテレーション数）
 # 複数 Actor で評価エピソードを並列実行（順序・割当は従来の round-robin と同じ）
 USE_DISTRIBUTED_EVAL = os.environ.get("DISTRIBUTED_PCN_DISTRIBUTED_EVAL", "1") == "1"
@@ -220,6 +253,13 @@ _QUICK_MODE = os.environ.get('DISTRIBUTED_PCN_QUICK', '0') == '1'
 _ABLATION_MODE = os.environ.get('DISTRIBUTED_PCN_ABLATION', '0') == '1'
 # Actor-Learner非同期オーバーラップ（Learner(i)とActor(i+1)を並列実行して待ち時間を隠蔽）
 _ASYNC_OVERLAP = os.environ.get('DISTRIBUTED_PCN_ASYNC_OVERLAP', '1') == '1'
+# [GCスラッシング対策] エピソード投入後に gc.freeze() で永久世代へ退避するか(既定ON)。
+# 100イテレーション規模では replay に数千万個の Transition が貯まり、gen2 走査が
+# イテレーションごとに重くなる。0 で従来動作。
+_GC_FREEZE_AFTER_INGEST = os.environ.get('PCN_GC_FREEZE', '1') == '1'
+# [淘汰の質] 投入後に replay ヒープの優先度を非支配+crowding で更新するか(既定ON)。
+# 0 にすると淘汰が古い順(FIFO)になり、PF両端を含む初期掃引から失われる。
+_REFRESH_REPLAY_PRIORITIES = os.environ.get('PCN_REFRESH_REPLAY_PRIORITIES', '1') == '1'
 # 評価専用 Actor プール(N体追加)。学習中 eval(分散評価64ep + eval_gap格子372cmd)は学習用 actor 8体に
 # 相乗りしており、1024 では eval iter が ~120s(Phase3の半分超)を占める。評価は greedy=決定的・重みは
 # 共有ObjectRef・結果はコマンド順で復元されるため、並列度を上げても値はビット一致。ReplayBuffer には
@@ -229,7 +269,26 @@ _EVAL_ACTOR_POOL = int(os.environ.get('PCN_EVAL_ACTOR_POOL', '0'))
 # Learner actor のメソッドキュー順序(learn→重み取得)は変えず、materialize した state_dict の代わりに
 # 同一中身の ObjectRef を1回putして全Actorで共有受信する（転送量を Actor 数分→1回に削減）。
 _ACTOR_WEIGHTS_REF = os.environ.get('PCN_ACTOR_WEIGHTS_REF', '1') == '1'
+# [PCN_ACTOR_ARRAY_EPISODE] 指令付き rollout(Phase3)のエピソードを配列で持ち回る(既定OFF)。
+# 5万ジョブでは 1本=5万個の Transition になり、ReplayBuffer→Learner の受け渡しが 40.6秒/iter
+# (720MB を 18MB/秒)、Actor 側の記録も約30秒/iter。工場(Phase1)と同じ配列形式に揃えて消す。
+_ACTOR_ARRAY_EP = os.environ.get('PCN_ACTOR_ARRAY_EPISODE', '0') == '1'
+# [検証用] 配列と従来の Transition を両方作って中身を突き合わせる(遅い。検証時のみ)。
+# 学習の loss は Ray の到着順で揺らぐため経路の正しさは中身の照合でしか判定できない。
+_ARR_EP_VERIFY = os.environ.get('PCN_ACTOR_ARRAY_VERIFY', '0') == '1'
 _PHASE3_GPU_CACHE = os.environ.get('DISTRIBUTED_PCN_PHASE3_GPU_CACHE', '1') == '1'
+# [PCN_REFIT_EVERY] 統制実験: 探索(rollout)結果でネットワーク重みを毎ラウンド直接更新する代わりに、
+# アーカイブへの投入(ingest)と重み学習(refit)を分離する。ingest は毎ラウンド呼ぶ（_add_episode +
+# frozen PF 更新のみ・update は呼ばない）。refit は PCN_REFIT_EVERY ラウンドごとに呼び、その時点の
+# アーカイブ全体を束ねて学習する（＝「重みの経路依存」を断つ側の統制腕）。
+# 0(既定)は従来どおり毎ラウンド learn()（投入+即時 update）を呼ぶ・完全ビット不変。
+# >0 のときは非同期オーバーラップを強制OFF(逐次モード)にして ingest/refit 経路へ切り替える。
+_REFIT_EVERY = int(os.environ.get("PCN_REFIT_EVERY", "0"))
+# refit のたびに reinit_network() で初期重みへ戻してから学習し直す(cold)か、直前の重みから
+# 続ける(warm)か。既定 cold=1（探索中の重み変化を一切引き継がない＝経路依存の完全な遮断）。
+_REFIT_COLD = os.environ.get("PCN_REFIT_COLD", "1") == "1"
+# refit 1回あたりの update 回数。
+_REFIT_EPOCHS = int(os.environ.get("PCN_REFIT_EPOCHS", "100"))
 _PHASE2_IMPORTANCE = os.environ.get('DISTRIBUTED_PCN_PHASE2_IMPORTANCE', '1') == '1'
 _PHASE2_IMPORTANCE_SAMPLES = int(os.environ.get('DISTRIBUTED_PCN_PHASE2_IMPORTANCE_SAMPLES', '1024'))
 # Phase2の教師あり学習は初期エピソードの行動を模倣するため、完全なIIDランダム行動だけだと
@@ -293,12 +352,13 @@ elif _viz_env in ("1", "true", "yes"):
     ENABLE_VISUALIZATION = True
 
 from src.agents.pcn_agent import (
-    PCN, 
-    Transition, 
-    get_non_dominated_inds, 
+    PCN,
+    Transition,
+    get_non_dominated_inds,
     get_non_dominated_inds_minimize,
-    crowding_distance,
-    hypervolume
+    episode_regime_scale,
+    episode_is_seed,
+    _REPLAY_REGIME_FAIR,
 )
 
 
@@ -517,6 +577,9 @@ _COLLECT_CMD_OUTCOMES = (
     or (ENABLE_VISUALIZATION and not _VIZ_LIGHT)
 )
 _EVAL_QUIET = os.environ.get("DISTRIBUTED_PCN_EVAL_QUIET", "1") == "1"
+# [島構造診断] Phase3 の (指令, 達成) 生ペアを iteration 毎に cmd_outcomes.jsonl へ追記する
+# オプトイン計装（既定OFF=ファイルも作らずビット不変）。DISTRIBUTED_PCN_CMD_OUTCOMES=1 が前提。
+_CMD_OUTCOMES_JSONL = os.environ.get("DISTRIBUTED_PCN_CMD_OUTCOMES_JSONL", "").strip() == "1"
 # [元PCN復元] desired_return の上限クリップ(元実装の max_return)。報酬負だと dr が使うほど0へ→0を突き抜けて
 # 正へ漂流し「達成不能な指令」になる。元PCNは np.clip(dr-reward, None, max_return) で上限を達成可能域に制限。
 # 私の実装はこれを削除(dr-=reward のみ)していた。PCN_DESIRED_RETURN_UB="0" で上限0(達成可能=報酬負の上限)。
@@ -608,12 +671,25 @@ def _eval_max_return(reward_dim: int = 2) -> np.ndarray:
     return np.full(reward_dim, np.inf, dtype=np.float32)
 
 
-def _distributed_evaluate_episodes(learner, actors, n: int):
+def _distributed_evaluate_episodes(learner, actors, n: int, gpu_factory=None):
     """Driver 上で分散評価（Learner 内から Actor→Learner.get_weights を呼ぶとデッドロックするため）。"""
     max_return = _eval_max_return()
     targets = ray.get(learner.get_eval_targets.remote(n))
     if not targets:
         return [], [], [], None
+    # [PCN_GPU_FACTORY] 工場ON時は greedy 評価を O(N) 工場で一括（40960 の CPU env O(N^2) 評価を置換）。
+    # 失敗時は従来 Actor 評価にフォールバック。
+    if gpu_factory is not None:
+        _fr = ray.get(gpu_factory.eval_commands.remote(targets))
+        if not _fr.get("_factory_failed"):
+            _vals = _fr["values"]
+            _ers = _fr["episode_returns"]
+            _results = [
+                (np.asarray(_ers[i], dtype=np.float64), np.asarray(_vals[i], dtype=np.float64), None, None)
+                for i in range(len(_vals))
+            ]
+            return ray.get(learner.ingest_distributed_eval_results.remote(_results))
+        print(f"[PCN_GPU_FACTORY] eval 工場失敗→Actor評価にフォールバック: {_fr['_factory_failed']}")
     weights_ref = ray.get(learner.get_eval_weights_ref.remote())
     futures = []
     for i, (desired_return, desired_horizon) in enumerate(targets):
@@ -627,7 +703,7 @@ def _distributed_evaluate_episodes(learner, actors, n: int):
     return ray.get(learner.ingest_distributed_eval_results.remote(results))
 
 
-def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_jobs: int):
+def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_jobs: int, gpu_factory=None):
     """Eval ギャップ FB を Driver で実行（格子評価は Actor のみ、Learner は準備と boost 適用のみ）。"""
     from src.utils.pf_eval_gap import (
         _uniform_grid_commands,
@@ -649,11 +725,20 @@ def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_j
         (np.asarray(dr, dtype=np.float32), float(hz))
         for dr, hz in prep.get("commands", [])
     ]
-    weights_ref = ray.get(learner.get_eval_weights_ref.remote())
+    # [PCN_GPU_FACTORY] 格子評価を greedy 工場で O(N)（40960 の CPU env O(N^2) 置換）。失敗時 Actor。
     _t2 = time.time()
-    pts = _run_uniform_grid_commands(
-        None, None, commands, actors=actors, weights_ref=weights_ref
-    )
+    pts = None
+    if gpu_factory is not None:
+        _fr = ray.get(gpu_factory.eval_commands.remote(commands))
+        if not _fr.get("_factory_failed"):
+            pts = np.asarray(_fr["values"], dtype=np.float64)
+        else:
+            print(f"[PCN_GPU_FACTORY] eval_gap 工場失敗→Actor: {_fr['_factory_failed']}")
+    if pts is None:
+        weights_ref = ray.get(learner.get_eval_weights_ref.remote())
+        pts = _run_uniform_grid_commands(
+            None, None, commands, actors=actors, weights_ref=weights_ref
+        )
     _t3 = time.time()
     nd = get_non_dominated_inds_minimize(pts)
     eval_pf = pts[nd] if len(nd) else pts
@@ -671,6 +756,12 @@ def _driver_eval_gap_feedback(learner, actors, training_iteration, plot_dir, n_j
     )
     _t4 = time.time()
     ray.get(learner.apply_eval_gap_boosts.remote(boosts))
+    # 達成ゲート型 MPFT: 今の前線帯を一発再現できたら reach を進める（単調構造）。
+    if os.environ.get("PCN_MPFT_GATED", "0") == "1":
+        ray.get(learner.mpft_gate_update.remote(eval_pf.tolist(), ref_pts.tolist()))
+    # command balance power の適応: 到達PFのHVを archive基準で山登り（左吸い寄せの自己解消）。
+    if os.environ.get("PCN_COMMAND_BALANCE_ADAPT", "0") == "1":
+        ray.get(learner.adapt_balance_power.remote(eval_pf.tolist(), ref_pts.tolist()))
     if _PROFILE_MODE:
         print(f"[PROFILE EVAL_GAP iter={training_iteration}] prep(replay舐め)={_t1-_t0:.2f}s "
               f"weights_ref={_t2-_t1:.2f}s 格子評価({len(commands)}cmd)={_t3-_t2:.2f}s "
@@ -801,15 +892,29 @@ class ReplayBuffer:
         episode_id = id(episode)
         if episode_id in self._hash_cache:
             return self._hash_cache[episode_id]
-        
+
+        # [FAST_REPLAY_HASH] uid があれば「エピソード長×uid」だけで O(1) ハッシュ化。
+        # 元の実装は重複検出のため全 transition(action/reward/terminal)を Python で走査しており、
+        # 大規模N(例40960 step/ep)では add_batch が数千万回のアクセスで数時間 grind する律速だった。
+        # uid はエピソードを一意に識別する(Phase1 は "phase1:actor:ep:prob" 等)ので、これだけで
+        # 重複検出は等価。uid が無いエピソードは従来通り全走査にフォールバック(ビット一致・既定ON)。
+        _fast_hash = os.environ.get("PCN_FAST_REPLAY_HASH", "1") == "1"
+        episode_uid = getattr(episode[0], '_pcn_episode_uid', None)
+        if _fast_hash and episode_uid is not None:
+            hasher = hashlib.md5()
+            hasher.update(len(episode).to_bytes(8, byteorder='big'))
+            hasher.update(str(episode_uid).encode())
+            hash_value = int(hasher.hexdigest(), 16)
+            self._hash_cache[episode_id] = hash_value
+            return hash_value
+
         # エピソードを一意に識別する要約情報のみを使用
         hasher = hashlib.md5()
-        
+
         # 1. エピソードの長さ
         episode_len = len(episode)
         hasher.update(episode_len.to_bytes(8, byteorder='big'))
 
-        episode_uid = getattr(episode[0], '_pcn_episode_uid', None)
         if episode_uid is not None:
             hasher.update(str(episode_uid).encode())
         
@@ -895,6 +1000,10 @@ class ReplayBuffer:
                     optimized_transition.command_return = getattr(t, "command_return", None)  # [案1] 指令もコピー保持
                 if hasattr(t, '_pcn_episode_uid'):
                     optimized_transition._pcn_episode_uid = t._pcn_episode_uid
+                if hasattr(t, '_pcn_seed_episode'):
+                    optimized_transition._pcn_seed_episode = t._pcn_seed_episode
+                if hasattr(t, '_pcn_arrival_scale'):
+                    optimized_transition._pcn_arrival_scale = t._pcn_arrival_scale
                 if hasattr(t, 'random_action_prob'):
                     optimized_transition.random_action_prob = t.random_action_prob
                 
@@ -1004,6 +1113,58 @@ class Actor:
     def _make_env(self):
         if self.env is None:
             n_jobs = self.config['param_env'].get('n_jobs', N_JOBS)
+            # [PCN_MIX_JOBS] 各Nのジョブ列を起動時に1回だけ生成してキャッシュする。
+            # 既存の固定N学習と同一の引数・seed経路(JobGenerator(0,1,...,N,0.2,0)→内部で
+            # np.random.seed(0))なので、各Nの列は「そのN専用学習のジョブ列」とビット同一
+            # (対照実験がクリーンになる)。JobGenerator.jobs_set はクラス共有 dict のため、
+            # 生成直後に episode0 配列を取り出して N ごとの独立 dict に保持する(後続の
+            # generate_jobs_set で dict エントリが置換されても取り出した配列参照は不変)。
+            # 昇順で生成し、この直後に既存パスが基準N(=最大N, mainで揃え済み)を生成し直す
+            # ので、np.random の最終状態も env に渡る jobs_set の中身も従来と一致する。
+            if _MIX_JOBS:
+                self._mix_jobs_sets = {}
+                for _n in _MIX_JOBS:
+                    _jg = JobGenerator(
+                        0, 1,
+                        self.config['param_env']['n_window'],
+                        self.config['param_env']['n_on_premise_node'],
+                        self.config['param_env']['n_cloud_node'],
+                        self.config, _n, 0.2, 0
+                    )
+                    _js = _jg.generate_jobs_set()
+                    self._mix_jobs_sets[_n] = {0: np.asarray(_js[0])}
+                self._mix_base_n = max(_MIX_JOBS)
+                # actor別seedの専用rng(グローバル np.random を汚さない・再現可能)
+                self._mix_rng = np.random.default_rng(0xA5D1 + int(self.actor_id))
+                print(
+                    f"[MIX_JOBS Actor {self.actor_id}] ジョブ列キャッシュ生成: "
+                    f"N∈{_MIX_JOBS} (基準N={self._mix_base_n})"
+                )
+            if _MIX_REGIMES:
+                # [PCN_MIX_REGIMES] 各到着スケール(混雑ρ)のジョブ列を基準n_jobsで生成しキャッシュ。
+                # SCHEDULER_ARRIVAL_SCALE を一時設定して生成→復元(グローバル汚染なし)。
+                self._mix_regime_sets = {}
+                _prev_as = os.environ.get("SCHEDULER_ARRIVAL_SCALE")
+                for _rs in _MIX_REGIMES:
+                    os.environ["SCHEDULER_ARRIVAL_SCALE"] = str(_rs)
+                    _jgr = JobGenerator(
+                        0, 1,
+                        self.config['param_env']['n_window'],
+                        self.config['param_env']['n_on_premise_node'],
+                        self.config['param_env']['n_cloud_node'],
+                        self.config, n_jobs, 0.2, 0
+                    )
+                    _jsr = _jgr.generate_jobs_set()
+                    self._mix_regime_sets[_rs] = {0: np.asarray(_jsr[0])}
+                if _prev_as is None:
+                    os.environ.pop("SCHEDULER_ARRIVAL_SCALE", None)
+                else:
+                    os.environ["SCHEDULER_ARRIVAL_SCALE"] = _prev_as
+                self._mix_regime_rng = np.random.default_rng(0x5EED + int(self.actor_id))
+                print(
+                    f"[MIX_REGIMES Actor {self.actor_id}] 到着スケール混合キャッシュ生成: "
+                    f"scales∈{_MIX_REGIMES} (基準n_jobs={n_jobs})"
+                )
             job_generator = JobGenerator(
                 0, 1,
                 self.config['param_env']['n_window'],
@@ -1012,25 +1173,38 @@ class Actor:
                 self.config, n_jobs, 0.2, 0
             )
             jobs_set = job_generator.generate_jobs_set()
-            self.env = _EnvClass(
-                np.inf,
-                self.config['param_env']['n_window'],
-                self.config['param_env']['n_on_premise_node'],
-                self.config['param_env']['n_cloud_node'],
-                self.config['param_env']['n_job_queue_obs'],
-                self.config['param_env']['n_job_queue_bck'],
-                self.config['param_agent']['weight_wt'],
-                self.config['param_agent']['weight_cost'],
-                self.config['param_env']['penalty_not_allocate'],
-                self.config['param_env']['penalty_invalid_action'],
-                jobs_set,
-                None, flag=0
-            )
-            # Learner 側でイベント→bitmap 復元する既定では、Actor は生イベント観測のまま収集（転送削減）
-            if _USE_EVENT_OBS and learner_bitmap_enabled():
-                self.env._pcn_raw_event_obs_for_transfer = True
+            if os.environ.get("PCN_SCALEFREE_ENV", "0") == "1":
+                # スケールフリー・逐次運用向け新env(観測102次元固定・全知排除・count近似)。
+                # 学習N≠運用Nでも観測分布が一致するので育てた重みが運用に転移できる。
+                from src.envs.scheduling_variants.scalefree_env import ScaleFreeSchedulingEnv
+                self.env = ScaleFreeSchedulingEnv(
+                    jobs_set[0],
+                    self.config['param_env']['n_on_premise_node'],
+                    self.config['param_env']['n_cloud_node'],
+                    n_window=self.config['param_env']['n_window'],
+                )
+                # 新envの観測は既に完成した102次元(生イベント→bitmap復元は不要)。
+                # 転送フラグは立てない=Learnerがそのまま102次元として受け取る。
             else:
-                self.env = _enable_event_bitmap_adapter(self.env)
+                self.env = _EnvClass(
+                    np.inf,
+                    self.config['param_env']['n_window'],
+                    self.config['param_env']['n_on_premise_node'],
+                    self.config['param_env']['n_cloud_node'],
+                    self.config['param_env']['n_job_queue_obs'],
+                    self.config['param_env']['n_job_queue_bck'],
+                    self.config['param_agent']['weight_wt'],
+                    self.config['param_agent']['weight_cost'],
+                    self.config['param_env']['penalty_not_allocate'],
+                    self.config['param_env']['penalty_invalid_action'],
+                    jobs_set,
+                    None, flag=0
+                )
+                # Learner 側でイベント→bitmap 復元する既定では、Actor は生イベント観測のまま収集（転送削減）
+                if _USE_EVENT_OBS and learner_bitmap_enabled():
+                    self.env._pcn_raw_event_obs_for_transfer = True
+                else:
+                    self.env = _enable_event_bitmap_adapter(self.env)
             # C実装が正しく使用されているか確認
             # if hasattr(self.env, '_cache_onpre_c'):
             #     print(f"[Actor {self.actor_id}] ✓ C実装環境が正しく初期化されました")
@@ -1140,9 +1314,22 @@ class Actor:
                     giant_defer_threshold=giant_defer_threshold,
                 )
                 if random_actions and episode:
-                    episode_uid = f"phase1:{self.actor_id}:{ep}:{random_action_prob}"
+                    # uid一意化: 種別(kind)を含めないと wtth種/giant種/NSGA種が全て
+                    # "phase1:{actor}:{ep}:None" で衝突し、FAST_REPLAY_HASH が重複誤判定して
+                    # 後続の種まきをサイレント破棄していた(実測: NSGA種48本が全skip)。
+                    if fixed_actions is not None:
+                        _kind = "nsgaseed"
+                    elif heuristic_threshold is not None:
+                        _kind = f"wtth{heuristic_threshold:g}"
+                    elif giant_defer_threshold is not None:
+                        _kind = f"giant{giant_defer_threshold:g}"
+                    else:
+                        _kind = "p"
+                    episode_uid = f"phase1:{self.actor_id}:{ep}:{_kind}:{random_action_prob}"
                     episode[0]._pcn_episode_uid = episode_uid
                     episode[0].random_action_prob = random_action_prob
+                    if fixed_actions is not None:
+                        episode[0]._pcn_seed_episode = True  # NSGA種まき由来(優先サンプリング識別用)
                 # print("done")
                 
                 # エピソードを一時保存
@@ -1167,10 +1354,15 @@ class Actor:
                     desired_return = np.array(cmd[0], dtype=np.float32)
                     base_return = np.array(cmd[2], dtype=np.float32) if (isinstance(cmd, (list, tuple)) and len(cmd) >= 3) else desired_return.copy()
                     # エピソードの割引累積報酬を計算（表示用、元データは変更しない）
-                    rewards = [np.array(t.reward, dtype=np.float32, copy=True) for t in episode]
-                    for i in reversed(range(len(rewards) - 1)):
-                        rewards[i] = rewards[i] + self.agent.gamma * rewards[i + 1]
-                    achieved_return = rewards[0] if rewards else np.zeros_like(desired_return)
+                    if getattr(episode, "_pcn_array_episode", False):
+                        # [PCN_ACTOR_ARRAY_EPISODE] 逆向きの累積は前計算済(rtg)。先頭が割引累積報酬
+                        # (gamma=1 は learner 既定と同じ)。5万個の per-step ループを回さない。
+                        achieved_return = np.asarray(episode.rtg[0], dtype=np.float32)
+                    else:
+                        rewards = [np.array(t.reward, dtype=np.float32, copy=True) for t in episode]
+                        for i in reversed(range(len(rewards) - 1)):
+                            rewards[i] = rewards[i] + self.agent.gamma * rewards[i + 1]
+                        achieved_return = rewards[0] if rewards else np.zeros_like(desired_return)
 
                     # 実数値空間（値）も記録。
                     # current_e_values は [cost, avg_waiting_time] で描画しているため、command 側も同じ尺へ合わせる。
@@ -1285,9 +1477,39 @@ class Actor:
         fixed_actions: ジョブ順の固定行動列(NSGA-II遺伝子等)。scheduled の時だけindexを進める(nsga2_agent._rolloutと同一規約)。
         giant_defer_threshold: 占有量パーセンタイル順位がこの値以上のジョブを後回し(action=2)するヒューリスティック。
           順位は相対値なので任意インスタンスで汎化(未知ジョブに崩れない種まき)。非巨大は heuristic_threshold で 0/1。"""
+        # [PCN_MIX_JOBS] エピソードごとに N を mix リストから一様サンプルし、env のジョブ列を
+        # 差し替えてから reset する。event-native の reset は jobs_set から jobs / total_jobs_count /
+        # job_queue / suffix_min_arrival / 占有順位キャッシュ(id(jobs)追跡)を全て再構築するので、
+        # 差し替えは jobs_set の置換だけで完結する。スケール定数(h_scale 等)は基準N固定のまま。
+        _mix_n = None
+        _reg = None  # このエピソードの到着スケール(レジーム標識)。単一レジーム時は None のまま。
+        if _MIX_JOBS and getattr(self, "_mix_jobs_sets", None):
+            _mix_n = int(self._mix_rng.choice(_MIX_JOBS))
+            self.env.jobs_set = self._mix_jobs_sets[_mix_n]
+            print(f"[MIX_JOBS Actor {self.actor_id}] episode N={_mix_n}")
+        if _MIX_REGIMES and getattr(self, "_mix_regime_sets", None):
+            _reg = float(self._mix_regime_rng.choice(_MIX_REGIMES))
+            # [PCN_SEED_REGIME] 種まき再生だけ指定レジームに固定(既定OFF)。乱数は分岐前に必ず
+            # 1回引くので、OFF時はもちろんON時も他エピソードの乱数列・レジーム割当は不変。
+            if _SEED_REGIME is not None and fixed_actions is not None:
+                if _SEED_REGIME in self._mix_regime_sets:
+                    _reg = _SEED_REGIME
+                else:
+                    print(f"[PCN_SEED_REGIME] 指定 {_SEED_REGIME} は "
+                          f"PCN_MIX_REGIMES={_MIX_REGIMES} に無いので無視")
+            self.env.jobs_set = self._mix_regime_sets[_reg]
+            print(f"[MIX_REGIMES Actor {self.actor_id}] episode arrival_scale={_reg}")
         obs = self.env.reset()
         done = False
         transitions = []
+        # [PCN_ACTOR_ARRAY_EPISODE] 指令付き rollout(Phase3)だけ配列で貯める。
+        # 5万ジョブでは 1本=5万個の Transition になり、Ray 経由の受け渡しが 40.6秒/iter、
+        # Actor 側の記録も約30秒/iter かかっていた。工場(Phase1)と同じ配列形式に揃える。
+        # ランダム収集(Phase1 の Actor 経路)は種まきの付帯情報を head に持たせるため従来経路。
+        _arr_mode = _ACTOR_ARRAY_EP and not random_actions
+        _arr_obs = []
+        _arr_act = []
+        _arr_rew = []
         _fa_idx = 0  # fixed_actions 用: スケジュール成立済みジョブ数
         # アンカー残差モード(get_anchor_set()がNoneでなければON)。OFF時は以下の分岐を一切通らずビット一致。
         _ar = get_anchor_set()
@@ -1314,10 +1536,21 @@ class Actor:
                     print(f"[PROFILE Actor {self.actor_id}] _choose_commands: {time.time()-t_choose_start:.3f}s")
             desired_return = np.array(desired_return, dtype=np.float32, copy=True)
             desired_horizon = np.float32(desired_horizon)
+            # [PCN_MIX_JOBS] horizon 初期値をこのエピソードの実ジョブ数に一致させる(-2 は既存の
+            # _choose_commands / _pf_command_horizon と同じ慣習)。指令の desired_return はそのまま。
+            # 学習ターゲット側の horizon は hindsight(episode_length - t)でデータ駆動に追従するので、
+            # ここは「実行時条件を学習時条件(そのNの残りステップ数)に揃える」ための上書き。
+            if _mix_n is not None:
+                desired_horizon = np.float32(max(1.0, _mix_n - 2))
             # [案1] 初期指令を保存（1379で desired_return -= reward に上書きされる前）。
             # pre_fetched_command 経路でも _choose_commands 経路でも、ここで desired_return に揃うので両方捕捉。
             _episode_command_return = np.array(desired_return, dtype=np.float32, copy=True)
             self.agent.set_desired_return_and_horizon(desired_return, desired_horizon)
+            if getattr(self.env, "_obs_budget_ratio", False):
+                # [SCHEDULER_OBS_BUDGET_RATIO] 最初の行動選択前にも初期予算を反映しておく
+                # (既定OFFは _obs_budget_ratio=False のままなのでこの分岐を一切通らずビット不変)。
+                self.env.set_remaining_budget(float(-desired_return[1]))
+                obs = self.env.get_observation()
             if _ar is not None:
                 # 方策の出力は「生成時アンカーからの残差」と解釈する
                 _, _ar_gen_gene = _ar.select(desired_return)
@@ -1355,7 +1588,7 @@ class Actor:
                     action = 1 if np.random.random() < random_action_prob else 0
                 else:
                     # より多様なランダム行動を生成
-                    if len(transitions) < 5:
+                    if (len(_arr_act) if _arr_mode else len(transitions)) < 5:
                         # 最初の5ステップは完全ランダム
                         action = self.env.action_space.sample()
                     else:
@@ -1364,8 +1597,8 @@ class Actor:
                             action = self.env.action_space.sample()
                         else:
                             # 30%の確率で前の行動と異なる行動を選択
-                            if len(transitions) > 0:
-                                prev_action = transitions[-1].action
+                            if (len(_arr_act) if _arr_mode else len(transitions)) > 0:
+                                prev_action = (_arr_act[-1] if _arr_mode else transitions[-1].action)
                                 if prev_action == 0:
                                     action = 1
                                 else:
@@ -1374,8 +1607,8 @@ class Actor:
                                 action = self.env.action_space.sample()
                 
                 # 行動の多様性を確認するためのログ（最初の数ステップのみ）
-                if DEBUG and len(transitions) < 3:
-                    print(f"[Actor {self.actor_id}] ステップ {len(transitions)+1}: ランダム行動 = {action}")
+                if DEBUG and (len(_arr_act) if _arr_mode else len(transitions)) < 3:
+                    print(f"[Actor {self.actor_id}] ステップ {(len(_arr_act) if _arr_mode else len(transitions))+1}: ランダム行動 = {action}")
             else:
                 # PCN本体の _run_episode と同じく方策からサンプリング。イベント観測は _obs_for_policy で bitmap 次元へ。
                 _ta = time.perf_counter() if _PROFILE_MODE else 0.0
@@ -1407,14 +1640,6 @@ class Actor:
                 if scheduled:
                     _ar_job_idx += 1
 
-            # 観測データをfloat32に変換してメモリ使用量を削減（シリアライゼーション最適化）
-            # 既にfloat32の場合は変換しない（メモリコピーを避ける）
-            if hasattr(obs, 'dtype') and obs.dtype != np.float32:
-                obs = np.array(obs, dtype=np.float32, copy=True)
-            if hasattr(n_obs, 'dtype') and n_obs.dtype != np.float32:
-                n_obs = np.array(n_obs, dtype=np.float32, copy=True)
-            transitions.append(Transition(obs, env_action, np.float32(reward).copy(), n_obs, done))
-            obs = n_obs
             if not random_actions:
                 # 学習時の教師は「各時刻の残りreturn/horizon」なので、実行時commandも同じように更新する。
                 # これを固定したままだと、学習時条件と実行時条件が別物になり、Cost軸追従が崩れる。
@@ -1425,10 +1650,34 @@ class Actor:
                     # [元PCN復元] 上限クリップ: 報酬負で dr が達成不能な正側へ漂流するのを防ぐ(元 max_return)。
                     desired_return = np.minimum(desired_return, _DESIRED_RETURN_UB).astype(np.float32)
                 self.agent.set_desired_return_and_horizon(desired_return, desired_horizon)
+                if getattr(self.env, "_obs_budget_ratio", False):
+                    # [SCHEDULER_OBS_BUDGET_RATIO] n_obs(=次ジョブの観測)が「このステップ支払い後の
+                    # 残り予算」を反映するよう、Transition構築前にenv側へ反映してからn_obsを
+                    # 再構築する(get_observationは副作用なしの純関数; 既定OFFはこのブロックを
+                    # 通らずビット不変)。
+                    self.env.set_remaining_budget(float(-desired_return[1]))
+                    n_obs = self.env.get_observation()
                 if scheduled:
                     desired_horizon = np.float32(max(desired_horizon - 1, 1.0))
                     self.agent.set_desired_return_and_horizon(desired_return, desired_horizon)
-            
+
+            # 観測データをfloat32に変換してメモリ使用量を削減（シリアライゼーション最適化）
+            # 既にfloat32の場合は変換しない（メモリコピーを避ける）
+            if hasattr(obs, 'dtype') and obs.dtype != np.float32:
+                obs = np.array(obs, dtype=np.float32, copy=True)
+            if hasattr(n_obs, 'dtype') and n_obs.dtype != np.float32:
+                n_obs = np.array(n_obs, dtype=np.float32, copy=True)
+            if _arr_mode:
+                _arr_obs.append(obs)
+                _arr_act.append(env_action)
+                _arr_rew.append(reward)
+                if _ARR_EP_VERIFY:
+                    transitions.append(
+                        Transition(obs, env_action, np.float32(reward).copy(), n_obs, done))
+            else:
+                transitions.append(Transition(obs, env_action, np.float32(reward).copy(), n_obs, done))
+            obs = n_obs
+
         # エピソード完了時に実数値を計算
         if done:
             t_steps = time.time() - t_steps_start
@@ -1443,12 +1692,15 @@ class Actor:
             # 事後リアンカー: 達成値の最近傍アンカー基準で全transitionの行動を残差化する。
             # これにより policy / random / heuristic / fixed すべてが残差表現に統一され、
             # アーカイブ内で絶対行動と残差が混在する汚染を防ぐ(設計書§4)。
-            if _ar is not None and len(transitions) > 0:
+            if _ar is not None and (len(_arr_act) if _arr_mode else len(transitions)) > 0:
                 _, _ach_gene = _ar.select_by_values(cost, avg_waiting_time)
-                for _ti in range(len(transitions)):
+                for _ti in range(len(_arr_act) if _arr_mode else len(transitions)):
                     _ji = _ar_job_idxs[_ti]
                     _abit = int(_ach_gene[_ji]) if _ji < len(_ach_gene) else 0
-                    transitions[_ti].action = int(_ar_abs_actions[_ti]) ^ _abit
+                    if _arr_mode:
+                        _arr_act[_ti] = int(_ar_abs_actions[_ti]) ^ _abit
+                    else:
+                        transitions[_ti].action = int(_ar_abs_actions[_ti]) ^ _abit
 
             solution_execution_time = time.time() - start_time
                 
@@ -1458,7 +1710,42 @@ class Actor:
             # print(f"  平均待機時間: {avg_waiting_time}")
             
             # 最初のTransitionに実数値を追加（後でアクセスできるように）
-            if len(transitions) > 0:
+            if _arr_mode and len(_arr_act) > 0:
+                # 工場(Phase1)と同一のベクトル演算で return-to-go と教師ブロックを前計算する。
+                # build_factory_array_episodes は従来 Transition 経路との一致を replay snapshot で
+                # 確認済み。obs は末尾に終端観測を1つ足した (L+1, D) を渡す規約。
+                from src.distributed.factory_episode import build_factory_array_episodes
+
+                _arr_obs.append(obs)
+                _res = {
+                    "obs": np.asarray(_arr_obs, dtype=np.float32)[None],
+                    "actions": np.asarray(_arr_act, dtype=np.int64)[None],
+                    "rewards": np.asarray(_arr_rew, dtype=np.float32)[None],
+                    "achieved": np.array([[cost, 0.0, avg_waiting_time]], dtype=np.float64),
+                }
+                _arr_ep = build_factory_array_episodes(_res, uids=[None])[0]
+                if _ARR_EP_VERIFY and transitions:
+                    # 従来経路と同じ値・同じ順序で入っているかを全ステップ突き合わせる
+                    _ref_obs = np.asarray([t.observation for t in transitions], dtype=np.float32)
+                    _ref_act = np.asarray([t.action for t in transitions], dtype=np.int64)
+                    _ref_rew = np.asarray([t.reward for t in transitions], dtype=np.float32)
+                    _n_o = int((np.nan_to_num(_ref_obs, nan=0.0, posinf=0.0, neginf=0.0)
+                                != _arr_ep.observations).sum())
+                    _n_a = int((_ref_act != _arr_ep.actions).sum())
+                    # rtg は従来経路が _add_episode で作る逆向き累積。ここで同順序に再現して照合。
+                    _ref_rtg = np.cumsum(_ref_rew[::-1], axis=0)[::-1].astype(np.float32)
+                    _n_r = int((_ref_rtg != _arr_ep.rtg).sum())
+                    print(f"[ARRAY_EP_VERIFY] actor={self.actor_id} L={len(transitions)} "
+                          f"obs_mismatch={_n_o} act_mismatch={_n_a} rtg_mismatch={_n_r} "
+                          f"{'OK' if (_n_o + _n_a + _n_r) == 0 else 'NG'}", flush=True)
+                    transitions = []
+                transitions = _arr_ep
+                transitions.objective_values = [cost, _, avg_waiting_time]
+                if (not random_actions) and _episode_command_return is not None:
+                    transitions.command_return = np.asarray(_episode_command_return, dtype=np.float32)
+                if not random_actions and solution_execution_time is not None:
+                    transitions.solution_execution_time = solution_execution_time
+            elif len(transitions) > 0:
                 transitions[0].objective_values = [cost,_,avg_waiting_time]
                 # [案1: 指令追従loss] 生成指令(desired_return)を先頭Transitionに保持する。
                 # experience_replay 経由で学習側の _command_track_loss_from_replay が「obs・生成指令・
@@ -1471,7 +1758,7 @@ class Actor:
                     transitions[0].solution_execution_time = solution_execution_time
         
         # エピソード完了時の統計を表示（ランダムアクションの場合）
-        if DEBUG and random_actions:
+        if DEBUG and random_actions and not _arr_mode:
             actions = [t.action for t in transitions]
             unique_actions, counts = np.unique(actions, return_counts=True)
             action_distribution = dict(zip(unique_actions, counts))
@@ -1498,7 +1785,16 @@ class Actor:
             # 実数値も表示
             if hasattr(transitions[0], 'objective_values'):
                 print(f"[Actor {self.actor_id}] エピソード完了 - 実数値: コスト={transitions[0].objective_values[0]}, 実行時間={transitions[0].objective_values[1]}")
-        
+
+        # [PCN_REPLAY_REGIME_FAIR] レジーム標識: このエピソードの到着スケールを先頭 Transition へ
+        # 付与する（policy/random/heuristic/NSGA種の全経路が通る唯一の出口）。replay 淘汰の
+        # レジーム公平化と [REPLAY_REGIME] 観測装置が読む。動的属性が増えるだけで既存挙動は不変。
+        if _reg is not None and len(transitions) > 0:
+            if _arr_mode:
+                transitions._pcn_arrival_scale = float(_reg)
+            else:
+                transitions[0]._pcn_arrival_scale = float(_reg)
+
         return transitions
 
     def _load_policy_weights(self, weights_ref=None) -> None:
@@ -1510,11 +1806,28 @@ class Actor:
         else:
             state = ray.get(weights_ref)
         self.agent.model.load_state_dict(state)
+        # [2026-08-26] Actor側は常に eval モードに固定する。
+        # dropout(_S_EMB_DROPOUT)の設計意図は「Learner の update 時に s_emb を落として
+        # 条件 c を使わざるを得なくする」(hindsight冗長性対策)であり、Learner の model は
+        # train モードのまま=学習では従来どおり効く。一方 Actor は eval() を呼んでおらず、
+        # rollout と学習中 eval の両方に dropout ノイズが乗っていた(eval が非決定的になり
+        # best 選抜が乱数で揺れる)。探索の確率性は multinomial サンプリングで別途確保
+        # されているため、Actor 側の dropout に依存しない。
+        self.agent.model.eval()
 
     def evaluate_episode(self, desired_return, desired_horizon, max_return, weights_ref=None):
         """単一エピソードの評価を実行。weights_ref 指定時は Learner へ戻らない（デッドロック回避）。"""
         if self.env is None:
             self._make_env()
+        # [PCN_MIX_JOBS] 学習中 eval は基準N(最大N)で実行する。学習 rollout が env のジョブ列を
+        # 別Nに差し替えたままでも、ここで基準Nへ戻す(agent._run_episode 冒頭の reset で反映)。
+        if _MIX_JOBS and getattr(self, "_mix_jobs_sets", None):
+            self.env.jobs_set = self._mix_jobs_sets[self._mix_base_n]
+        if _MIX_REGIMES and getattr(self, "_mix_regime_sets", None):
+            # [PCN_EVAL_REGIME] 既定は従来どおりリスト先頭。指定時はそのレジームで eval(=best選抜)。
+            _er = _EVAL_REGIME_VAL if (_EVAL_REGIME_VAL is not None
+                                       and _EVAL_REGIME_VAL in self._mix_regime_sets) else _MIX_REGIMES[0]
+            self.env.jobs_set = self._mix_regime_sets[_er]
         self._load_policy_weights(weights_ref)
         
         # 評価エピソードの実行時間計測開始
@@ -1558,6 +1871,14 @@ class Actor:
         """均等格子 PF 用: (desired_return, horizon) のリストを同一 Actor で連続評価。"""
         if self.env is None:
             self._make_env()
+        # [PCN_MIX_JOBS] 学習中 eval は基準N(最大N)で実行する(evaluate_episode と同じ理由)。
+        if _MIX_JOBS and getattr(self, "_mix_jobs_sets", None):
+            self.env.jobs_set = self._mix_jobs_sets[self._mix_base_n]
+        if _MIX_REGIMES and getattr(self, "_mix_regime_sets", None):
+            # [PCN_EVAL_REGIME] 既定は従来どおりリスト先頭。指定時はそのレジームで eval(=best選抜)。
+            _er = _EVAL_REGIME_VAL if (_EVAL_REGIME_VAL is not None
+                                       and _EVAL_REGIME_VAL in self._mix_regime_sets) else _MIX_REGIMES[0]
+            self.env.jobs_set = self._mix_regime_sets[_er]
         self._load_policy_weights(weights_ref)
         max_return = np.full(2, np.inf, dtype=np.float32)
         values = []
@@ -1700,7 +2021,12 @@ class Learner:
                 if DEBUG:
                     print(f"Ray GPU detected: {gpu_ids}")
                 if len(gpu_ids) > 0:
-                    torch.cuda.set_device(gpu_ids[0])
+                    # Ray は GPU id を文字列で返すことがあり、さらに worker 内では
+                    # CUDA_VISIBLE_DEVICES が割当GPUだけに絞られる(=可視 ordinal は常に0起点)。
+                    # 物理 id をそのまま set_device すると invalid device ordinal になるため、
+                    # 可視デバイス数の範囲内のときだけ従い、範囲外なら 0 (=割当GPU) を使う。
+                    _gid = int(gpu_ids[0])
+                    torch.cuda.set_device(_gid if _gid < torch.cuda.device_count() else 0)
             if DEBUG:
                 print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
             return 'cuda'
@@ -1719,6 +2045,17 @@ class Learner:
             self.config, n_jobs, 0.2, 0
         )
         jobs_set = job_generator.generate_jobs_set()
+        if os.environ.get("PCN_SCALEFREE_ENV", "0") == "1":
+            from src.envs.scheduling_variants.scalefree_env import ScaleFreeSchedulingEnv
+            env = ScaleFreeSchedulingEnv(
+                jobs_set[0],
+                self.config['param_env']['n_on_premise_node'],
+                self.config['param_env']['n_cloud_node'],
+                n_window=self.config['param_env']['n_window'],
+            )
+            if DEBUG:
+                print(f"[Learner] ScaleFreeSchedulingEnv obs_dim={env.obs_dim}")
+            return env
         env = _EnvClass(
             np.inf,
             self.config['param_env']['n_window'],
@@ -1804,6 +2141,10 @@ class Learner:
         self._weights_ref = ray.put(weights)
         return self._weights_ref
 
+    def get_convergence_status(self) -> bool:
+        """収束判定(convergence_stats が streak>=K を観測済みか)。PCN_CONVERGE_STOP 用。"""
+        return bool(getattr(self.agent, "_converged", False))
+
     def reinit_ema(self):
         """EMA shadow を現在(=Phase2学習済み)重みで初期化。Phase3突入直前に1回呼ぶ。EMA無効時はno-op。"""
         if hasattr(self.agent, "reinit_ema"):
@@ -1863,6 +2204,10 @@ class Learner:
             t_new.command_return = getattr(t, "command_return", None)  # [案1] 指令もコピー保持
         if hasattr(t, "_pcn_episode_uid"):
             t_new._pcn_episode_uid = t._pcn_episode_uid
+        if hasattr(t, "_pcn_seed_episode"):
+            t_new._pcn_seed_episode = t._pcn_seed_episode
+        if hasattr(t, "_pcn_arrival_scale"):
+            t_new._pcn_arrival_scale = t._pcn_arrival_scale
         if hasattr(t, "random_action_prob"):
             t_new.random_action_prob = t.random_action_prob
         return t_new
@@ -1871,6 +2216,29 @@ class Learner:
         """エピソードを経験再生バッファに追加。追加した場合は格納したエピソードを返す。"""
         if not transitions:
             return None
+
+        # [PCN_GPU_FACTORY] 配列エピソード fast path: return-to-go は前計算済なので per-transition
+        # の copy も reward 逆cumsum ループ(:2015-2018)も回さず、uid で O(1) 重複検出して
+        # そのまま experience_replay へ。40960 で >29 分だった取込を配列そのままに落とす。
+        # 既定 Transition 経路は不変（配列エピソード=PCN_GPU_FACTORY 配列モードでのみ生成）。
+        if getattr(transitions, "_pcn_array_episode", False):
+            arr_uid = getattr(transitions, "uid", None)
+            if arr_uid is not None and arr_uid in self._episode_uids:
+                if DEBUG:
+                    print(f"[Learner] 重複エピソード(uid,array)をスキップ: {arr_uid}")
+                return None
+            if arr_uid is not None:
+                self._episode_uids.add(arr_uid)
+                arr_hash = hash(arr_uid)
+            else:
+                arr_hash = id(transitions)
+            arr_unique_step = (step, arr_hash)
+            # [PCN_REPLAY_REGIME_FAIR] 淘汰は agent._replay_push に一本化（既定OFF=従来 heappushpop とビット一致）
+            was_at_capacity = len(self.agent.experience_replay) == max_size
+            self.agent._replay_push((1, arr_unique_step, transitions), max_size)
+            if was_at_capacity:
+                self.agent.mark_training_batch_cache_stale()
+            return transitions
 
         episode_uid = getattr(transitions[0], "_pcn_episode_uid", None)
         if _USE_EVENT_OBS and learner_bitmap_enabled():
@@ -1892,6 +2260,10 @@ class Learner:
                     t_copy.command_return = getattr(t, "command_return", None)  # [案1] 指令もコピー保持
                 if hasattr(t, "_pcn_episode_uid"):
                     t_copy._pcn_episode_uid = t._pcn_episode_uid
+                if hasattr(t, "_pcn_seed_episode"):
+                    t_copy._pcn_seed_episode = t._pcn_seed_episode
+                if hasattr(t, "_pcn_arrival_scale"):
+                    t_copy._pcn_arrival_scale = t._pcn_arrival_scale
                 if hasattr(t, "random_action_prob"):
                     t_copy.random_action_prob = t.random_action_prob
                 transitions_copy.append(t_copy)
@@ -1920,6 +2292,10 @@ class Learner:
                     t_copy.command_return = getattr(t, "command_return", None)  # [案1] 指令もコピー保持
                 if hasattr(t, "_pcn_episode_uid"):
                     t_copy._pcn_episode_uid = t._pcn_episode_uid
+                if hasattr(t, "_pcn_seed_episode"):
+                    t_copy._pcn_seed_episode = t._pcn_seed_episode
+                if hasattr(t, "_pcn_arrival_scale"):
+                    t_copy._pcn_arrival_scale = t._pcn_arrival_scale
                 if hasattr(t, "random_action_prob"):
                     t_copy.random_action_prob = t.random_action_prob
                 transitions_copy.append(t_copy)
@@ -1945,11 +2321,10 @@ class Learner:
 
         was_at_capacity = len(self.agent.experience_replay) == max_size
         unique_step = (step, episode_hash)
+        # [PCN_REPLAY_REGIME_FAIR] 淘汰は agent._replay_push に一本化（既定OFF=従来 heappushpop とビット一致）
+        self.agent._replay_push((1, unique_step, stored), max_size)
         if was_at_capacity:
-            heapq.heappushpop(self.agent.experience_replay, (1, unique_step, stored))
             self.agent.mark_training_batch_cache_stale()
-        else:
-            heapq.heappush(self.agent.experience_replay, (1, unique_step, stored))
 
         if DEBUG:
             print(f"[Learner] エピソードを追加しました。現在のバッファサイズ: {len(self.agent.experience_replay)}")
@@ -1963,9 +2338,18 @@ class Learner:
             return 0
         
         # キャッシュチェック（transitionsリストのidをキーとして使用）
+        # [2026-08-26 修正] id() は解放後に再利用されるため、id だけをキーにすると
+        # 「別エピソードに前のハッシュを返す」→ 重複と誤判定 → 新規エピソードが黙って
+        # 捨てられる。同一オブジェクトであることを検証してから返す。
+        # (このキャッシュは同一 learn() 内の 2 回呼び(重複判定→登録)を省くためのもので、
+        #  イテレーションを跨いで持つ必要はない。start_learn_cycle() で毎回クリアする)
         transitions_id = id(transitions)
-        if transitions_id in self._hash_cache:
-            return self._hash_cache[transitions_id]
+        _cached = self._hash_cache.get(transitions_id)
+        if _cached is not None:
+            _obj, _hash_value = _cached
+            if _obj is transitions:
+                return _hash_value
+            del self._hash_cache[transitions_id]  # id 再利用を検出 → 破棄
         
         # エピソードを一意に識別する要約情報のみを使用
         hasher = hashlib.md5()
@@ -2013,7 +2397,8 @@ class Learner:
         hash_value = int(hasher.hexdigest(), 16)
         
         # キャッシュに保存（transitionsリストのidをキーとして使用）
-        self._hash_cache[transitions_id] = hash_value
+        # [修正] id 再利用の誤ヒット検出用にオブジェクト参照を同梱(読み出し側と対)
+        self._hash_cache[transitions_id] = (transitions, hash_value)
         
         return hash_value
     
@@ -2086,9 +2471,9 @@ class Learner:
         """次のエピソードの目標報酬とホライズンを選択"""
         return self.agent._choose_commands(num_episodes)
 
-    def _choose_commands_batch(self, num_episodes: int, n_commands: int):
+    def _choose_commands_batch(self, num_episodes: int, n_commands: int, iteration=None):
         """複数の異なる探索方向を一括で取得（Learner呼び出しを1回に削減、各Actorに異なる目標値）"""
-        return self.agent._choose_commands_batch(num_episodes, n_commands)
+        return self.agent._choose_commands_batch(num_episodes, n_commands, iteration=iteration)
 
     def _ensure_cuda_perf(self) -> None:
         if self.actual_device != "cuda" or self._cuda_perf_tuned:
@@ -2099,6 +2484,10 @@ class Learner:
 
     def learn(self, batch_size: int = 100, n_updates: int = 2, use_training_cache: bool = False) -> float:
         self._ensure_cuda_perf()
+        # 適応学習量: 改善局面(達成ゲートが検知)では n_updates を倍率で増やす。既定倍率1.0で不変。
+        _vol_mult = float(getattr(self.agent, "_mpft_updates_mult", 1.0))
+        if _vol_mult != 1.0:
+            n_updates = max(1, int(round(n_updates * _vol_mult)))
         total_loss = []
         total_policy_acc = []
         total_true_prob = []
@@ -2125,7 +2514,17 @@ class Learner:
             self._learn_timings = {'get_episodes': [], 'add_episodes': [], 'update': []}
         if _PROFILE_MODE and hasattr(self, '_learn_timings'):
             self._learn_timings['get_episodes'].append(t_get_episodes)
-        if not all_episodes:
+
+        # 崩壊診断: replay凍結ゲート(H1データ劣化 vs H2最適化病理の分離実験)。
+        # PCN_FREEZE_REPLAY_AFTER=N (>0) で、learn() 呼び出し N 回目以降は新エピソードを
+        # 破棄し replay を固定したまま学習だけ続ける。既定 0=無効(従来とビット一致)。
+        self._learn_calls = getattr(self, "_learn_calls", 0) + 1
+        _freeze_after = int(os.environ.get("PCN_FREEZE_REPLAY_AFTER", "0"))
+        _replay_frozen = _freeze_after > 0 and self._learn_calls > _freeze_after
+        if _replay_frozen and all_episodes:
+            print(f"[FREEZE_REPLAY] learn#{self._learn_calls}: 新規{len(all_episodes)}エピソードを破棄 (replay凍結中, buffer={len(self.agent.experience_replay)})")
+            all_episodes = []
+        if not all_episodes and not (_replay_frozen and len(self.agent.experience_replay) > 0):
             return 0.0
 
         if DEBUG:
@@ -2184,6 +2583,9 @@ class Learner:
         _tx_budget = int(os.environ.get("DISTRIBUTED_PCN_REPLAY_TX_BUDGET", "1200000"))
         _ep_len_est = max(1, len(all_episodes[0]) if all_episodes else 1)
         _replay_max = max(300, min(10000, _tx_budget // _ep_len_est))
+        # [2026-08-26 ④] id 再利用の誤ヒットを避けるため、learn/ingest ごとに破棄する
+        # (キャッシュの目的は同一呼び出し内の 2 回呼びの省略であり、跨いで持つ意味はない)。
+        self._hash_cache.clear()
         new_episodes_for_cache: List[List[Transition]] = []
         t_add_start = time.time()
         for episode in all_episodes:
@@ -2195,6 +2597,36 @@ class Learner:
             else:
                 skipped_episodes += 1
         t_add = time.time() - t_add_start
+        # [2026-08-26 淘汰の質] 投入直後にヒープ優先度を「非支配+crowding」で更新する。
+        # これをしないと優先度が push 時の 1 のままで、淘汰が古い順(FIFO)になり
+        # Phase1 の掃引(PFの両端を含む)から先に捨てられる=原論文§4.4 の失敗モード。
+        # 本番の指令選択(pf_mixed)は _nlargest を通らないため、ここで明示的に呼ぶ。
+        if _REFRESH_REPLAY_PRIORITIES:
+            try:
+                _nd = self.agent.refresh_replay_priorities()
+                if _PROFILE_MODE:
+                    print(f"[REPLAY] 優先度更新: 非支配 {_nd}/{len(self.agent.experience_replay)} 本 "
+                          f"(被支配から淘汰される)", flush=True)
+            except Exception as _e:
+                print(f"[REPLAY] 優先度更新に失敗(淘汰がFIFOになります): {_e}", flush=True)
+        # [2026-08-26 ⑤] GCスラッシング対策。
+        # Phase3 の CPU Actor 経路では 1エピソード=5万個の Transition が生成され、
+        # replay に貯まった全オブジェクトが毎回の gen2 走査対象になる。
+        # コスト ∝ (新規生成数)×(生存オブジェクト数) で反復に対し超線形に悪化し、
+        # v2 の「iter15 から 4分/iter → 20分/iter」の主因になっていた。
+        # gc.freeze() は追跡中のオブジェクトを永久世代へ移し gen2 走査から外す。
+        # 参照カウントによる解放は従来どおり効くので、淘汰されたエピソードは解放される
+        # (非循環データのため。循環があるものだけは解放されなくなる点に注意)。
+        if _GC_FREEZE_AFTER_INGEST:
+            try:
+                import gc as _gc
+                _before = len(_gc.get_objects())
+                _gc.freeze()
+                if _PROFILE_MODE:
+                    print(f"[GC] freeze: 追跡対象 {_before:,} 個を永久世代へ退避 "
+                          f"(以後の gen2 走査から除外)", flush=True)
+            except Exception as _e:
+                print(f"[GC] freeze に失敗(続行): {_e}", flush=True)
         if _PROFILE_MODE and hasattr(self, '_learn_timings'):
             self._learn_timings['add_episodes'].append(t_add)
         
@@ -2211,6 +2643,28 @@ class Learner:
         
         # 修正: バッファ追加完了後にバッファサイズをチェック
         final_buffer_size = len(self.agent.experience_replay)
+        # [REPLAY_REGIME] レジーム公平淘汰の観測装置: scale別本数と種(NSGA)生存数を毎iter出力。
+        # PCN_MIX_REGIMES 有効時のみ（print のみ=学習内容には一切影響しない）。
+        if _MIX_REGIMES:
+            _reg_counts: Dict[float, int] = {}
+            _reg_seeds: Dict[float, int] = {}
+            for _, _, _ep in self.agent.experience_replay:
+                if len(_ep) == 0:
+                    continue
+                _r = episode_regime_scale(_ep)
+                _reg_counts[_r] = _reg_counts.get(_r, 0) + 1
+                if episode_is_seed(_ep):
+                    _reg_seeds[_r] = _reg_seeds.get(_r, 0) + 1
+            _parts = " ".join(
+                f"r{_r:g}:{_reg_counts[_r]}(seed{_reg_seeds.get(_r, 0)})"
+                for _r in sorted(_reg_counts)
+            )
+            print(
+                f"[REPLAY_REGIME] iter={self._learn_calls} total={final_buffer_size} "
+                f"fair={'ON' if _REPLAY_REGIME_FAIR else 'OFF'} | {_parts} | "
+                f"seeds_alive={sum(_reg_seeds.values())}",
+                flush=True,
+            )
         self.agent.update_desired_return_normalization()
         # frozen-PF cloning: best-ever 非支配フロントを更新し、教師に常時含める（自己強化崩壊の遮断）
         self.agent.update_frozen_pf()
@@ -2307,10 +2761,46 @@ class Learner:
             )
         if total_policy_acc and total_true_prob:
             _ct_str = f", cmd_track_loss={np.mean(total_cmd_track):.4f}(n={len(total_cmd_track)})" if total_cmd_track else ", cmd_track_loss=NA"
+            _ct_parts = getattr(self.agent, "_cmd_track_parts", None)
+            if total_cmd_track and _ct_parts:
+                _ct_str += (f" [cost_miss2={_ct_parts.get('cost_miss2', float('nan')):.4f}"
+                            f" wait_miss2={_ct_parts.get('wait_miss2', float('nan')):.4f}]")
             print(
                 f"[Learner] policy_acc={np.mean(total_policy_acc):.4f}, "
                 f"true_prob_mean={np.mean(total_true_prob):.4f}{_ct_str}"
             )
+
+        # 崩壊診断計装: replay組成 / 命令感度(挙動) / FiLM変調量 / 重みノルム を毎iteration 1行出力。
+        if os.environ.get("PCN_COLLAPSE_DIAG", "0") == "1":
+            try:
+                _diag = self.agent.collapse_diag_stats()
+                if _diag:
+                    print(f"[COLLAPSE_DIAG] iter={self._learn_calls} {_diag}", flush=True)
+            except Exception as e:
+                print(f"[COLLAPSE_DIAG] 失敗: {e}")
+
+        # [v10計装] wait指令感受性プローブ(既定OFF)。0=網がwait指令を完全無視。
+        if os.environ.get("PCN_WAIT_SENS_PROBE", "0") == "1":
+            try:
+                _wtv = self.agent.probe_wait_sensitivity()
+                if _wtv is not None:
+                    print(f"[WAIT_SENS] iter={self._learn_calls} "
+                          f"tv01={_wtv['tv01']:.4f} tv12={_wtv['tv12']:.4f} "
+                          f"P_cloud(z=0/0.02/0.2)={_wtv['pc']}", flush=True)
+            except Exception as e:
+                print(f"[WAIT_SENS] 失敗: {e}")
+
+        # 収束観測/判定(原著PCNの自己焼きなまし): ND新規点ゼロ+変位<eps がK回連続で converged。
+        # PCN_CONVERGE_STOP=1 なら main ループが get_convergence_status() を見て学習を終了する。
+        if os.environ.get("PCN_CONVERGE_STOP", "0") == "1" or os.environ.get("PCN_CONVERGE_DIAG", "0") == "1":
+            try:
+                _cv = self.agent.convergence_stats()
+                if _cv:
+                    print(f"[CONVERGE] iter={self._learn_calls} n_nd={_cv['n_nd']} n_new={_cv['n_new']} "
+                          f"disp={_cv['disp']:.4f} nd_std={_cv['nd_std']:.4f} streak={_cv['streak']}"
+                          + (" ★CONVERGED" if _cv["converged"] else ""), flush=True)
+            except Exception as e:
+                print(f"[CONVERGE] 失敗: {e}")
         
         # 学習後に重みのObjectRefを更新（全Actorで共有される）
         # 重みが更新された場合のみObjectRefを更新
@@ -2318,6 +2808,91 @@ class Learner:
             self.update_weights_ref()
         
         return np.mean(total_loss) if total_loss else 0.0
+
+    def ingest(self, use_training_cache: bool = False) -> Dict[str, Any]:
+        """[PCN_REFIT_EVERY] learn() の前半だけを切り出した版: ReplayBuffer から新規エピソードを
+        受け取り experience_replay へ投入し、frozen PF / return正規化を更新する。ネットワーク重みの
+        update は一切行わない（探索結果で重みを直接更新しない設計の統制実験用）。毎ラウンド呼ぶ想定。"""
+        self._ensure_cuda_perf()
+        if _REPLAY_ZERO_COPY:
+            all_episodes = ray.get(self.buffer.take_all_episodes.remote())
+        else:
+            all_episodes = ray.get(self.buffer.get_all_episodes.remote())
+        added_episodes = 0
+        skipped_episodes = 0
+        if all_episodes:
+            _tx_budget = int(os.environ.get("DISTRIBUTED_PCN_REPLAY_TX_BUDGET", "1200000"))
+            _ep_len_est = max(1, len(all_episodes[0]))
+            _replay_max = max(300, min(10000, _tx_budget // _ep_len_est))
+            for episode in all_episodes:
+                added_episode = self._add_episode(episode, max_size=_replay_max, step=self.global_step)
+                if added_episode is not None:
+                    added_episodes += 1
+                else:
+                    skipped_episodes += 1
+        self.agent.update_desired_return_normalization()
+        # frozen-PF cloning: best-ever 非支配フロントを更新（PCN_TEACH_FRONT_ONLY の教師元）
+        self.agent.update_frozen_pf()
+        self.agent.update_anchor_snapshot()
+        if use_training_cache and _PHASE3_GPU_CACHE and not getattr(self, '_use_jax', False):
+            # refit() 側で全件再構築させる（ingest はキャッシュに触れない）
+            self.agent.mark_training_batch_cache_stale()
+        return {
+            "n_episodes": len(all_episodes),
+            "added_episodes": added_episodes,
+            "skipped_episodes": skipped_episodes,
+            "buffer_size": len(self.agent.experience_replay),
+        }
+
+    def refit(self, cold: bool = True, epochs: int = 100) -> float:
+        """[PCN_REFIT_EVERY] ingest() で溜めたアーカイブを束ねて学習し直す。ingest() と対で使う。
+        cold=True: reinit_network()（+reinit_ema）で重みを初期値に戻してから epochs 回 update する
+        （探索中に直接反映された重みの経路依存を断ち切る）。cold=False は現在の重みから続けて
+        epochs 回 update するだけ（温熱リフィット、比較用）。"""
+        self._ensure_cuda_perf()
+        if cold:
+            self.agent.reinit_network()
+            self.reinit_ema()
+        self.agent.clear_training_batch_cache()
+        if getattr(self, "_use_jax", False):
+            losses = []
+            for i in range(max(0, epochs)):
+                try:
+                    loss_value = self._jax_update_step()
+                    if np.isnan(loss_value) or np.isinf(loss_value):
+                        loss_value = 0.0
+                except Exception as e:
+                    print(f"[REFIT] JAX更新エラー {i}: {e}")
+                    loss_value = 0.0
+                losses.append(loss_value)
+            self.global_step += max(0, epochs)
+            if losses:
+                self.update_weights_ref()
+            return float(np.mean(losses)) if losses else 0.0
+
+        if _PHASE3_GPU_CACHE:
+            sync = self.agent.sync_training_batch_cache(
+                on_device=self.actual_device == "cuda", force_rebuild=True,
+            )
+            cache = sync.get("cache", {}) or {}
+            print(
+                f"[REFIT] cold={cold} epochs={epochs} teacher_cache={int(sync.get('steps', 0))} transitions "
+                f"({'GPU' if cache.get('on_device', False) else 'CPU'})"
+            )
+        mean_loss, batch_metrics, per_update_losses = self.agent.update_many(epochs)
+        self.global_step += max(0, epochs)
+        if per_update_losses:
+            self.update_weights_ref()
+        if isinstance(batch_metrics, dict) and batch_metrics:
+            _ct_str = (
+                f", cmd_track_loss={batch_metrics['cmd_track_loss']:.4f}"
+                if "cmd_track_loss" in batch_metrics else ""
+            )
+            print(
+                f"[REFIT] policy_acc={batch_metrics.get('policy_acc', float('nan')):.4f}, "
+                f"true_prob_mean={batch_metrics.get('true_prob_mean', float('nan')):.4f}{_ct_str}"
+            )
+        return float(mean_loss) if per_update_losses else 0.0
 
     def get_learn_profile_summary(self) -> Dict[str, Any]:
         timings = getattr(self, "_learn_timings", None) or {}
@@ -2419,36 +2994,15 @@ class Learner:
         self.agent.set_eval_gap_band_boosts(boosts if boosts else None)
         self.agent.mark_training_batch_cache_stale()
 
-    def update_eval_gap_feedback(
-        self,
-        training_iteration: Optional[int] = None,
-        plot_dir: Optional[str] = None,
-        actors: Optional[List[Any]] = None,
-    ):
-        """均等 command Eval PF の弱点 cost 帯を検出し、次の教師 cache で replay 重みを増幅。"""
-        if os.environ.get("PCN_EVAL_GAP_FEEDBACK", "0") != "1":
-            return {}
-        from src.utils.pf_eval_gap import compute_eval_gap_feedback
+    def mpft_gate_update(self, eval_pf, ref_pts):
+        """達成ゲート型 MPFT の reach 前進判定を agent に委譲（driver から毎eval呼ぶ）。"""
+        fn = getattr(self.agent, "mpft_gate_update", None)
+        return fn(eval_pf, ref_pts) if fn is not None else None
 
-        n_jobs = int(getattr(self.env, "n_jobs", 1024))
-        label = os.environ.get("DISTRIBUTED_PCN_LIVE_UNIFORM_PF_LABEL", "live")
-        boosts, summary, _plot = compute_eval_gap_feedback(
-            self.agent,
-            self.env,
-            n_jobs,
-            plot_dir=plot_dir,
-            plot_iteration=training_iteration,
-            plot_label=label,
-            actors=actors,
-        )
-        self.agent.set_eval_gap_band_boosts(boosts if boosts else None)
-        self.agent.mark_training_batch_cache_stale()
-        if boosts:
-            parts = [f"{lo:.0g}-{hi:.0g}x{mult:.2f}" for lo, hi, mult in boosts]
-            print(
-                f"[EVAL_GAP] iter={training_iteration} boost_bands=[{', '.join(parts)}]"
-            )
-        return summary
+    def adapt_balance_power(self, eval_pf, ref_pts=None):
+        """command balance power の HV山登り適応を agent に委譲（driver から毎eval呼ぶ）。"""
+        fn = getattr(self.agent, "adapt_balance_power", None)
+        return fn(eval_pf, ref_pts) if fn is not None else None
 
     def save_live_uniform_pf_plot(
         self,
@@ -2470,71 +3024,6 @@ class Learner:
             plot_label=label,
             actors=actors,
         )
-
-    def evaluate_distributed(self, actors, max_return=None, n=10):
-        """分散評価を実行"""
-        if max_return is None:
-            max_return = _eval_max_return()
-        
-        if DEBUG:
-            print(f"分散評価を実行中... (n={n}, actors={len(actors)})")
-        
-        # 評価用の目標値を取得
-        episodes = self.agent._nlargest(n)
-        if len(episodes) == 0:
-            print("警告: 評価用のエピソードが見つかりませんでした。")
-            return [], [], [], None
-        
-        returns, horizons = list(zip(*[(e[2][0].reward, len(e[2])) for e in episodes]))
-        returns = np.float32(returns)
-        horizons = np.float32(horizons)
-        
-        # Actorに分散して評価を実行
-        evaluation_futures = []
-        for i, (desired_return, desired_horizon) in enumerate(zip(returns, horizons)):
-            actor_id = i % len(actors)  # ラウンドロビンでActorに割り当て
-            future = actors[actor_id].evaluate_episode.remote(desired_return, desired_horizon, max_return)
-            evaluation_futures.append(future)
-        
-        # 全ての評価結果を収集
-        results = ray.get(evaluation_futures)
-        
-        # 結果を整理
-        e_returns = []
-        e_values = []
-        all_transitions = []
-        
-        for episode_return, value, transitions, map_fin in results:
-            e_returns.append(episode_return)
-            e_values.append(value)
-            all_transitions.append(transitions)
-        
-        if DEBUG:
-            print(f"分散評価完了: {len(e_returns)}エピソードを評価")
-        
-        # 非支配解を計算
-        e_returns_np = np.array(e_returns, dtype=np.float64)
-        e_values_np = np.array(e_values, dtype=np.float64)
-        
-        non_dominated_inds_reward = get_non_dominated_inds(e_returns_np)
-        non_dominated_inds_values = get_non_dominated_inds_minimize(e_values_np)
-        
-        # 評価履歴に保存
-        self.agent.evaluation_history.append({
-            'all_returns': np.array(e_returns),
-            'pareto_front_reward': e_returns_np[non_dominated_inds_reward],
-            'pareto_front_values': e_values_np[non_dominated_inds_values],
-            'values': e_values
-        })
-        self.agent.evaluation_timestamps.append("1")
-        self.agent.global_steps_at_evaluation.append(self.global_step)
-        if not hasattr(self.agent, "wall_seconds_at_evaluation"):
-            self.agent.wall_seconds_at_evaluation = []
-        self.agent.wall_seconds_at_evaluation.append(
-            float(time.perf_counter() - self._mo_hv_wall0)
-        )
-        
-        return e_returns, e_values, [], map_fin  # distancesは計算しない（分散評価では不要）
 
     def export_mo_hv_data(self) -> dict:
         """アルゴリズム比較用: 解空間パレート（pareto_front_values）と時系列メタデータを JSON 化可能な dict で返す。"""
@@ -2704,7 +3193,10 @@ class Learner:
         """Phase2重要度可視化用の解釈しやすい入力グループを作る。"""
         urgency_extra = 1 if os.environ.get("SCHEDULER_OBS_URGENCY", "0") == "1" else 0
         occupancy_extra = 1 if os.environ.get("SCHEDULER_OBS_OCCUPANCY", "0") == "1" else 0
-        event_obs_dim = N_EVENTS_OBS * EVENT_FEATURES + JOB_QUEUE_SIZE + urgency_extra + occupancy_extra
+        # [SCHEDULER_OBS_EFFICIENCY] 現ジョブの雲送り効率3次元(event_c_env.EFF_EXTRA_DIM)
+        efficiency_extra = 3 if os.environ.get("SCHEDULER_OBS_EFFICIENCY", "0") == "1" else 0
+        event_obs_dim = (N_EVENTS_OBS * EVENT_FEATURES + JOB_QUEUE_SIZE
+                         + urgency_extra + occupancy_extra + efficiency_extra)
         is_event_vector = _USE_EVENT_OBS and not learner_bitmap_enabled() and obs_dim == event_obs_dim
 
         if is_event_vector:
@@ -3122,8 +3614,14 @@ class Learner:
             "episodes": episodes,
         }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        # compresslevel=6: end-of-run 1回の後処理。9→6で保存 ~4倍速・サイズ +2〜3%のみ（展開後は同一）。
-        with gzip.open(path, "wb", compresslevel=6) as f:
+        # [exit134の根治] v6 では 360ep の pickle+gzip に 31分かかり、その間 driver が
+        # ray.get でブロック→外部SIGTERM→Ray の fatal handler が abort(128+6=134)した。
+        # 100iter 規模では約2.5時間ブロックするため、compresslevel を下げ(1で数倍速・
+        # サイズ+10%程度)、開始時にも print して「生きている」ことを見せる。
+        _clv = int(os.environ.get("DISTRIBUTED_PCN_SNAPSHOT_COMPRESSLEVEL", "1"))
+        print(f"[Learner] replay スナップショット保存開始: {path} "
+              f"({len(payload.get('episodes', []))} episodes, compresslevel={_clv})", flush=True)
+        with gzip.open(path, "wb", compresslevel=_clv) as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         nbytes = _estimate_episodes_numpy_bytes(episodes)
         print(
@@ -3248,198 +3746,6 @@ def _dedupe_aligned_points_for_plot(
     return tuple(np.asarray(a)[mask] for a in arrays)
 
 
-def visualize_initial_pareto_front(initial_batch, save_dir="pareto_front_visualization"):
-    """ 
-    初期経験収集後のパレートフロントを可視化する関数
-    
-    Args:
-        initial_batch: 初期エピソードのリスト（Learnerの経験再生バッファ形式）
-        save_dir: 保存ディレクトリ
-        
-    Returns:
-        dict: 軸範囲の情報を含む辞書
-    """
-    # 初期エピソードから累積報酬と実数値を計算
-    initial_e_returns = []
-    initial_e_values = []
-
-    for episode in initial_batch:
-        # episode[2]が遷移のリスト
-        transitions = episode[2]
-        if len(transitions) > 0:
-            # エピソードの累積報酬を計算
-            episode_return = np.sum([t.reward for t in transitions], axis=0)
-            initial_e_returns.append(episode_return)
-            
-            # エピソードの実数値（コストと実行時間）を取得
-            # objective_values属性が存在するかチェック
-            if hasattr(transitions[0], 'objective_values') and transitions[0].objective_values is not None:
-                # Transitionオブジェクトから実数値を取得
-                cost,_,avg_waiting_time = transitions[0].objective_values
-                initial_e_values.append([cost,avg_waiting_time])
-            else:
-                # objective_valuesが存在しない場合は、報酬から推定値を計算
-                # 報酬の累積値を実数値として使用（仮の対応）
-                episode_return = np.sum([t.reward for t in transitions], axis=0)
-                # 報酬を負の値に変換して最小化問題として扱う
-                initial_e_values.append([-episode_return[0], -episode_return[1]])
-                
-                # デバッグ情報を表示（最初の数エピソードのみ）
-                if len(initial_e_returns) <= 3:
-                    print(f"エピソード {len(initial_e_returns)}: objective_valuesが見つかりません")
-                    print(f"  報酬: {episode_return}")
-                    print(f"  推定実数値: {[-episode_return[0], -episode_return[1]]}")
-
-    # 軸範囲を計算するための辞書
-    axis_ranges = {}
-    
-    if len(initial_e_returns) > 0 and len(initial_e_values) > 0:
-        # 非支配解の計算
-        initial_non_dominated_inds = get_non_dominated_inds(np.array(initial_e_returns))
-        initial_non_dominated_inds_values = get_non_dominated_inds_minimize(np.array(initial_e_values))
-        
-        # 報酬空間の軸範囲を計算
-        all_returns = np.array(initial_e_returns)
-        reward_x_min, reward_x_max = all_returns[:, 0].min(), all_returns[:, 0].max()
-        reward_y_min, reward_y_max = all_returns[:, 1].min(), all_returns[:, 1].max()
-        
-        # マージンを追加（10%）
-        reward_x_margin = (reward_x_max - reward_x_min) * 0.1
-        reward_y_margin = (reward_y_max - reward_y_min) * 0.1
-        
-        axis_ranges['rewards'] = {
-            'x_min': reward_x_min - reward_x_margin,
-            'x_max': reward_x_max + reward_x_margin,
-            'y_min': reward_y_min - reward_y_margin,
-            'y_max': reward_y_max + reward_y_margin
-        }
-        
-        # 実数値空間の軸範囲を計算
-        all_values = np.array(initial_e_values)
-        values_x_min, values_x_max = all_values[:, 0].min(), all_values[:, 0].max()
-        values_y_min, values_y_max = all_values[:, 1].min(), all_values[:, 1].max()
-        
-        # マージンを追加（10%）
-        values_x_margin = (values_x_max - values_x_min) * 0.1
-        values_y_margin = (values_y_max - values_y_min) * 0.1
-        
-        axis_ranges['values'] = {
-            'x_min': values_x_min - values_x_margin,
-            'x_max': values_x_max + values_x_margin,
-            'y_min': values_y_min - values_y_margin,
-            'y_max': values_y_max + values_y_margin
-        }
-        
-        # 1. 報酬空間でのパレートフロント（最大化目的）
-        plt.figure(figsize=(8, 6))
-        
-        all_returns_vis = _dedupe_points_for_plot(all_returns)
-        non_dominated_inds_vis = get_non_dominated_inds(all_returns_vis)
-        pareto_front_returns_vis = all_returns_vis[non_dominated_inds_vis]
-        plt.scatter(all_returns_vis[:, 0], all_returns_vis[:, 1], c='lightblue', alpha=0.6, label='All Solutions', s=50)
-        plt.scatter(
-            pareto_front_returns_vis[:, 0], pareto_front_returns_vis[:, 1],
-            c='red', s=100, label='Pareto Front', zorder=5,
-        )
-        
-        if len(pareto_front_returns_vis) > 1:
-            sorted_indices = np.lexsort((pareto_front_returns_vis[:, 1], pareto_front_returns_vis[:, 0]))
-            sorted_pareto = pareto_front_returns_vis[sorted_indices]
-            plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], 'r-', linewidth=2, alpha=0.8)
-        
-        plt.xlim(axis_ranges['rewards']['x_min'], axis_ranges['rewards']['x_max'])
-        plt.ylim(axis_ranges['rewards']['y_min'], axis_ranges['rewards']['y_max'])
-        
-        plt.title(
-            f'Initial Random Experience - Pareto Front (Reward)\n'
-            f'Non-dominated: {len(non_dominated_inds_vis)} (unique points)',
-            fontsize=12,
-        )
-        plt.xlabel('Reward 1', fontsize=10)
-        plt.ylabel('Reward 2', fontsize=10)
-        plt.legend(fontsize=9)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # 保存
-        reward_plot_path = f"{save_dir}/pareto_front_rewards_initial_random.png"
-        plt.savefig(reward_plot_path, dpi=100, bbox_inches='tight')
-        plt.close()
-        if DEBUG:
-            print(f"初期ランダム経験の報酬空間パレートフロントを保存: {reward_plot_path}")
-        
-        # 2. 実数値空間でのパレートフロント（最小化目的）
-        plt.figure(figsize=(8, 6))
-        
-        all_values_vis = _dedupe_points_for_plot(all_values)
-        non_dominated_inds_values_vis = get_non_dominated_inds_minimize(all_values_vis)
-        pareto_front_values_vis = all_values_vis[non_dominated_inds_values_vis]
-        plt.scatter(all_values_vis[:, 0], all_values_vis[:, 1], c='lightgreen', alpha=0.6, label='All Solutions', s=50)
-        plt.scatter(
-            pareto_front_values_vis[:, 0], pareto_front_values_vis[:, 1],
-            c='red', s=100, label='Pareto Front', zorder=5,
-        )
-        
-        if len(pareto_front_values_vis) > 1:
-            sorted_indices = np.lexsort((pareto_front_values_vis[:, 1], pareto_front_values_vis[:, 0]))
-            sorted_pareto = pareto_front_values_vis[sorted_indices]
-            plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], 'r-', linewidth=2, alpha=0.8)
-        
-        plt.xlim(axis_ranges['values']['x_min'], axis_ranges['values']['x_max'])
-        plt.ylim(axis_ranges['values']['y_min'], axis_ranges['values']['y_max'])
-        
-        plt.title(
-            f'Initial Random Experience - Pareto Front (Value)\n'
-            f'Non-dominated: {len(non_dominated_inds_values_vis)} (unique points)',
-            fontsize=12,
-        )
-        plt.xlabel('Cost (Minimize)', fontsize=10)
-        plt.ylabel('Execution Time (Minimize)', fontsize=10)
-        plt.legend(fontsize=9)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # 保存
-        values_plot_path = f"{save_dir}/pareto_front_values_initial_random.png"
-        plt.savefig(values_plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        if DEBUG:
-            print(f"初期ランダム経験の実数値空間パレートフロントを保存: {values_plot_path}")
-        
-        # 3. 詳細データの保存
-        details_path = f"{save_dir}/pareto_front_details_initial_random.txt"
-        with open(details_path, 'w', encoding='utf-8') as f:
-            f.write(f"=== 初期ランダム経験パレートフロント詳細 ===\n")
-            f.write(f"生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"評価サンプル数: {len(initial_e_returns)}\n")
-            f.write(f"報酬空間非支配解数: {len(initial_non_dominated_inds)}\n")
-            f.write(f"実数値空間非支配解数: {len(initial_non_dominated_inds_values)}\n")
-            f.write(f"初期エピソード数: {len(initial_batch)}\n")
-            f.write(f"報酬空間軸範囲: X[{axis_ranges['rewards']['x_min']:.4f}, {axis_ranges['rewards']['x_max']:.4f}], Y[{axis_ranges['rewards']['y_min']:.4f}, {axis_ranges['rewards']['y_max']:.4f}]\n")
-            f.write(f"実数値空間軸範囲: X[{axis_ranges['values']['x_min']:.4f}, {axis_ranges['values']['x_max']:.4f}], Y[{axis_ranges['values']['y_min']:.4f}, {axis_ranges['values']['y_max']:.4f}]\n")
-            
-            # 報酬空間の非支配解を詳細に記録
-            f.write(f"\n=== 報酬空間の非支配解 ===\n")
-            for i, idx in enumerate(initial_non_dominated_inds):
-                f.write(f"解{i+1}: {initial_e_returns[idx]}\n")
-            
-            # 実数値空間の非支配解を詳細に記録
-            f.write(f"\n=== 実数値空間の非支配解 ===\n")
-            for i, idx in enumerate(initial_non_dominated_inds_values):
-                f.write(f"解{i+1}: {initial_e_values[idx]}\n")
-        
-        if DEBUG:
-            print(f"初期ランダム経験の詳細データを保存: {details_path}")
-            print(f"=== 初期経験収集後の可視化完了 ===")
-    
-    else:
-        if DEBUG:
-            print("初期経験が不足しているため、可視化をスキップします")
-    
-    return axis_ranges
-
 # =========================
 # 5. 実行スクリプト
 # =========================
@@ -3549,6 +3855,23 @@ def main():
         config['param_env']['n_jobs'] = int(os.environ['DISTRIBUTED_PCN_JOBS'])
     else:
         config['param_env']['n_jobs'] = N_JOBS
+    # [PCN_MIX_JOBS] N混合学習: スケール基準は常にリスト最大N。config n_jobs を max(mix) に揃える。
+    # この後の workload calibration(PCN_VALUE_WAIT_SCALE=wait_max×n_jobs の焼き込み)・
+    # Actor/Learner の h_scale(=1/n_jobs)は全てこの値から決まるため、ここで揃えれば
+    # スケール定数は全部「最大N基準で固定」になる(エピソードごとに変わらない)。
+    if _MIX_JOBS:
+        _mix_base_n = max(_MIX_JOBS)
+        if int(config['param_env']['n_jobs']) != _mix_base_n:
+            print(
+                f"[MIX_JOBS] config n_jobs={config['param_env']['n_jobs']} を "
+                f"mix リスト最大 {_mix_base_n} に揃えます (スケール基準N)"
+            )
+            config['param_env']['n_jobs'] = _mix_base_n
+        print(
+            f"[MIX_JOBS] N混合学習 ON: N∈{_MIX_JOBS} をエピソードごとに一様サンプル / "
+            f"スケール基準N={_mix_base_n} (h_scale・PCN_VALUE_WAIT_SCALE は基準N固定) / "
+            f"学習中eval・Learner env は基準N={_mix_base_n} で実行"
+        )
     if os.environ.get('DISTRIBUTED_PCN_ONPREM'):
         config['param_env']['n_on_premise_node'] = int(os.environ['DISTRIBUTED_PCN_ONPREM'])
     if os.environ.get('DISTRIBUTED_PCN_CLOUD'):
@@ -3608,6 +3931,17 @@ def main():
     from src.agents.pcn_agent import refresh_train_env_weights
 
     refresh_train_env_weights()
+
+    # [フラグ台帳] プロファイル適用が全て終わった時点で、有効な構成を1箇所に印字し
+    # 前提フラグの不整合(黙って無効になるフラグ)を検出する。ray.init より前に置くと
+    # ワーカーへ伝播する env と同じものを見られる。
+    try:
+        from src.distributed.flag_audit import audit_flags
+        audit_flags()
+    except ValueError:
+        raise
+    except Exception as _e:
+        print(f"[FLAG_AUDIT] 検査に失敗(続行): {_e}", flush=True)
     if os.environ.get("DISTRIBUTED_PCN_SUPERVISED_EPOCHS"):
         SUPERVISED_LEARNING_EPOCHS = int(os.environ["DISTRIBUTED_PCN_SUPERVISED_EPOCHS"])
     if os.environ.get("DISTRIBUTED_PCN_SUPERVISED_UPDATES_PER_EPOCH"):
@@ -3733,6 +4067,44 @@ def main():
 
     actors = [Actor.remote(config, learner, buffer, actor_id=i) for i in range(N_ACTORS)]
 
+    # [PCN_GPU_FACTORY] GPU rollout データ工場（既定OFF。PCN_GPU_FACTORY=1 で有効化）。
+    # ON時のみ生成し ping(対応構成チェック)/warmup(jitコンパイル)する。ping が非対応構成や
+    # 例外を返した場合・生成に失敗した場合は None のまま＝従来 Actor 経路に完全フォールバック。
+    # 有効時: Phase1 ランダム収集と Phase3 指令 rollout を工場が O(N) で一括生産する。
+    _gpu_factory_holder = {"actor": None}
+    if os.environ.get("PCN_GPU_FACTORY", "0") == "1":
+        try:
+            from src.distributed.gpu_factory import GPUFactoryWorker
+            _fac_gpus = float(os.environ.get("PCN_GPU_FACTORY_NUM_GPUS", "1"))
+            _FactoryActor = ray.remote(num_gpus=_fac_gpus)(GPUFactoryWorker)
+            _factory = _FactoryActor.remote(config, learner, buffer)
+            _ping = ray.get(_factory.ping.remote())
+            if not _ping.get("ok"):
+                print(f"[PCN_GPU_FACTORY] 非対応/失敗のため従来 Actor 経路に戻します: {_ping.get('reason')}")
+            else:
+                _wu = ray.get(_factory.warmup.remote())
+                _gpu_factory_holder["actor"] = _factory
+                print(f"[PCN_GPU_FACTORY] 工場ON: {_ping} warmup={_wu:.1f}s "
+                      f"(num_gpus={_fac_gpus}, Phase1/Phase3 を GPU 工場経由で生産)")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[PCN_GPU_FACTORY] 起動失敗、従来 Actor 経路: {type(_e).__name__}: {_e}")
+            _gpu_factory_holder["actor"] = None
+
+    def _eval_gpu_factory():
+        """学習中 eval を工場 greedy(O(N)) で回すなら工場 actor を、PCN_GPU_FACTORY_EVAL=0 なら
+        None（=厳密 env の Actor eval にフォールバック; 忠実な PF が要る場合）。既定は工場。"""
+        if os.environ.get("PCN_GPU_FACTORY_EVAL", "1") != "1":
+            return None
+        return _gpu_factory_holder["actor"]
+
+    # [PCN_GPU_FACTORY] cheap端(congested, 生存≈N)は工場の O(N)前提が崩れ overflow で
+    # onprem-wait が壊れる(N=4096固定実験で cheap端喪失を確定)。cheap端エピソードだけ
+    # 厳密env Actor(exact, overflow無)へ回し、飽和側(cloud寄り)は工場のまま=大e_alloc の
+    # 18分コンパイルを回避する安価な修正。既定OFF(=従来の全工場)。
+    _CHEAP_TO_ACTOR = os.environ.get("PCN_GPU_FACTORY_CHEAP_TO_ACTOR", "0") == "1"
+    _CHEAP_MIN_P = float(os.environ.get("PCN_GPU_FACTORY_MIN_P", "0.2"))   # Phase1: これ未満pは工場でなく種(exact)に任せ除外
+    _CHEAP_FRAC = float(os.environ.get("PCN_GPU_FACTORY_CHEAP_FRAC", "0.35"))  # Phase3: 安いcost端 fraction を Actor へ
+
     init_futures = [actor._make_env.remote() for actor in actors]
 
     # 評価専用 Actor プール(PCN_EVAL_ACTOR_POOL>0 時のみ)。エピソード生成には使わず、
@@ -3806,36 +4178,81 @@ def main():
         except Exception as e:
             print(f"一部のActorの初期化でエラーが発生: {e}")
 
-        # 全てのエピソード生成を並列で開始（for文を避けて並列化を最大化）
-        simulation_futures = [
-            actor.run.remote(
-                n_episodes=INITIAL_EPISODES,
-                random_actions=True,
-                random_action_probs=initial_action_probs,
-            )
-            for actor in actors
-        ]
-
-        # 全てのエピソード生成を並列で待つ
-        try:
-            results = ray.get(simulation_futures)  # 全ての結果を並列で取得
-            for i, result in enumerate(results):
-                episodes_generated = result["episodes_generated"] if isinstance(result, dict) else int(result)
-                total_episodes += episodes_generated
-                if isinstance(result, dict):
-                    phase1_episode_summaries.extend(result.get("episode_summaries", []))
-                if isinstance(result, dict) and result.get("action_one_prob_counts"):
+        # [PCN_GPU_FACTORY] Phase1 ランダム収集: 工場ON時は GPU で一括生産し、従来 Actor 波をスキップ。
+        # p sweep（initial_action_probs; 未設定時は p=0..1 の 11 段）を probs に束ねて一回で流す。
+        # 失敗時は工場を無効化して従来経路にフォールバック（学習は止めない）。ヒューリスティック/
+        # giant-defer/NSGA 種まきは工場非対応のため以降も従来 Actor 経路のまま実行される。
+        _p1_factory = _gpu_factory_holder["actor"]
+        _p1_done_by_factory = False
+        if _p1_factory is not None:
+            try:
+                _n_init = N_ACTORS * INITIAL_EPISODES
+                if initial_action_probs is not None:
+                    _p1_probs = initial_action_probs
+                else:
+                    _sweep = [round(i / 10.0, 1) for i in range(11)]
+                    _p1_probs = [_sweep[i % len(_sweep)] for i in range(_n_init)]
+                if _CHEAP_TO_ACTOR:
+                    # cheap端(低p=全オンプレ寄り=congested)は工場で overflow するので除外し、
+                    # 正しい cheap端データは exact な種まき(heuristic wtth高/NSGA cost0遺伝子)に委譲。
+                    _n_before = len(_p1_probs)
+                    _p1_probs = [p for p in _p1_probs if float(p) >= _CHEAP_MIN_P]
+                    _n_init = len(_p1_probs)
+                    print(f"[PCN_GPU_FACTORY] cheap端 p<{_CHEAP_MIN_P} を工場から除外(exact種に委譲): {_n_before}→{_n_init} eps")
+                print(f"[PCN_GPU_FACTORY] Phase1 ランダム収集を GPU 工場で生産: {_n_init} episodes（従来 Actor 波はスキップ）")
+                _t_fac = time.time()
+                _res = ray.get(_p1_factory.run_random.remote(_n_init, _p1_probs))
+                if _res.get("_factory_failed"):
+                    raise RuntimeError(_res["_factory_failed"])
+                total_episodes += int(_res.get("episodes_generated", 0))
+                phase1_episode_summaries.extend(_res.get("episode_summaries", []))
+                if _res.get("action_one_prob_counts"):
                     if "phase1_action_prob_counts" not in locals():
                         phase1_action_prob_counts = {}
-                    for p, c in result["action_one_prob_counts"].items():
+                    for p, c in _res["action_one_prob_counts"].items():
                         phase1_action_prob_counts[float(p)] = phase1_action_prob_counts.get(float(p), 0) + int(c)
-                completed_actors += 1
-                # 進捗を表示
-                progress_percentage = (completed_actors / N_ACTORS) * 100
-                if DEBUG:
-                    print(f"Actor {i} の初期エピソード生成完了: {episodes_generated} エピソード (進捗: {progress_percentage:.1f}%)")
-        except Exception as e:
-            print(f"一部のActorのエピソード生成でエラーが発生: {e}")
+                print(
+                    f"[PCN_GPU_FACTORY] Phase1 工場収集完了: +{_res.get('episodes_generated', 0)} eps "
+                    f"in {time.time() - _t_fac:.1f}s (工場GPU wall={_res.get('wall', 0.0):.2f}s, "
+                    f"overflow={_res.get('overflow')})"
+                )
+                _p1_done_by_factory = True
+            except Exception as _e:
+                print(f"[PCN_GPU_FACTORY] Phase1 工場失敗→従来 Actor 経路にフォールバック: {type(_e).__name__}: {_e}")
+                _gpu_factory_holder["actor"] = None
+                _p1_done_by_factory = False
+
+        # 全てのエピソード生成を並列で開始（for文を避けて並列化を最大化）
+        if not _p1_done_by_factory:
+            simulation_futures = [
+                actor.run.remote(
+                    n_episodes=INITIAL_EPISODES,
+                    random_actions=True,
+                    random_action_probs=initial_action_probs,
+                )
+                for actor in actors
+            ]
+
+            # 全てのエピソード生成を並列で待つ
+            try:
+                results = ray.get(simulation_futures)  # 全ての結果を並列で取得
+                for i, result in enumerate(results):
+                    episodes_generated = result["episodes_generated"] if isinstance(result, dict) else int(result)
+                    total_episodes += episodes_generated
+                    if isinstance(result, dict):
+                        phase1_episode_summaries.extend(result.get("episode_summaries", []))
+                    if isinstance(result, dict) and result.get("action_one_prob_counts"):
+                        if "phase1_action_prob_counts" not in locals():
+                            phase1_action_prob_counts = {}
+                        for p, c in result["action_one_prob_counts"].items():
+                            phase1_action_prob_counts[float(p)] = phase1_action_prob_counts.get(float(p), 0) + int(c)
+                    completed_actors += 1
+                    # 進捗を表示
+                    progress_percentage = (completed_actors / N_ACTORS) * 100
+                    if DEBUG:
+                        print(f"Actor {i} の初期エピソード生成完了: {episodes_generated} エピソード (進捗: {progress_percentage:.1f}%)")
+            except Exception as e:
+                print(f"一部のActorのエピソード生成でエラーが発生: {e}")
 
         # --- Phase-1 ヒューリスティック種まき（reactive cloud-overflow で良質な低wait例を生成）---
         # ランダムBernoulli配置は「コストは合うがwaitは最適より悪い」点しか生まない。
@@ -4029,7 +4446,13 @@ def main():
         print("初期エピソードをLearnerの経験再生バッファに追加中...")
 
     # まずLearnerの学習を実行（これによりReplayBufferからエピソードが取得され、Learnerの経験再生バッファに追加される）
-    initial_loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES))
+    # [PCN_GPU_FACTORY] 配列エピソードは per-transition の episode[t] 参照が高コスト（40960 で
+    # get_training_batch 非cache 経路が episode[j] を T 回舐める）。工場ON時は初期learnも
+    # use_training_cache=True にし、前計算済ブロックから cache を組んで cache サンプリング経路に乗せる
+    # （OFF時は従来どおり False で不変）。
+    _init_use_cache = _gpu_factory_holder["actor"] is not None
+    initial_loss = ray.get(learner.learn.remote(
+        batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=_init_use_cache))
     print(f"初期学習の損失: {initial_loss}")
 
     if DEBUG:
@@ -4418,10 +4841,26 @@ def main():
     _es_ref = None          # 環境変数で絶対nadirを与えた場合のみ固定。未指定なら全候補から動的に拡大。
     _es_candidates = []     # [(iter, nd_points)]: 全評価候補を保持し毎回「全候補nadir」で再評価する
     _es_best_path = os.path.join(execution_dir, "best_model.pth")
+    # [best選抜の物差し] 生HVは「真PFのcost上限を超えて伸びた解」が有利になる(cost上限外の体積を
+    # 稼げてしまう)。DISTRIBUTED_PCN_EARLYSTOP_COST_CLAMP で cost<=上限 に限定した箱でHVを測る。
+    #   ""(既定)=OFF・完全ビット不変 / "auto"=PCN_SEED_CHROMOSOMES の真PF cost最大 / 数値=その値
+    _es_cost_clamp = None
     if _EARLYSTOP:
         _ref_env = os.environ.get("DISTRIBUTED_PCN_EARLYSTOP_REF", "").strip()
         if _ref_env:
             _es_ref = np.array([float(x) for x in _ref_env.split(",")], dtype=np.float64)
+        _clamp_env = os.environ.get("DISTRIBUTED_PCN_EARLYSTOP_COST_CLAMP", "").strip()
+        if _clamp_env:
+            try:
+                if _clamp_env.lower() == "auto":
+                    _seed_npz = os.environ.get("PCN_SEED_CHROMOSOMES", "").strip()
+                    _es_cost_clamp = float(np.load(_seed_npz, allow_pickle=True)["pf"][:, 0].max())
+                else:
+                    _es_cost_clamp = float(_clamp_env)
+                print(f"[EARLYSTOP] cost上限クランプHVで選抜: cost<={_es_cost_clamp:.6g}")
+            except Exception as _exc:
+                print(f"[EARLYSTOP] cost上限クランプの解決に失敗→OFF: {_exc}")
+                _es_cost_clamp = None
         print(f"[EARLYSTOP] 有効: 達成HV最良ckptを {_es_best_path} に保存 (固定ref={_es_ref})")
 
 
@@ -4464,6 +4903,8 @@ def main():
                 f"mean_norm={mean_norm:.3f}, n={len(deltas)}"
             )
         return actor_cmds
+    _health_log = {}
+
     def _episodes_generated_sum(actor_results):
         total = 0
         for r in actor_results:
@@ -4472,6 +4913,35 @@ def main():
             else:
                 total += int(r)
         return total
+    def _check_rollout_health(actor_results, iter_index, expected=None):
+        """[健全性] Phase3 の生産結果を検査して異常を必ず表に出す。
+
+        従来は工場の except が `_factory_failed`/`episodes_generated=0` を返しても
+        呼び出し側が読まず、OOM 等で 1 iter 分のデータが消えても無言で完走していた
+        (Phase1 は :4337 で raise 済み=非対称だった)。溢れ(overflow)も同様に
+        誰も読んでいなかったため、壊れた待ち時間が学習/評価に混入し得た。
+        戻り値=検出した異常のリスト(空なら正常)。
+        """
+        issues = []
+        for r in actor_results:
+            if not isinstance(r, dict):
+                continue
+            if r.get("_factory_failed"):
+                issues.append(f"factory_failed: {r['_factory_failed']}")
+            if r.get("overflow"):
+                issues.append("overflow: 工場バッファ溢れ(待ち時間がCPU env と不一致の可能性)")
+            if int(r.get("episodes_failed", 0) or 0):
+                issues.append(f"episodes_failed={r['episodes_failed']}")
+        got = _episodes_generated_sum(actor_results)
+        if expected is not None and got < int(expected):
+            issues.append(f"本数不足: {got}/{expected}")
+        for msg in issues:
+            print(f"[ROLLOUT_HEALTH] ⚠️ iter={iter_index} {msg}", flush=True)
+        _health_log.setdefault("rollout_issues", []).extend(
+            [{"iter": int(iter_index), "issue": m} for m in issues])
+        _health_log.setdefault("episodes_per_iter", []).append([int(iter_index), int(got)])
+        return issues
+
     def _collect_command_outcomes(actor_results):
         outcomes = []
         for r in actor_results:
@@ -4564,19 +5034,86 @@ def main():
 
     _cmd_track_hist = []  # [CMD-TRACK] 指令追従距離の iteration 履歴（診断・プロット用）
     _prev_skip_stats = (0, 0)  # [STEP_SKIP] 差分計算用 (skip累計, step成功累計)
+
+    # Phase3 恒常探索枠(多様性・数の最優先): 毎波、先頭 K actor を方策ロールアウトでなく
+    # Phase1 と同じヒューリスティック探索(giant-defer + wtth 梯子)に充てる。方策が固まって
+    # std ナッジ探索が死んでも archive へ多様な候補が流れ続け、収束判定は
+    # 「ヒューリスティック探索ですら新規 ND を生まない」という強い意味になる。0=無効(従来どおり)。
+    _P3_EXPLORE_ACTORS = int(os.environ.get("DISTRIBUTED_PCN_PHASE3_EXPLORE_ACTORS", "0"))
+    _p3_explore_rng = np.random.default_rng(int(os.environ.get("DISTRIBUTED_PCN_PHASE3_EXPLORE_SEED", "7")))
+
+    def _phase3_actor_wave(commands_batch):
+        """毎波、先頭 K actor をランダム化ヒューリスティック探索に充てる。
+
+        決定論的な梯子(固定wtth等)は毎回同じエピソードを生み新規NDに寄与しない
+        (検証済: 固定梯子は収束を iter6 に早めるだけ)。波ごとに乱数で作り分ける:
+        - 偶数番actor: wtth を log一様 10^U(0,6) から3本 + giant-defer 閾値 U(0.7,0.99)
+        - 奇数番actor: ランダム混合率 P〜U(0,1) の Bernoulli 方策
+        """
+        # [PCN_GPU_FACTORY] 工場ON時は Phase3 指令 rollout を GPU 工場で一括生産する。
+        # 返り値は「結果 dict のリスト」なので run_commands の 1 future を [future] で包み、
+        # 従来の ray.get(actor_futures) / _episodes_generated_sum / _collect_command_outcomes と
+        # 完全互換にする。重み同期は run_commands 内で get_weights_ref（learn と同じ FIFO 順序点）。
+        # [PCN_GPU_FACTORY_P3] Phase3 rollout の工場利用トグル(既定1=従来どおり)。
+        # 大N(5万級)は scan 長=T が逐次律速で 1 チャンク〜26分となり毎 iter の生産が
+        # 非現実になるため、Phase1=工場(一括生産が得) / Phase3=CPU Actor(少数本が得)の
+        # 混成を 0 で選べるようにする。
+        _p3_factory = _gpu_factory_holder["actor"] \
+            if os.environ.get("PCN_GPU_FACTORY_P3", "1") == "1" else None
+        if _p3_factory is not None:
+            if _CHEAP_TO_ACTOR and commands_batch:
+                # cost目標 dr[1](=-cost)が0に近い=cheap端(congested,生存≈N)を厳密env Actor(exact,
+                # overflow無)へ、飽和側(cloud寄り)は工場のまま。工場が cheap端を overflow で壊す問題を回避。
+                _order = sorted(
+                    range(len(commands_batch)),
+                    key=lambda i: -float(np.asarray(commands_batch[i][0], dtype=np.float64)[1]),
+                )
+                _n_cheap = min(len(commands_batch), N_ACTORS,
+                               max(1, int(round(len(commands_batch) * _CHEAP_FRAC))))
+                _cheap = [commands_batch[i] for i in _order[:_n_cheap]]
+                _rest = [commands_batch[i] for i in _order[_n_cheap:]]
+                _futs = []
+                if _rest:
+                    _futs.append(_p3_factory.run_commands.remote(_rest))
+                for _ci in range(len(_cheap)):  # actor_id*1+0=_ci で _cheap[_ci] を引く
+                    _futs.append(actors[_ci].run.remote(
+                        n_episodes=1, random_actions=False, pre_fetched_commands=_cheap))
+                return _futs
+            return [_p3_factory.run_commands.remote(commands_batch)]
+        futures = []
+        for _ai, _actor in enumerate(actors):
+            if _ai < _P3_EXPLORE_ACTORS:
+                if _ai % 2 == 0:
+                    _wtth = [float(x) for x in 10 ** _p3_explore_rng.uniform(0.0, 6.0, size=3)]
+                    _gd = [float(_p3_explore_rng.uniform(0.7, 0.99))]
+                    futures.append(_actor.run.remote(
+                        n_episodes=EPISODES_PER_ITERATION, random_actions=True,
+                        giant_defer_thresholds=_gd, heuristic_thresholds=_wtth))
+                else:
+                    _probs = [float(x) for x in _p3_explore_rng.uniform(0.0, 1.0, size=max(3, EPISODES_PER_ITERATION))]
+                    futures.append(_actor.run.remote(
+                        n_episodes=EPISODES_PER_ITERATION, random_actions=True,
+                        random_action_probs=_probs))
+            else:
+                futures.append(_actor.run.remote(
+                    n_episodes=EPISODES_PER_ITERATION, random_actions=False,
+                    pre_fetched_commands=commands_batch))
+        return futures
+
     for iteration in range(N_ITERATIONS):
-        if _ASYNC_OVERLAP and N_ITERATIONS > 1:
+        if _ASYNC_OVERLAP and N_ITERATIONS > 1 and _REFIT_EVERY == 0:
             # 非同期オーバーラップモード
             if iteration == 0:
                 if DEBUG:
                     print("Actorが改良されたエピソードを生成中...")
                     print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
                 # 一括で探索方向を取得（12回のリモート呼び出し→1回に削減）
-                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter, iteration + 1))
                 commands_batch = _normalize_commands_for_actor_and_log(commands_batch, iteration + 1)
-                actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
+                actor_futures = _phase3_actor_wave(commands_batch)
                 t_actor_start = time.time()
                 actor_results = ray.get(actor_futures)
+                _check_rollout_health(actor_results, iteration + 1, n_commands_per_iter)
                 t_actor = time.time() - t_actor_start
                 if _PROFILE_MODE:
                     print(f"[PROFILE Iter {iteration+1}] Actor実行: {t_actor:.3f}s (合計{_episodes_generated_sum(actor_results)}エピソード)")
@@ -4584,10 +5121,10 @@ def main():
                 if DEBUG:
                     print("Learnerが改良された経験で学習を実行中")
                 t_learner_start = time.time()
-                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+                commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter, iteration + 2))
                 commands_batch = _normalize_commands_for_actor_and_log(commands_batch, iteration + 1)
                 learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True)
-                next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
+                next_actor_futures = _phase3_actor_wave(commands_batch)
                 t_wait_start = time.time()
                 loss = ray.get(learner_future)
                 ray.get(next_actor_futures)  # Actor(1)完了待機（actor_resultsはActor(0)のまま）
@@ -4597,8 +5134,8 @@ def main():
                     print(f"[PROFILE Iter {iteration+1}] Learner+Actor(次)並列待機: {t_wait:.3f}s (Learner: {t_learner:.3f}s)")
                 if N_ITERATIONS > 1:
                     learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True)
-                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
-                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
+                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter, iteration + 3))
+                    next_actor_futures = _phase3_actor_wave(commands_batch)
                 else:
                     learner_future = None
                     next_actor_futures = None
@@ -4607,6 +5144,7 @@ def main():
                 # 前イテレーションで起動した Learner の結果を取得（戻り値を捨てると表示損失が固定される）
                 loss_pending = ray.get(learner_future)
                 actor_results = ray.get(next_actor_futures)  # Actor(i)完了
+                _check_rollout_health(actor_results, iteration + 1, n_commands_per_iter)
                 t_wait = time.time() - t_wait_start
                 if _PROFILE_MODE:
                     print(f"[PROFILE Iter {iteration+1}] Learner+Actor並列待機: {t_wait:.3f}s (合計{_episodes_generated_sum(actor_results)}エピソード)")
@@ -4616,12 +5154,12 @@ def main():
                 
                 if iteration < N_ITERATIONS - 1:
                     t_choose_start = time.time()
-                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+                    commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter, iteration + 2))
                     commands_batch = _normalize_commands_for_actor_and_log(commands_batch, iteration + 1)
                     if _PROFILE_MODE:
                         print(f"[PROFILE Iter {iteration+1}] choose_commands: {time.time()-t_choose_start:.3f}s")
                     learner_future = learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True)
-                    next_actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
+                    next_actor_futures = _phase3_actor_wave(commands_batch)
                     loss = loss_pending
                 else:
                     # 最終イテレーション: 上で完了した並行 learn のあと、直前 Actor 波が ReplayBuffer に積んだ分をもう一度学習する
@@ -4643,11 +5181,12 @@ def main():
             if DEBUG:
                 print("Actorが改良されたエピソードを生成中...")
                 print("※ PCNエージェントの_choose_commandsと_nlargestメソッドにより改善された目標値を使用")
-            commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter))
+            commands_batch = ray.get(learner._choose_commands_batch.remote(50, n_commands_per_iter, iteration + 1))
             commands_batch = _normalize_commands_for_actor_and_log(commands_batch, iteration + 1)
-            actor_futures = [actor.run.remote(n_episodes=EPISODES_PER_ITERATION, random_actions=False, pre_fetched_commands=commands_batch) for actor in actors]
+            actor_futures = _phase3_actor_wave(commands_batch)
             t_actor_start = time.time()
             actor_results = ray.get(actor_futures)
+            _check_rollout_health(actor_results, iteration + 1, n_commands_per_iter)
             t_actor = time.time() - t_actor_start
             if _PROFILE_MODE:
                 print(f"[PROFILE Iter {iteration+1}] Actor実行: {t_actor:.3f}s (合計{_episodes_generated_sum(actor_results)}エピソード)")
@@ -4657,7 +5196,20 @@ def main():
             if DEBUG:
                 print("Learnerが改良された経験で学習を実行中")
             t_learner_start = time.time()
-            loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True))
+            if _REFIT_EVERY > 0:
+                # [PCN_REFIT_EVERY] 毎ラウンド ingest（投入のみ・重み不変）、REFIT_EVERY ラウンドごとに
+                # refit（束ね学習）。REFIT_EVERY 未満の周期では重みは変化しない＝loss=0.0 のまま表示。
+                ingest_stats = ray.get(learner.ingest.remote(use_training_cache=True))
+                if DEBUG or _PROFILE_MODE:
+                    print(f"[REFIT] iter={iteration + 1} ingest={ingest_stats}")
+                _do_refit = ((iteration + 1) % _REFIT_EVERY == 0) or ((iteration + 1) == N_ITERATIONS)
+                if _do_refit:
+                    loss = ray.get(learner.refit.remote(cold=_REFIT_COLD, epochs=_REFIT_EPOCHS))
+                    print(f"[REFIT] iter={iteration + 1} refit実行 cold={_REFIT_COLD} epochs={_REFIT_EPOCHS} loss={loss:.4f}")
+                else:
+                    loss = 0.0
+            else:
+                loss = ray.get(learner.learn.remote(batch_size=BATCH_SIZE, n_updates=N_UPDATES, use_training_cache=True))
             t_learner = time.time() - t_learner_start
             if _PROFILE_MODE:
                 print(f"[PROFILE Iter {iteration+1}] Learner実行: {t_learner:.3f}s")
@@ -4696,6 +5248,14 @@ def main():
         training_history['iterations'].append(iteration + 1)
         training_history['losses'].append(loss)
         training_history.setdefault('command_outcomes', []).append(_collect_command_outcomes(actor_results if actor_results is not None else []))
+        # [島構造診断] 生ペアの jsonl 追記（オプトイン・既定OFF）。学習には一切影響しない。
+        if _CMD_OUTCOMES_JSONL:
+            try:
+                with open(os.path.join(execution_dir, "cmd_outcomes.jsonl"), "a", encoding="utf-8") as _cf:
+                    for _o in training_history['command_outcomes'][-1]:
+                        _cf.write(json.dumps({"iter": iteration + 1, **_o}, ensure_ascii=False) + "\n")
+            except Exception as _e:
+                print(f"[CMD-OUTCOMES] jsonl追記失敗: {_e}")
         
 
         
@@ -4711,7 +5271,7 @@ def main():
                 _eval_n = EVAL_SAMPLES if EVAL_SAMPLES_DISTRIBUTED <= 0 else EVAL_SAMPLES_DISTRIBUTED
                 t_deval_start = time.time()
                 e_returns, e_values, distances, map_fin = _distributed_evaluate_episodes(
-                    learner, eval_pool, _eval_n
+                    learner, eval_pool, _eval_n, gpu_factory=_eval_gpu_factory()
                 )
                 if _PROFILE_MODE:
                     print(f"[PROFILE Iter {iteration+1}] 分散評価({_eval_n}ep): {time.time()-t_deval_start:.3f}s")
@@ -4775,6 +5335,10 @@ def main():
                         _ref_use = _es_ref  # 環境変数で絶対nadirを与えた場合は固定
                     else:
                         _ref_use = np.vstack([c[1] for c in _es_candidates]).max(axis=0) * 1.1
+                    if _es_cost_clamp is not None:
+                        # cost上限で箱を閉じる: 上限超の点は評価に入れない(_hypervolume_2d_min が
+                        # c<ref[0] で弾く)ので ref[0] をクランプ値にするだけで箱が揃う。
+                        _ref_use = np.array([_es_cost_clamp, float(_ref_use[1])], dtype=np.float64)
                     _best_it, _best_hv = max(
                         ((it, _hypervolume_2d_min(nd, _ref_use)) for it, nd in _es_candidates),
                         key=lambda t: t[1])
@@ -4802,6 +5366,7 @@ def main():
                         iteration + 1,
                         _plot_dir,
                         int(config["param_env"].get("n_jobs", N_JOBS)),
+                        gpu_factory=_eval_gpu_factory(),
                     )
                     weak = {
                         k: round(v["mean_gap"], 0)
@@ -5252,7 +5817,32 @@ def main():
                 print(f"ユニークエピソード数: {buffer_stats['unique_episodes']}")
                 print(f"利用率: {buffer_stats['utilization']:.2%}")
                 print("=" * 40)
-        
+
+        # 収束による学習終了(原著PCNの自己焼きなまし: フロント改善停止→同じ点の支持継続→終了)。
+        # v2: 「アーカイブfront停滞(Learner streak>=K)」だけでは早すぎる(Phase1種まきで骨格が
+        # 先に飽和する。検証済: iter5-8で停止し週転移が悪い)。ユーザー設計の本意は
+        # 多様性(骨格)→質(応答が骨格を再現できる)→両方止まったら終了、なので
+        # 「応答PFサイズ(評価毎の非支配点数)が直近2評価で過去最高を更新しない」を AND 条件に足す。
+        # 収束時点の(EMA)重みを converged_model.pth に保存。async の残 futures は回収してから抜ける。
+        if os.environ.get("PCN_CONVERGE_STOP", "0") == "1" and iteration < N_ITERATIONS - 1:
+            try:
+                _pf_hist = [v for v in training_history.get('pareto_front_sizes', []) if v is not None]
+                _resp_stalled = len(_pf_hist) >= 4 and max(_pf_hist[-2:]) <= max(_pf_hist[:-2])
+                if _resp_stalled and ray.get(learner.get_convergence_status.remote()):
+                    conv_path = f"{execution_dir}/converged_model.pth"
+                    ray.get(learner.save_model.remote(conv_path))
+                    print(f"[CONVERGE_STOP] iter {iteration + 1} で収束を検出 → 学習を終了し {conv_path} に保存")
+                    if _ASYNC_OVERLAP and N_ITERATIONS > 1:
+                        try:
+                            if learner_future is not None:
+                                ray.get(learner_future)
+                            if next_actor_futures is not None:
+                                ray.get(next_actor_futures)
+                        except Exception as _e:
+                            print(f"[CONVERGE_STOP] 残タスク回収で警告: {_e}")
+                    break
+            except Exception as _e:
+                print(f"[CONVERGE_STOP] 判定失敗(継続): {_e}")
 
 
     # フェーズ3の完了時間を記録
@@ -5849,6 +6439,32 @@ Training Statistics:
     
     if DEBUG:
         print("\n学習が完了しました")
+
+    # [健全性] 実行中に検出した異常を終了時に必ず一望させる(散らばった print では
+    # 数万行のログに埋もれるため)。異常ゼロなら1行で「正常」と出す。
+    try:
+        _issues = _health_log.get("rollout_issues", []) if "_health_log" in dir() else []
+        if _issues:
+            print(f"\n{'='*60}\n[HEALTH] ⚠️ 実行中に {len(_issues)} 件の異常を検出しました:")
+            for _it in _issues[:50]:
+                print(f"  iter={_it['iter']}: {_it['issue']}")
+            if len(_issues) > 50:
+                print(f"  ... 他 {len(_issues)-50} 件")
+            print(f"{'='*60}")
+        else:
+            print("[HEALTH] ✅ rollout 異常なし(工場失敗/溢れ/本数不足の検出ゼロ)")
+    except Exception as _e:
+        print(f"[HEALTH] サマリ出力に失敗: {_e}")
+
+    # [exit134の根治] 正常終了パスに ray.shutdown() が無く、driver が後片付けで
+    # ブロックしたまま外部シグナルを受けて abort する経路があった。
+    try:
+        import ray as _ray
+        if _ray.is_initialized():
+            _ray.shutdown()
+    except Exception as _e:
+        print(f"[SHUTDOWN] ray.shutdown() に失敗(続行): {_e}")
+
 
 if __name__ == "__main__":
     main()

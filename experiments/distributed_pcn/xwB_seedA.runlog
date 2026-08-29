@@ -1,0 +1,2 @@
+[run_synth] NAME=xwB_seedA JOBS=4096 NITER=100 OUT=experiments/distributed_pcn/run_synth4096_xwB_seedA ALPHA=1.000 START=01:21:51
+DONE NAME=xwB_seedA JOBS=4096 EXEC=experiments/distributed_pcn/run_synth4096_xwB_seedA/20260811_012154 TRAIN_EXIT=0 END=04:28:08

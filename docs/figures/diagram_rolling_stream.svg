@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 340" font-family="Noto Sans JP, sans-serif">
+  <style>
+    .ttl{font-size:17px;font-weight:700;fill:#1e293b}
+    .lbl{font-size:13px;fill:#334155}
+    .sm{font-size:11px;fill:#64748b}
+    .cmd{font-size:12px;font-weight:600;fill:#b45309}
+    .box{fill:#eff6ff;stroke:#3b82f6;stroke-width:1.5}
+    .res{fill:#f1f5f9;stroke:#94a3b8;stroke-width:1.2}
+    .arr{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#ah)}
+    .carry{stroke:#b45309;stroke-width:1.6;fill:none;stroke-dasharray:5 3;marker-end:url(#ah2)}
+  </style>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#475569"/></marker>
+    <marker id="ah2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#b45309"/></marker>
+  </defs>
+
+  <text x="20" y="28" class="ttl">窓で学習 → 未知の一週間にストリーム適用（繰越つき）</text>
+
+  <!-- 学習フェーズ -->
+  <rect x="20" y="52" width="150" height="70" rx="8" class="box"/>
+  <text x="95" y="80" text-anchor="middle" class="lbl" font-weight="700">前週の窓で学習</text>
+  <text x="95" y="100" text-anchor="middle" class="sm">先頭 256〜4096 ジョブ</text>
+  <text x="95" y="114" text-anchor="middle" class="sm">（約20分・1回だけ）</text>
+
+  <path class="arr" d="M175,87 L232,87"/>
+  <text x="205" y="78" text-anchor="middle" class="sm">方策</text>
+
+  <!-- 適用フェーズ: 週を窓に区切る -->
+  <text x="245" y="66" class="lbl" font-weight="700">未知の一週間（学習で1個も見ていない）を順に流す</text>
+
+  <!-- 命令(注文票) -->
+  <text x="245" y="150" class="cmd">命令（毎回同じ目標）</text>
+  <text x="245" y="166" class="sm">「コスト予算 と 待ち目標」</text>
+
+  <g>
+    <!-- 窓1 -->
+    <rect x="245" y="180" width="115" height="46" rx="6" class="res"/>
+    <text x="302" y="200" text-anchor="middle" class="lbl">窓1</text>
+    <text x="302" y="216" text-anchor="middle" class="sm">ジョブ 1..256</text>
+    <path class="arr" d="M245,175 L302,175 L302,178" /><!-- 命令→窓1 -->
+    <line x1="302" y1="171" x2="302" y2="179" class="arr"/>
+
+    <!-- 窓2 -->
+    <rect x="372" y="180" width="115" height="46" rx="6" class="res"/>
+    <text x="429" y="200" text-anchor="middle" class="lbl">窓2</text>
+    <text x="429" y="216" text-anchor="middle" class="sm">257..512</text>
+
+    <!-- 窓3 -->
+    <rect x="499" y="180" width="115" height="46" rx="6" class="res"/>
+    <text x="556" y="200" text-anchor="middle" class="lbl">窓3</text>
+    <text x="556" y="216" text-anchor="middle" class="sm">...</text>
+
+    <!-- 窓N -->
+    <rect x="700" y="180" width="130" height="46" rx="6" class="res"/>
+    <text x="765" y="200" text-anchor="middle" class="lbl">窓N（週末）</text>
+    <text x="765" y="216" text-anchor="middle" class="sm">..50,278</text>
+    <text x="650" y="207" text-anchor="middle" class="sm">…</text>
+  </g>
+
+  <!-- 資源は連続(下の帯) -->
+  <rect x="245" y="240" width="585" height="26" rx="5" fill="#dcfce7" stroke="#22c55e" stroke-width="1.2"/>
+  <text x="537" y="257" text-anchor="middle" class="sm">資源（マシンの埋まり具合）は週を通してずっと連続。窓が変わってもリセットしない</text>
+
+  <!-- 窓→窓 の進行矢印 -->
+  <path class="arr" d="M360,203 L370,203"/>
+  <path class="arr" d="M487,203 L497,203"/>
+  <path class="arr" d="M614,203 L644,203"/>
+  <path class="arr" d="M656,203 L698,203"/>
+
+  <!-- 命令リセット/繰越 -->
+  <path class="carry" d="M302,180 C330,150 400,150 429,178"/>
+  <path class="carry" d="M429,180 C460,150 527,150 556,178"/>
+  <text x="245" y="300" class="cmd">→ 256ジョブ捌くごとに命令を出し直す（繰越版：使い残しは次窓へ／使い過ぎは次窓が絞る）</text>
+  <text x="245" y="320" class="sm">固定版：毎回まっさらな同じ命令。繰越版：週の残り目標を残り窓数で割り直して命令にする（物差しが正確なときだけ有効）</text>
+</svg>

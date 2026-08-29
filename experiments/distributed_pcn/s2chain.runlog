@@ -1,0 +1,29 @@
+[S2] 1) P掃引 23:11:59
+[JobGenerator] clamped processing_time>=1 for 5 degenerate (pt<=0) trace job(s)
+[JobGenerator] excluded largest outlier: trace job_id=1239, pt=432005, nodes=72, pt*nodes=31104360
+[JobGenerator] job trace読み込み: /home/noguchi/scheduler-sim-for-cb/job_trace/FY2024/scacctreq_202412_weekB_sub1024_jobs.csv (取得件数=2267 / nrows=2268)
+[JobGenerator] 先頭5件サンプル: [[334, 57208, 76, 1, 213, 0, -1, 0], [6602, 26, 76, 1, 256, 1, -1, 0], [15203, 84839, 76, 1, 213, 2, -1, 0], [15656, 111922, 76, 1, 200, 3, -1, 0], [15813, 16, 76, 1, 202, 4, -1, 0]]
+P_cloud=0.00 cost=0.0000e+00 avg_wait=     72068.9 (1s)
+P_cloud=0.25 cost=2.3054e+08 avg_wait=     10650.5 (0s)
+P_cloud=0.50 cost=4.4206e+08 avg_wait=      1297.1 (0s)
+P_cloud=0.75 cost=6.2065e+08 avg_wait=        26.0 (0s)
+P_cloud=1.00 cost=8.1013e+08 avg_wait=        61.8 (0s)
+[S2] 2) NSGA-II 23:12:04
+saved /tmp/s2_nsga2.npz: PF 200点 evals=28504 elapsed=618.4s
+  cost range: 0 – 536839106
+  wait range: 28.83 – 72068.95
+[S2] 3) 窓学習 base 3seed 23:22:26
+[S2] 学習完了 23:50:20
+[S2] 4) carry 適用 23:50:20
+[S2] seed1 較正: cost_cl=216683334 wait_op=51248.1 wait_cl=439.1
+  seed1 OK
+[S2] seed2 較正: cost_cl=216683334 wait_op=51248.1 wait_cl=439.1
+  seed2 OK
+[S2] seed3 較正: cost_cl=216683334 wait_op=51248.1 wait_cl=439.1
+  seed3 OK
+[S2] 5) 集計 23:51:11
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+  File "<stdin>", line 14, in <listcomp>
+ValueError: could not convert string to float: ''
+[S2] ALL DONE 23:51:11
